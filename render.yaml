@@ -5,7 +5,12 @@ services:
     plan: free
     region: oregon
 
-    buildCommand: npm ci && npx turbo run build --filter=@prolific/server...
+    # Render defaults to latest Node (e.g. 26.x) which breaks native modules.
+    # Pin to Active LTS v20 — better-sqlite3 (used by POS only, not server)
+    # has prebuilt binaries for v20 so no native compile is triggered.
+    # Also note: the server workspace does NOT even use better-sqlite3; it is
+    # pulled in only by the POS/Electron workspaces via monorepo npm ci.
+    buildCommand: npm ci --ignore-scripts && npx turbo run build --filter=@prolific/server...
     startCommand: npm run start:prod --workspace=@prolific/server
 
     healthCheckPath: /api/v1
@@ -20,6 +25,9 @@ services:
         - render.yaml
 
     envVars:
+      - key: NODE_VERSION
+        value: "20.17.0"
+
       - key: NODE_ENV
         value: production
 
