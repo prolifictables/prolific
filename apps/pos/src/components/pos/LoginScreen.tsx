@@ -193,7 +193,33 @@ export default function LoginScreen() {
 
         navigate('/pos', { replace: true });
         return;
-      } catch {
+      } catch (err: any) {
+        // #region debug-point pos-pin-login-not-working:F-submitPin-catch
+        (() => {
+          try {
+            fetch("http://127.0.0.1:7777/event", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                sessionId: "pos-pin-login-not-working",
+                runId: "pre-fix",
+                hypothesisId: "H4",
+                location: "apps/pos/src/components/pos/LoginScreen.tsx submitPin pinLogin catch",
+                msg: "[DEBUG] Online pinLogin FAILED — falling through to offline fallback shim findByPin",
+                data: {
+                  pinEntered: pin,
+                  pinType: typeof pin,
+                  pinLen: String(pin).length,
+                  errName: err?.name,
+                  errMessage: err?.message || String(err),
+                  hasElectronDbFindByPin: Boolean(window.electronAPI?.db?.employees?.findByPin),
+                },
+                ts: Date.now(),
+              }),
+            }).catch(() => {});
+          } catch {}
+        })();
+        // #endregion
         // Always fall through to offline mock shim / local SQLite fallback
         // regardless of the specific pinLogin failure type. This covers:
         // network failures, HTTP 401/500 from backend, CORS issues, invalid

@@ -30,6 +30,9 @@ function dbgAuthService(event: Record<string, unknown>) {
     const parsedFromFile = (() => {
       try {
         const candidates = [
+          `${process.cwd()}/.dbg/pos-pin-login-not-working.env`,
+          `${process.cwd()}/../.dbg/pos-pin-login-not-working.env`,
+          `${process.cwd()}/../../.dbg/pos-pin-login-not-working.env`,
           `${process.cwd()}/.dbg/pos-invalid-pin.env`,
           `${process.cwd()}/../.dbg/pos-invalid-pin.env`,
           `${process.cwd()}/../../.dbg/pos-invalid-pin.env`,
@@ -364,13 +367,36 @@ export class AuthService {
           event: 'loginWithPin.candidates',
           branchId: requestedBranchId,
           candidateCount: candidates.length,
+          // H3: enumerate each candidate: _id, role, status (raw from doc), pin exists, pin hash prefix
+          candidates: candidates.map((e:any) => ({
+            _id: e._id ? String(e._id) : null,
+            role: e.role || null,
+            statusRaw: (e.status !== undefined ? String(e.status) : '__MISSING__'),
+            pinHashPrefix: typeof e.pin === 'string' ? e.pin.slice(0,15) : null,
+            branchId: e.branchId ? String(e.branchId) : null,
+          })),
         });
         for (const e of candidates) {
           const status = String((e as any).status || 'ACTIVE').toUpperCase();
           if (status !== 'ACTIVE') continue;
           const hash = (e as any).pin;
           if (!hash) continue;
-          const ok = await bcrypt.compare(pinStr, String(hash));
+          // H2: explicitly log before/after compare with types + lengths
+          const pinForCompare = pinStr;
+          const compareStart = {
+            candidateId: (e as any)._id ? String((e as any)._id) : null,
+            pinStrLen: pinForCompare.length,
+            pinStrType: typeof pinForCompare,
+            pinStrChars: pinForCompare, // raw digits to compare vs what admin typed
+            hashType: typeof hash,
+            hashPrefix: String(hash).slice(0,15),
+          };
+          const ok = await bcrypt.compare(pinForCompare, String(hash));
+          void dbgAuthService({
+            event: 'loginWithPin.branchBcrypt',
+            ...compareStart,
+            compareResult: ok,
+          });
           if (ok) {
             employee = e;
             break;
@@ -397,13 +423,36 @@ export class AuthService {
           event: 'loginWithPin.fallbackCandidates',
           requestedBranchId,
           candidateCount: globalCandidates.length,
+          // H3: enumerate each global candidate
+          candidates: globalCandidates.map((e:any) => ({
+            _id: e._id ? String(e._id) : null,
+            role: e.role || null,
+            statusRaw: (e.status !== undefined ? String(e.status) : '__MISSING__'),
+            pinHashPrefix: typeof e.pin === 'string' ? e.pin.slice(0,15) : null,
+            branchId: e.branchId ? String(e.branchId) : null,
+          })),
         });
         for (const e of globalCandidates) {
           const status = String((e as any).status || 'ACTIVE').toUpperCase();
           if (status !== 'ACTIVE') continue;
           const hash = (e as any).pin;
           if (!hash) continue;
-          const ok = await bcrypt.compare(pinStr, String(hash));
+          // H2: explicit before/after bcrypt.compare with pin literal shown
+          const pinForCompare = pinStr;
+          const compareStart = {
+            candidateId: (e as any)._id ? String((e as any)._id) : null,
+            pinStrLen: pinForCompare.length,
+            pinStrType: typeof pinForCompare,
+            pinStrChars: pinForCompare, // raw digits entered on POS keypad
+            hashType: typeof hash,
+            hashPrefix: String(hash).slice(0,15),
+          };
+          const ok = await bcrypt.compare(pinForCompare, String(hash));
+          void dbgAuthService({
+            event: 'loginWithPin.fallbackBcrypt',
+            ...compareStart,
+            compareResult: ok,
+          });
           if (ok) {
             employee = e;
             break;

@@ -202,6 +202,35 @@ export default function EmployeesPage() {
     try {
       const res: any = await apiPost(`/employees/${resetTarget.id}/reset-pin`, {});
       const pin = res?.rawPin || res?.data?.rawPin || '';
+
+      // #region debug-point pos-pin-login-not-working:H1-admin-resetpin-display
+      (() => {
+        try {
+          fetch("http://127.0.0.1:7777/event", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              sessionId: "pos-pin-login-not-working",
+              runId: "pre-fix",
+              hypothesisId: "H1",
+              location: "apps/admin/src/app/(protected)/employees/page.tsx resetPin",
+              msg: "[DEBUG] Admin resetPin API returned rawPin — about to display to admin in generated PIN modal",
+              data: {
+                employeeId: String((resetTarget as any)?.id || ''),
+                employeeFirstName: (resetTarget as any)?.user?.firstName || '',
+                employeeLastName: (resetTarget as any)?.user?.lastName || '',
+                resShape: Object.keys(res || {}),
+                returnedRawPin: pin,     // exact digits the admin will copy
+                pinLen: String(pin).length,
+                pinType: typeof pin,
+              },
+              ts: Date.now(),
+            }),
+          }).catch(() => {});
+        } catch {}
+      })();
+      // #endregion
+
       if (!pin) {
         throw new Error('Reset succeeded but no PIN was returned');
       }

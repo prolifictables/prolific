@@ -25,6 +25,9 @@ function dbgEmployeesService(event: Record<string, unknown>) {
     const parsedFromFile = (() => {
       try {
         const candidates = [
+          `${process.cwd()}/.dbg/pos-pin-login-not-working.env`,
+          `${process.cwd()}/../.dbg/pos-pin-login-not-working.env`,
+          `${process.cwd()}/../../.dbg/pos-pin-login-not-working.env`,
           `${process.cwd()}/.dbg/reset-pin-not-found.env`,
           `${process.cwd()}/../.dbg/reset-pin-not-found.env`,
           `${process.cwd()}/../../.dbg/reset-pin-not-found.env`,
@@ -563,14 +566,25 @@ export class EmployeesService {
       const rawPin = Math.floor(1000 + Math.random() * 9000).toString();
       const hashedPin = await bcrypt.hash(rawPin, 10);
 
-      await this.employeeModel
+      const updatedDoc = await this.employeeModel
         .findByIdAndUpdate(employee._id, { $set: { pin: hashedPin } }, { new: true })
         .exec();
 
+      // Verify the write actually landed by re-reading
+      const postRead = await this.employeeModel.findById(employee._id).exec();
       void dbgEmployeesService({
         event: 'resetPin.success',
         employeeId: employee?._id?.toString?.() || null,
         branchId: (employee as any)?.branchId ?? null,
+        // H1: exact rawPin that will be shown to the admin in the toast
+        rawPin,
+        // H1: hashed pin prefix (first 15 chars of $2b$...) to compare with post-write
+        hashedPinPrefix: hashedPin.slice(0, 15),
+        // H5: whether findByIdAndUpdate returned a document
+        updateReturnedDoc: Boolean(updatedDoc),
+        // H5: post-read pin field matches expected hash
+        postReadPinMatches: postRead && (postRead as any).pin === hashedPin,
+        postReadPinPrefix: postRead && (postRead as any).pin ? (postRead as any).pin.slice(0, 15) : null,
       });
       return {
         employeeId: id,
