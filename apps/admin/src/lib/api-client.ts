@@ -1,3 +1,6 @@
+import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
+import { beginWake, endWake, publishApiWake } from './api-wake';
+
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
 
 const getToken = (): string | null => {
@@ -55,15 +58,70 @@ const authHeaders = (): HeadersInit => {
   return headers;
 };
 
+// Admin: browser-only app. SSR minimal; still guard SSR path with
+// typeof window check (throws once on SSR so caller can withFallbackNull).
+async function guardedFetch(doFetch: () => Promise<Response>): Promise<Response> {
+  const isBrowser = typeof window !== 'undefined';
+  let res: Response;
+  try {
+    res = await doFetch();
+  } catch (err) {
+    if (isBrowser) {
+      beginWake();
+      await waitForApiWake(API_BASE, {
+        onProgress: (p) =>
+          publishApiWake({
+            attempt: p.attempt,
+            elapsedMs: p.elapsedMs,
+            etaMs: p.etaMs,
+          }),
+        onWakeResolved: endWake,
+      });
+      return doFetch();
+    }
+    throw err;
+  }
+  const ct = res.headers.get('content-type');
+  let bodyStart = '';
+  try {
+    if (res.status >= 500 || !!ct?.toLowerCase().includes('text/html')) {
+      const cloned = res.clone();
+      bodyStart = (await cloned.text()).slice(0, 300);
+    }
+  } catch {
+    // ignore
+  }
+  const waking = isApiWakingResponse(res.status, ct, bodyStart);
+  if (waking) {
+    if (isBrowser) {
+      beginWake();
+      await waitForApiWake(API_BASE, {
+        onProgress: (p) =>
+          publishApiWake({
+            attempt: p.attempt,
+            elapsedMs: p.elapsedMs,
+            etaMs: p.etaMs,
+          }),
+        onWakeResolved: endWake,
+      });
+      return doFetch();
+    }
+    throw new Error(`Render waking page detected (${res.status}) — SSR fallback to null`);
+  }
+  return res;
+}
+
 export async function apiGet<T>(path: string, opts?: { headers?: HeadersInit }): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'GET',
-    cache: 'no-store',
-    headers: {
-      ...authHeaders(),
-      ...(opts?.headers || {}),
-    },
-  });
+  const res = await guardedFetch(() =>
+    fetch(`${API_BASE}${path}`, {
+      method: 'GET',
+      cache: 'no-store',
+      headers: {
+        ...authHeaders(),
+        ...(opts?.headers || {}),
+      },
+    })
+  );
   return unwrap<T>(res);
 }
 
@@ -75,11 +133,14 @@ export async function apiPost<T>(
   const headers = opts?.skipAuth
     ? { 'Content-Type': 'application/json', ...(opts?.headers || {}) }
     : { ...authHeaders(), ...(opts?.headers || {}) };
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
+  const mkBody = () => JSON.stringify(body);
+  const res = await guardedFetch(() =>
+    fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers,
+      body: mkBody(),
+    })
+  );
   return unwrap<T>(res);
 }
 
@@ -88,26 +149,31 @@ export async function apiPatch<T>(
   body: unknown,
   opts?: { headers?: HeadersInit }
 ): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'PATCH',
-    headers: {
-      ...authHeaders(),
-      ...(opts?.headers || {}),
-    },
-    body: JSON.stringify(body),
-  });
+  const res = await guardedFetch(() =>
+    fetch(`${API_BASE}${path}`, {
+      method: 'PATCH',
+      headers: {
+        ...authHeaders(),
+        ...(opts?.headers || {}),
+      },
+      body: JSON.stringify(body),
+    })
+  );
   return unwrap<T>(res);
 }
 
 export async function apiDelete<T>(path: string, opts?: { headers?: HeadersInit }): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'DELETE',
-    headers: {
-      ...authHeaders(),
-      ...(opts?.headers || {}),
-    },
-  });
+  const res = await guardedFetch(() =>
+    fetch(`${API_BASE}${path}`, {
+      method: 'DELETE',
+      headers: {
+        ...authHeaders(),
+        ...(opts?.headers || {}),
+      },
+    })
+  );
   return unwrap<T>(res);
 }
 
 export const API_BASE_URL = API_BASE;
+export { withFallbackNull } from './api-wake';

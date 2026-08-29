@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
 import './globals.css';
+import { ClientApiWakeLayer } from '../components/ClientApiWakeLayer';
 
 const inter = Inter({
   subsets: ['latin'],
@@ -23,6 +24,9 @@ export default function RootLayout({
   return (
     <html lang="en" className={inter.variable}>
       <body className="antialiased text-slate-800 bg-slate-50 scrollbar-thin">
+        {/* Silent until any first-call detects Render waking-page 502/503, then shows
+            polite custom spinner overlay — NEVER Render's "Application Loading" HTML */}
+        <ClientApiWakeLayer appName="Prolific Admin" />
         {children}
       </body>
     </html>

@@ -3,22 +3,16 @@ import OrderStatusClient, {
   LiveStatusPillar,
   LiveWhenCompleted,
 } from './order-status-client';
-
-const API_BASE =
-  (process.env.NEXT_PUBLIC_API_URL as string) || 'http://localhost:4000/api/v1';
+import { apiGet, withFallbackNull } from '../../../../../lib/api';
 
 async function fetchOrderStatus(orderId: string): Promise<any> {
-  try {
-    const res = await fetch(`${API_BASE}/public/orders/${orderId}`, {
-      method: 'GET',
-      cache: 'no-store',
-    });
-    const json = await res.json();
-    if (!res.ok) return { error: json?.error?.message || `HTTP ${res.status}` };
-    return json.data;
-  } catch (e: any) {
-    return { error: e?.message || 'Network error' };
-  }
+  // SSR-safe cold-start pattern: any SSR throw (waking page / network) returns null
+  // → skeleton rendered; client re-fetch via guarded wrapper → overlay if needed.
+  const data = await withFallbackNull(
+    apiGet<any>(`/public/orders/${orderId}`)
+  );
+  if (data === null || data === undefined) return null;
+  return data;
 }
 
 interface OrderStatusPageProps {
@@ -40,23 +34,26 @@ export default async function OrderStatusPage({
   const { token, orderId } = params;
   const data = await fetchOrderStatus(orderId);
 
-  if (data?.error) {
+  // SSR safety: any server-side error (cold-start waking or network) → branded skeleton.
+  // Client-side hydration re-fetches via guarded wrapper → our custom overlay.
+  if (!data) {
     return (
       // Diner phone frame — keeps QR order flow centered and "app-like" on all viewports
       <div className="min-h-screen w-full flex justify-center items-start bg-gradient-mesh-warm py-0 sm:py-6">
-        <div className="w-full max-w-[480px] mx-auto min-h-screen sm:min-h-[calc(100vh-3rem)] sm:shadow-2xl sm:rounded-[2.5rem] sm:overflow-hidden relative border-x border-t sm:border border-restaurant-100 bg-restaurant flex flex-col items-center justify-center px-6 py-16">
-          <div className="w-24 h-24 rounded-full bg-amber-100 flex items-center justify-center mb-5 shadow-card animate-fade-in">
-            <span className="text-5xl">🔎</span>
+        <div className="w-full max-w-[480px] mx-auto min-h-screen sm:min-h-[calc(100vh-3rem)] sm:shadow-2xl sm:rounded-[2.5rem] sm:overflow-hidden relative border-x border-t sm:border border-restaurant-100 bg-slate-50 flex flex-col items-center justify-center px-6 py-16">
+          <div className="relative w-24 h-24 mb-6">
+            <div className="absolute inset-0 animate-ping rounded-full bg-amber-400/25" />
+            <div className="absolute inset-0 animate-spin rounded-full border-[3px] border-amber-200/30 border-t-amber-500" />
           </div>
-          <h1 className="text-xl headline text-restaurant-800 mb-2 animate-fade-in-up">
-            Order not found
+          <h1 className="text-xl headline text-restaurant-800 mb-2 animate-pulse">
+            Loading your order…
           </h1>
-          <p className="text-sm text-ink-muted text-center max-w-sm mb-6 animate-fade-in-up-100">
-            {data.error}
-          </p>
+          <p className="text-sm text-ink-muted text-center max-w-sm mb-6">
+              Getting the latest status — one moment…
+            </p>
           <Link
             href={`/t/${token}`}
-            className="rounded-2xl bg-gradient-warm text-white px-6 py-3 font-semibold shadow-glow-restaurant hover:brightness-105 transition animate-fade-in-up-200"
+            className="rounded-2xl bg-gradient-warm text-white px-6 py-3 font-semibold shadow-glow-restaurant hover:brightness-105 transition"
           >
             Back to Menu
           </Link>

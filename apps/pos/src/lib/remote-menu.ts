@@ -1,4 +1,6 @@
 import type { MenuCategory, MenuItem, MenuModifier } from '@prolific/shared-types';
+import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
+import { beginWake, endWake, publishApiWake } from './api-wake';
 
 // Remote public API client so the POS cashier terminal (both Electron desktop
 // and the browser preview mode) reads menu data from the Nest server so any
@@ -21,6 +23,42 @@ const DEFAULT_BRANCH_OVERRIDE =
     ((import.meta as any).env.VITE_DEFAULT_BRANCH_ID ||
       (import.meta as any).env.VITE_DEFAULT_BRANCH)) ||
   null;
+
+// ---------- Render cold-start resilience wrapper (POS is browser-only, never SSR) ----------
+async function guardedFetch(doFetch: () => Promise<Response>): Promise<Response> {
+  let res: Response;
+  try {
+    res = await doFetch();
+  } catch (err) {
+    beginWake();
+    await waitForApiWake(API_BASE, {
+      onProgress: (p) =>
+        publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
+      onWakeResolved: endWake,
+    });
+    return doFetch();
+  }
+  const ct = res.headers.get('content-type');
+  let bodyStart = '';
+  try {
+    if (res.status >= 500 || !!ct?.toLowerCase().includes('text/html')) {
+      const cloned = res.clone();
+      bodyStart = (await cloned.text()).slice(0, 300);
+    }
+  } catch {
+    // ignore clone/text failures — detection best-effort
+  }
+  if (isApiWakingResponse(res.status, ct, bodyStart)) {
+    beginWake();
+    await waitForApiWake(API_BASE, {
+      onProgress: (p) =>
+        publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
+      onWakeResolved: endWake,
+    });
+    return doFetch();
+  }
+  return res;
+}
 
 // ---------- Shape helpers: public API → shared-types ----------
 // The Nest public/menu endpoint returns `priceCents` / `priceDeltaCents` to
@@ -90,12 +128,14 @@ export type PublicMenuEnvelope = {
 export async function listPublicBranches(
   signal?: AbortSignal
 ): Promise<PublicBranch[]> {
-  const res = await fetch(`${API_BASE}/public/branches`, {
-    method: 'GET',
-    signal,
-    cache: 'no-store',
-  });
-  const json = await res.json();
+  const res = await guardedFetch(() =>
+    fetch(`${API_BASE}/public/branches`, {
+      method: 'GET',
+      signal,
+      cache: 'no-store',
+    })
+  );
+  const json = await res.json().catch(() => null);
   if (!res.ok) throw new Error(json?.error?.message || `HTTP ${res.status}`);
   return (json?.data as PublicBranch[]) || [];
 }
@@ -124,12 +164,14 @@ export async function fetchPublicMenu(
   items: MenuItem[];
   modifiers: MenuModifier[];
 }> {
-  const res = await fetch(`${API_BASE}/public/menu?branchId=${encodeURIComponent(branchId)}`, {
-    method: 'GET',
-    signal,
-    cache: 'no-store',
-  });
-  const json = await res.json();
+  const res = await guardedFetch(() =>
+    fetch(`${API_BASE}/public/menu?branchId=${encodeURIComponent(branchId)}`, {
+      method: 'GET',
+      signal,
+      cache: 'no-store',
+    })
+  );
+  const json = await res.json().catch(() => null);
   if (!res.ok) throw new Error(json?.error?.message || `HTTP ${res.status}`);
   const envelope = (json?.data || json) as PublicMenuEnvelope;
   if (!envelope) throw new Error('Empty menu envelope from API');

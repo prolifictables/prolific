@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next';
 import './globals.css';
+import { ClientApiWakeLayer } from '../components/ClientApiWakeLayer';
 
 export const metadata: Metadata = {
   title: 'Prolific Tables — Order & Pay from Your Table',
@@ -38,6 +39,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         >
           Skip to content
         </a>
+        {/* Mounted very early. Overlay is null by default. Only shows polite
+            spinner overlay during Render cold-start (20-90s first request of day).
+            Never forwards to Render "Application Loading" HTML page. */}
+        <ClientApiWakeLayer appName="Prolific Tables" />
         {children}
       </body>
     </html>

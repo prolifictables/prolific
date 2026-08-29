@@ -1,22 +1,16 @@
 import { notFound } from 'next/navigation';
 import Link from 'next/link';
 import SessionClientShell from './client-shell';
-
-const API_BASE =
-  (process.env.NEXT_PUBLIC_API_URL as string) || 'http://localhost:4000/api/v1';
+import { apiGet, withFallbackNull } from '../../../lib/api';
 
 async function resolveQrServerSide(token: string): Promise<any> {
-  try {
-    const res = await fetch(`${API_BASE}/public/qr/${token}`, {
-      method: 'GET',
-      cache: 'no-store',
-    });
-    const json = await res.json();
-    if (!res.ok) return { error: json?.error?.message || `HTTP ${res.status}` };
-    return json.data;
-  } catch (e: any) {
-    return { error: e?.message || 'Network error resolving QR' };
-  }
+  // SSR-safe cold-start pattern: any SSR throw returns null → skeleton;
+  // client re-fetch through SessionClientShell guarded fetches → custom overlay.
+  const data = await withFallbackNull(
+    apiGet<any>(`/public/qr/${token}`)
+  );
+  if (data === null || data === undefined) return null;
+  return data;
 }
 
 interface QrTokenPageProps {
@@ -27,7 +21,9 @@ export default async function QrTokenPage({ params }: QrTokenPageProps) {
   const token = params.token;
   const resolved = await resolveQrServerSide(token);
 
-  if (resolved?.error) {
+  // SSR safety: any server-side error (cold-start waking or network) → branded skeleton.
+  // Client-side hydration will re-fetch via SessionClientShell guarded calls → our custom overlay.
+  if (!resolved) {
     return (
       <div className="min-h-screen w-full flex justify-center items-start bg-[#050506] py-0 sm:py-6 relative">
         <div aria-hidden className="fixed inset-0 -z-10 pointer-events-none">
@@ -37,18 +33,19 @@ export default async function QrTokenPage({ params }: QrTokenPageProps) {
           <div className="absolute inset-0 bg-cyber-grid opacity-[0.12]" />
         </div>
         <div className="w-full max-w-[480px] mx-auto min-h-screen sm:min-h-[calc(100vh-3rem)] sm:shadow-2xl sm:shadow-amber-500/25 sm:rounded-[2.5rem] sm:overflow-hidden relative border sm:border-white/10 bg-surface-sunken flex flex-col items-center justify-center px-6 py-16">
-          <div className="w-28 h-28 rounded-full bg-gradient-neon/20 flex items-center justify-center mb-6 shadow-glow-restaurant ring-1 ring-amber-400/30 animate-float">
-            <div className="w-20 h-20 rounded-full bg-surface-panel flex items-center justify-center ring-1 ring-white/10">
-              <span className="text-5xl">🍽️</span>
+          <div className="relative w-28 h-28 mb-6">
+            <div className="absolute inset-0 animate-ping rounded-full bg-amber-500/20" />
+            <div className="absolute inset-0 animate-spin rounded-full border-[3px] border-amber-300/15 border-t-amber-400" />
+            <div className="absolute inset-2 rounded-full bg-gradient-neon/20 flex items-center justify-center ring-1 ring-amber-400/30">
+              <span className="text-4xl">🍽️</span>
             </div>
           </div>
-          <div className="text-center max-w-sm animate-fade-in-up">
+          <div className="text-center max-w-sm animate-pulse">
             <h1 className="text-2xl headline text-white mb-2">
-              QR code invalid or expired
+              Loading your table…
             </h1>
             <p className="text-sm text-ink-muted mb-8 leading-relaxed">
-              This QR token may have been used, disabled, or it doesn&apos;t match any active table.
-              Please scan the printed QR on your table again, or ask a staff member for assistance.
+              Pulling up the menu for this table — one moment…
             </p>
             <div className="space-y-3">
               <Link
@@ -57,12 +54,6 @@ export default async function QrTokenPage({ params }: QrTokenPageProps) {
               >
                 Back to Home
               </Link>
-              <button
-                onClick={() => window.location.reload()}
-                className="block w-full rounded-2xl border border-white/10 bg-surface-muted text-white py-3.5 font-semibold hover:bg-white/5 transition shadow-sm"
-              >
-                Scan Another QR
-              </button>
             </div>
           </div>
         </div>

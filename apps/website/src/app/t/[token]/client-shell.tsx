@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { cn } from '@prolific/utils';
 import { useCart, useSession } from '../../../lib/store';
-import { apiGet } from '../../../lib/api';
+import { apiGet, apiPost } from '../../../lib/api';
 import { createClientSocket, disconnectClientSocket } from '../../../lib/client-socket';
 import { CategoryChips } from '../../../components/CategoryChips';
 import { MenuItemCard, MenuItemData } from '../../../components/MenuItemCard';
@@ -401,19 +401,12 @@ export default function SessionClientShell({
                     fullWidth
                     onClick={async () => {
                       try {
-                        await fetch(
-                          `${(process as any).env?.NEXT_PUBLIC_API_URL || 'http://localhost:4000/api/v1'}/public/table-sessions/join`,
-                          {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                              qrToken: token,
-                              displayName: joinDisplayName || undefined,
-                              phone: joinPhone || undefined,
-                              email: joinEmail || undefined,
-                            }),
-                          }
-                        );
+                        await apiPost('/public/table-sessions/join', {
+                          qrToken: token,
+                          displayName: joinDisplayName || undefined,
+                          phone: joinPhone || undefined,
+                          email: joinEmail || undefined,
+                        });
                       } finally {
                         setStep('menu');
                       }

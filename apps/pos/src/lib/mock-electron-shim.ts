@@ -12,6 +12,8 @@ import type {
   CustomerSpecial,
   CustomerStatePayload,
 } from '../vite-env';
+import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
+import { beginWake, endWake, publishApiWake } from './api-wake';
 
 // ---------------------------------------------------------------------------
 // Customer Display state bus (BroadcastChannel, browser-mode only)
@@ -174,6 +176,43 @@ function resolveDefaultBranchId(): string {
   );
 }
 
+// ---------- Render cold-start resilience wrapper (shim-only, uses resolvePublicApiBase) ----------
+async function shimGuardedFetch(doFetch: () => Promise<Response>): Promise<Response> {
+  const apiBase = resolvePublicApiBase();
+  let res: Response;
+  try {
+    res = await doFetch();
+  } catch (err) {
+    beginWake();
+    await waitForApiWake(apiBase, {
+      onProgress: (p) =>
+        publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
+      onWakeResolved: endWake,
+    });
+    return doFetch();
+  }
+  const ct = res.headers.get('content-type');
+  let bodyStart = '';
+  try {
+    if (res.status >= 500 || !!ct?.toLowerCase().includes('text/html')) {
+      const cloned = res.clone();
+      bodyStart = (await cloned.text()).slice(0, 300);
+    }
+  } catch {
+    // ignore clone/text failures — detection best-effort
+  }
+  if (isApiWakingResponse(res.status, ct, bodyStart)) {
+    beginWake();
+    await waitForApiWake(apiBase, {
+      onProgress: (p) =>
+        publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
+      onWakeResolved: endWake,
+    });
+    return doFetch();
+  }
+  return res;
+}
+
 // Module-scope state for the admin-managed customer-display write-up live-poller.
 // Runs once on bootstrap, then every 30 seconds so edits propagate to already-open
 // customer-display popups without requiring a refresh.
@@ -238,9 +277,11 @@ async function fetchCustomerDisplayForBranch(branchId: string): Promise<any | nu
   try {
     const API_BASE = resolvePublicApiBase();
     const url = `${API_BASE}/public/customer-display-settings?branchId=${encodeURIComponent(String(branchId))}`;
-    const resp = await fetch(url, { headers: { Accept: 'application/json' }, credentials: 'omit' });
+    const resp = await shimGuardedFetch(() =>
+      fetch(url, { headers: { Accept: 'application/json' }, credentials: 'omit' })
+    );
     if (!resp.ok) return null;
-    const raw = await resp.json();
+    const raw = await resp.json().catch(() => null);
     // Envelope shape: the NestJS interceptor wraps everything as {success, data, meta}.
     // Unwrap raw.data if present, else return raw (endpoint may return direct object).
     return raw && typeof raw === 'object' && 'data' in raw && raw.data && typeof raw.data === 'object'
@@ -254,12 +295,14 @@ async function fetchCustomerDisplayForBranch(branchId: string): Promise<any | nu
 async function fetchPublicBranches(limit = 10): Promise<any[]> {
   try {
     const API_BASE = resolvePublicApiBase();
-    const resp = await fetch(`${API_BASE}/public/branches?limit=${limit}`, {
-      headers: { Accept: 'application/json' },
-      credentials: 'omit',
-    });
+    const resp = await shimGuardedFetch(() =>
+      fetch(`${API_BASE}/public/branches?limit=${limit}`, {
+        headers: { Accept: 'application/json' },
+        credentials: 'omit',
+      })
+    );
     if (!resp.ok) return [];
-    const raw = await resp.json();
+    const raw = await resp.json().catch(() => null);
     if (raw && typeof raw === 'object' && Array.isArray(raw.data)) return raw.data;
     return Array.isArray(raw) ? raw : [];
   } catch {

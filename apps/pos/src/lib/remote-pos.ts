@@ -1,3 +1,6 @@
+import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
+import { beginWake, endWake, publishApiWake } from './api-wake';
+
 const API_BASE =
   (typeof import.meta !== 'undefined' &&
     (import.meta as any).env &&
@@ -7,20 +10,56 @@ const API_BASE =
       (import.meta as any).env.API_BASE_URL)) ||
   'http://localhost:4000/api/v1';
 
+async function guardedFetch(doFetch: () => Promise<Response>): Promise<Response> {
+  let res: Response;
+  try {
+    res = await doFetch();
+  } catch (err) {
+    beginWake();
+    await waitForApiWake(API_BASE, {
+      onProgress: (p) =>
+        publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
+      onWakeResolved: endWake,
+    });
+    return doFetch();
+  }
+  const ct = res.headers.get('content-type');
+  let bodyStart = '';
+  try {
+    if (res.status >= 500 || !!ct?.toLowerCase().includes('text/html')) {
+      const cloned = res.clone();
+      bodyStart = (await cloned.text()).slice(0, 300);
+    }
+  } catch {
+    // ignore
+  }
+  if (isApiWakingResponse(res.status, ct, bodyStart)) {
+    beginWake();
+    await waitForApiWake(API_BASE, {
+      onProgress: (p) =>
+        publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
+      onWakeResolved: endWake,
+    });
+    return doFetch();
+  }
+  return res;
+}
+
 export async function fetchPosBootstrap(opts: {
   accessToken: string;
   signal?: AbortSignal;
 }): Promise<{ employees: any[]; tables: any[] }> {
-  const res = await fetch(`${API_BASE}/pos/bootstrap`, {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${opts.accessToken}` },
-    signal: opts.signal,
-  });
+  const res = await guardedFetch(() =>
+    fetch(`${API_BASE}/pos/bootstrap`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${opts.accessToken}` },
+      signal: opts.signal,
+    })
+  );
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     const msg =
-      (json && (json.error?.message || json.message || json.error)) ||
-      `HTTP ${res.status}`;
+      (json && (json.error?.message || json.message || json.error)) || `HTTP ${res.status}`;
     throw new Error(msg);
   }
   const data = json && (json.data ?? json);
@@ -28,3 +67,5 @@ export async function fetchPosBootstrap(opts: {
   const tables = Array.isArray(data?.tables) ? data.tables : [];
   return { employees, tables };
 }
+
+export const REMOTE_POS_API_BASE = API_BASE;

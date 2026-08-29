@@ -3,6 +3,7 @@ import { useAuthStore } from './lib/auth-store';
 import LoginScreen from './components/pos/LoginScreen';
 import CashierScreenLayout from './components/pos/CashierScreenLayout';
 import CustomerDisplayApp from './components/customer/CustomerDisplayApp';
+import { ApiWakeOverlay } from './components/ApiWakeOverlay';
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const employee = useAuthStore((s) => s.employee);
@@ -27,26 +28,33 @@ function RootRedirect() {
 
 export default function App() {
   return (
-    <Routes>
-      <Route
-        path="/login"
-        element={
-          <RequireGuest>
-            <LoginScreen />
-          </RequireGuest>
-        }
-      />
-      <Route
-        path="/pos"
-        element={
-          <RequireAuth>
-            <CashierScreenLayout />
-          </RequireAuth>
-        }
-      />
-      <Route path="/customer-display" element={<CustomerDisplayApp />} />
-      <Route path="/" element={<RootRedirect />} />
-      <Route path="*" element={<RootRedirect />} />
-    </Routes>
+    <>
+      {/* Render our custom wake overlay ABOVE all screens — always mounted so
+          it can appear INSTANTLY the moment any fetch detects a 502/503 HTML
+          page from Render. The Login / Cashier screens render BEHIND it in the
+          DOM (fully painted, ready to go) so the UI loads first per UX spec. */}
+      <ApiWakeOverlay appName="Prolific POS Terminal" />
+      <Routes>
+        <Route
+          path="/login"
+          element={
+            <RequireGuest>
+              <LoginScreen />
+            </RequireGuest>
+          }
+        />
+        <Route
+          path="/pos"
+          element={
+            <RequireAuth>
+              <CashierScreenLayout />
+            </RequireAuth>
+          }
+        />
+        <Route path="/customer-display" element={<CustomerDisplayApp />} />
+        <Route path="/" element={<RootRedirect />} />
+        <Route path="*" element={<RootRedirect />} />
+      </Routes>
+    </>
   );
 }
