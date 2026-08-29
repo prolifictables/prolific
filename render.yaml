@@ -10,7 +10,13 @@ services:
     # has prebuilt binaries for v20 so no native compile is triggered.
     # Also note: the server workspace does NOT even use better-sqlite3; it is
     # pulled in only by the POS/Electron workspaces via monorepo npm ci.
-    buildCommand: npm ci --ignore-scripts && npx turbo run build --filter=@prolific/server...
+    #
+    # NODE_ENV is set to `production` below for RUNTIME only. During BUILD we
+    # MUST explicitly set NODE_ENV=development for `npm ci`, otherwise npm
+    # skips devDependencies and turbo (a root devDep) is not installed at all
+    # → npx falls back to downloading the latest turbo global (v2) which
+    # breaks on the old turbo.json (pipeline → tasks rename).
+    buildCommand: NODE_ENV=development npm ci --ignore-scripts && NODE_ENV=production npx turbo run build --filter=@prolific/server...
     startCommand: npm run start:prod --workspace=@prolific/server
 
     healthCheckPath: /api/v1
