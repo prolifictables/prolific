@@ -31,6 +31,15 @@ export class Employee
   @Prop({ type: [String], required: true, default: [] })
   assignedZoneIds!: string[];
 
+  @Prop({
+    type: String,
+    required: true,
+    enum: Object.values(S.EmployeeStatus),
+    default: S.EmployeeStatus.ACTIVE,
+    index: true,
+  })
+  status!: S.EmployeeStatus;
+
   @Prop({ type: Date })
   joinedAt?: Date;
 }

@@ -12,6 +12,13 @@ export declare enum Role {
     WAITER = "WAITER",
     ACCOUNTANT = "ACCOUNTANT"
 }
+export declare enum EmployeeStatus {
+    ACTIVE = "ACTIVE",
+    INACTIVE = "INACTIVE",
+    SUSPENDED = "SUSPENDED",
+    TERMINATED = "TERMINATED",
+    ON_LEAVE = "ON_LEAVE"
+}
 export declare enum ConnectionStatus {
     ONLINE = "ONLINE",
     OFFLINE = "OFFLINE",
@@ -231,6 +238,7 @@ export interface Employee {
     employeeNumber?: string;
     positionTitle?: string;
     assignedZoneIds: ID[];
+    status: EmployeeStatus;
     joinedAt?: Timestamp;
     createdAt: Timestamp;
     updatedAt: Timestamp;

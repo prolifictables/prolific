@@ -350,7 +350,14 @@ export class AuthService {
           branchIdAliases,
         });
         const candidates = await this.employeeModel
-          .find({ branchId: { $in: branchIdAliases }, pin: { $exists: true, $ne: null } })
+          .find({
+            branchId: { $in: branchIdAliases },
+            pin: { $exists: true, $ne: null },
+            // Belt+suspenders: legacy employees may have no `status` field at all
+            // (Employee schema didn't define it originally). Treat missing/null
+            // as ACTIVE so they can still log in; only explicit INACTIVE blocks.
+            $or: [{ status: { $exists: false } }, { status: null }, { status: 'ACTIVE' }],
+          })
           .limit(500)
           .exec();
         void dbgAuthService({
@@ -359,6 +366,8 @@ export class AuthService {
           candidateCount: candidates.length,
         });
         for (const e of candidates) {
+          const status = String((e as any).status || 'ACTIVE').toUpperCase();
+          if (status !== 'ACTIVE') continue;
           const hash = (e as any).pin;
           if (!hash) continue;
           const ok = await bcrypt.compare(pinStr, String(hash));
@@ -375,7 +384,13 @@ export class AuthService {
       // POS login flow.
       if (!employee) {
         const globalCandidates = await this.employeeModel
-          .find({ pin: { $exists: true, $ne: null }, status: 'ACTIVE' })
+          .find({
+            pin: { $exists: true, $ne: null },
+            // Same belt+suspenders for legacy employees without a `status` field:
+            // missing/null → treated as ACTIVE in Mongo query, then double-checked
+            // in the inner loop below. Only explicit INACTIVE is excluded.
+            $or: [{ status: { $exists: false } }, { status: null }, { status: 'ACTIVE' }],
+          })
           .limit(2000)
           .exec();
         void dbgAuthService({
@@ -384,6 +399,8 @@ export class AuthService {
           candidateCount: globalCandidates.length,
         });
         for (const e of globalCandidates) {
+          const status = String((e as any).status || 'ACTIVE').toUpperCase();
+          if (status !== 'ACTIVE') continue;
           const hash = (e as any).pin;
           if (!hash) continue;
           const ok = await bcrypt.compare(pinStr, String(hash));

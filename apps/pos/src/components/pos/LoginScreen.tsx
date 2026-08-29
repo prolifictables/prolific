@@ -42,9 +42,6 @@ function connectionDotClass(status: string) {
 export default function LoginScreen() {
   const navigate = useNavigate();
   const authActions = useAuthStore((s) => s.actions);
-  // Collapse demo PINs by default on narrow/short screens so the Sign In CTA sits above the fold;
-  // on wide terminals (>= lg) we always show the full hint card since vertical space isn't tight.
-  const [showDemoPins, setShowDemoPins] = useState(false);
 
   const [connection, setConnection] = useState<ConnectionPillState>({
     status: 'OFFLINE',
@@ -117,7 +114,7 @@ export default function LoginScreen() {
 
   const submitPin = async () => {
     if (pin.length < 4) {
-      setPinError('PIN must be 4–6 digits. Default PIN: 1234');
+      setPinError('PIN must be 4–6 digits.');
       return;
     }
     setPinSubmitting(true);
@@ -211,7 +208,7 @@ export default function LoginScreen() {
       // without asking the cashier to pick a branch explicitly.
       const found: any = await window.electronAPI?.db?.employees?.findByPin?.('', pin);
       if (!found) {
-        throw new Error('Incorrect PIN. Try 1234 for cashiers, 0000 supervisor, 9999 manager.');
+        throw new Error('Incorrect PIN. Please try again or ask your manager for assistance.');
       }
       const offlineEmployee = {
         id: found.id,
@@ -423,26 +420,6 @@ export default function LoginScreen() {
             >
               {pinSubmitting ? '🔐 Verifying PIN…' : '⚡ Sign In'}
             </button>
-
-            <div className="lg:hidden">
-              <button
-                type="button"
-                onClick={() => setShowDemoPins((v) => !v)}
-                className="w-full text-[11px] text-amber-300/90 hover:text-amber-200 font-bold underline-offset-2 hover:underline py-1 tracking-wide"
-              >
-                {showDemoPins ? '▲ Hide demo PINs' : '💡 Show demo PINs (1234 / 0000 / 9999)'}
-              </button>
-              {showDemoPins && (
-                <div className="mt-1 rounded-2xl p-2 ring-1 ring-inset ring-amber-500/20 bg-[linear-gradient(120deg,rgba(212,175,55,0.10),rgba(234,88,12,0.08))]">
-                  <div className="text-[10px] uppercase tracking-[0.14em] font-black text-amber-300 mb-1">💡 Demo PINs</div>
-                  <div className="text-[10px] text-ink-200 leading-snug space-y-0.5">
-                    <div><span className="font-black text-amber-200">1234</span> — Cashier</div>
-                    <div><span className="font-black text-amber-200">0000</span> — Supervisor</div>
-                    <div><span className="font-black text-amber-200">9999</span> — Manager</div>
-                  </div>
-                </div>
-              )}
-            </div>
           </div>
         </div>
       </div>
