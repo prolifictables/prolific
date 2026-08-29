@@ -1,0 +1,93 @@
+services:
+  - type: web
+    name: prolific-api
+    runtime: node
+    plan: free
+    region: oregon
+
+    buildCommand: npm ci && npx turbo run build --filter=@prolific/server...
+    startCommand: npm run start:prod --workspace=@prolific/server
+
+    healthCheckPath: /api/v1
+
+    buildFilter:
+      paths:
+        - server/**
+        - packages/**
+        - package.json
+        - package-lock.json
+        - turbo.json
+        - render.yaml
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      - key: MONGODB_URI
+        sync: false
+
+      - key: JWT_ACCESS_SECRET
+        sync: false
+
+      - key: JWT_REFRESH_SECRET
+        sync: false
+
+      - key: JWT_ACCESS_TTL_SECONDS
+        value: "1800"
+
+      - key: JWT_REFRESH_TTL_SECONDS
+        value: "604800"
+
+      - key: JWT_ISSUER
+        value: prolific.pos
+
+      - key: JWT_AUDIENCE
+        value: prolific.clients
+
+      - key: CORS_ORIGIN
+        value: https://prolifictables.com
+
+      - key: DEFAULT_PAYMENT_PROVIDER
+        value: PAYSTACK
+
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+
+      - key: PAYSTACK_PUBLIC_KEY
+        sync: false
+
+      - key: PAYSTACK_WEBHOOK_SECRET
+        sync: false
+
+      - key: FLUTTERWAVE_SECRET_KEY
+        sync: false
+
+      - key: FLUTTERWAVE_PUBLIC_KEY
+        sync: false
+
+      - key: FLUTTERWAVE_WEBHOOK_SECRET
+        sync: false
+
+      - key: SEED_ENABLED
+        value: "true"
+
+      - key: SEED_RUN_ONCE
+        value: "true"
+
+      - key: SEED_SUPERADMIN_EMAIL
+        value: superadmin@prolific.ai
+
+      - key: SEED_SUPERADMIN_PASSWORD
+        sync: false
+
+      - key: SEED_SUPERADMIN_FIRSTNAME
+        value: Super
+
+      - key: SEED_SUPERADMIN_LASTNAME
+        value: Admin
+
+      - key: RATE_LIMIT_AUTH
+        value: "20"
+
+      - key: RATE_LIMIT_DEFAULT
+        value: "500"
