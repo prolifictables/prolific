@@ -5,18 +5,37 @@ services:
     plan: free
     region: oregon
 
-    # Render defaults to latest Node (e.g. 26.x) which breaks native modules.
-    # Pin to Active LTS v20 — better-sqlite3 (used by POS only, not server)
-    # has prebuilt binaries for v20 so no native compile is triggered.
-    # Also note: the server workspace does NOT even use better-sqlite3; it is
-    # pulled in only by the POS/Electron workspaces via monorepo npm ci.
+    # NOTE ON BUILD COMMAND (professional Render monorepo pattern):
+    # ---------------------------------------------------------------------------
+    # If you have EVER set "Build Command" manually in the Render Web Service
+    # Dashboard → Environment tab, THAT manual override ALWAYS TAKES PRECEDENCE
+    # over render.yaml. If the deployed build still shows the OLD plain
+    # `npm ci && npx turbo...` in logs despite having this file committed, go
+    # to the Dashboard → Environment and DELETE the manual Build Command entry
+    # (or paste this exact line there).
     #
-    # NODE_ENV is set to `production` below for RUNTIME only. During BUILD we
-    # MUST explicitly set NODE_ENV=development for `npm ci`, otherwise npm
-    # skips devDependencies and turbo (a root devDep) is not installed at all
-    # → npx falls back to downloading the latest turbo global (v2) which
-    # breaks on the old turbo.json (pipeline → tasks rename).
-    buildCommand: NODE_ENV=development npm ci --ignore-scripts && NODE_ENV=production npx turbo run build --filter=@prolific/server...
+    # Key flags:
+    #   --include=dev         : Overrides NODE_ENV=production implicit
+    #                         : --omit=dev. Installs ALL devDependencies across
+    #                         : ROOT (turbo, typescript, @types/node) AND ALL
+    #                         : workspaces (shared-package @types/node, tsc).
+    #                         : This is the standard npm CI flag for TypeScript
+    #                         : monorepos where build tools ARE devDeps.
+    #                         : (Prior failure root cause: NODE_ENV=production
+    #                         : in envVars caused npm ci to skip EVERY devDep
+    #                         : → turbo missing + @types/node missing →
+    #                         : crypto TS2591.)
+    #   --ignore-scripts      : Skip postinstall hooks. The POS/Electron
+    #                         : workspace's better-sqlite3 native C++ postinstall
+    #                         : is POS-only and we never run it for server build
+    #                         : anyway (saves 5+ min, avoids V8 signature crash
+    #                         : on Node 26.x should pin ever slip).
+    #   NODE_ENV=production   : Only applied to TURBO/NESTJS build phase — Nest
+    #                         : needs this for webpack mode, ORM prod configs,
+    #                         : sourcemap stripping etc. npm ci above doesn't
+    #                         : need NODE_ENV prefix since --include=dev makes
+    #                         : install behavior unambiguous.
+    buildCommand: npm ci --include=dev --ignore-scripts && NODE_ENV=production npx turbo run build --filter=@prolific/server...
     startCommand: npm run start:prod --workspace=@prolific/server
 
     healthCheckPath: /api/v1
