@@ -1,0 +1,22 @@
+{
+  "name": "@prolific/database",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "typecheck": "tsc --noEmit --project tsconfig.json",
+    "lint": "echo \"No lint configured\"",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@prolific/shared-types": "*",
+    "mongoose": "^8.0.3",
+    "better-sqlite3": "^9.2.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "typescript": "^5.3.0"
+  }
+}

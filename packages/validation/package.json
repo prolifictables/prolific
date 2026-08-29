@@ -1,0 +1,20 @@
+{
+  "name": "@prolific/validation",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "typecheck": "tsc --noEmit --project tsconfig.json",
+    "lint": "echo \"No lint configured\"",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@prolific/shared-types": "*",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0"
+  }
+}
