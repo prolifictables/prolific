@@ -110,6 +110,24 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
           items = Array.isArray(mirror.items) ? (mirror.items as MenuItem[]) : [];
         }
       }
+      // Defensive ID normalization: shim/mirror paths may contain raw
+      // Mongoose ObjectId instances or legacy _id field names from earlier
+      // writes. Guarantee plain-string id & FKs so === equality never fails.
+      const norm = <T extends Record<string, any>>(x: T): T => {
+        const c: any = { ...x };
+        const oid = c.id ?? c._id;
+        if (oid != null) c.id = String(oid);
+        delete c._id;
+        for (const k of Object.keys(c)) {
+          if (k.endsWith('Id') && c[k] != null && typeof c[k] !== 'string') c[k] = String(c[k]);
+          if (Array.isArray(c[k]) && (k === 'modifierIds' || k === 'taxIds')) {
+            c[k] = c[k].map((y: any) => (typeof y === 'string' ? y : String(y)));
+          }
+        }
+        return c as T;
+      };
+      cats = cats.map(norm);
+      items = items.map(norm);
 
       setCategories(cats.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)));
       setAllItems(items);
@@ -169,11 +187,17 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
     };
   }, [searchQuery]);
 
+  // Safe ID equality: coerce both sides to strings. Server responses may
+  // contain ObjectId instances (Mongoose raw documents) in nested arrays
+  // while local React state values are always strings; === would otherwise
+  // always be false, filtering items to zero even when records exist.
+  const sidEq = (a: unknown, b: unknown) => String(a ?? '') === String(b ?? '');
+
   const filteredItems = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     let items = allItems;
     if (activeCategoryId) {
-      items = items.filter((i) => i.categoryId === activeCategoryId);
+      items = items.filter((i) => sidEq(i.categoryId, activeCategoryId));
     }
     if (q) {
       items = items.filter(
@@ -189,7 +213,8 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
     const map: Record<string, number> = {};
     for (const it of allItems) {
       if (!it.categoryId) continue;
-      map[it.categoryId] = (map[it.categoryId] || 0) + 1;
+      const key = String(it.categoryId);
+      map[key] = (map[key] || 0) + 1;
     }
     return map;
   }, [allItems]);
@@ -286,8 +311,12 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
-            {filteredItems.map((item) => (
-              <MenuItemTile key={item.id} item={item} onAdded={onItemAdded} />
+            {filteredItems.map((item, idx) => (
+              <MenuItemTile
+                key={String(item.id ?? (item as any)._id ?? `item-${idx}`)}
+                item={item}
+                onAdded={onItemAdded}
+              />
             ))}
           </div>
         )}

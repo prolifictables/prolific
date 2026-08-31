@@ -27,11 +27,55 @@ export type ApiListResult<T> = { data: T[] } | T[];
 
 // Unwrap either { data: [...] } or plain [...] responses consistently.
 function unwrapList<T>(raw: unknown): T[] {
-  if (Array.isArray(raw)) return raw as T[];
-  if (raw && typeof raw === 'object' && Array.isArray((raw as any).data)) {
-    return (raw as any).data as T[];
+  const arr = Array.isArray(raw)
+    ? (raw as T[])
+    : raw && typeof raw === 'object' && Array.isArray((raw as any).data)
+      ? ((raw as any).data as T[])
+      : [];
+  // Every returned doc might be a raw Mongoose document that serializes with
+  // `_id` but NOT the virtual `id`. Normalize so all consumers (ManagerTools
+  // editors, CategoryRail, write-through snapshots, MenuGrid equality checks)
+  // can rely on `id` being a consistent string and never hunt for `_id` fallback
+  // or compare ObjectId instance === string equality incorrectly.
+  return arr.map((doc) => normalizeDocIds(doc as any)) as T[];
+}
+
+// Single-doc normalization (used for create/update/delete returns).
+function unwrapSingle<T>(raw: any): T {
+  const doc = raw && raw.data !== undefined ? raw.data : raw;
+  return normalizeDocIds(doc) as T;
+}
+
+// Normalize Mongoose-style identifiers:
+//   - ensure `id` is a string (use _id if id missing)
+//   - ensure all foreign ID fields (categoryId, branchId, restaurantId,
+//     modifierIds[], taxIds[], recipeId, menuItemId etc.) are plain strings
+//     (never a leftover ObjectId from a lean() call or a mismatched serialize)
+//   - strip the raw _id field so there's no ambiguity after this point
+function normalizeDocIds<T extends Record<string, any>>(doc: T | null | undefined): T {
+  if (!doc || typeof doc !== 'object') return doc as unknown as T;
+  const cloned: Record<string, any> = Array.isArray(doc) ? [...doc] : { ...doc };
+  const rawId = cloned.id ?? cloned._id;
+  cloned.id = rawId == null ? undefined : String(rawId);
+  delete cloned._id;
+  for (const key of Object.keys(cloned)) {
+    const v = cloned[key];
+    if (v == null) continue;
+    if (key.endsWith('Id') && typeof v !== 'string') cloned[key] = String(v);
+    if (Array.isArray(v) && (key === 'modifierIds' || key === 'taxIds' || key === 'options')) {
+      cloned[key] = v.map((x: any) => {
+        if (x && typeof x === 'object' && (x.id || x._id)) {
+          const n = { ...x };
+          const oid = n.id ?? n._id;
+          if (oid != null) n.id = String(oid);
+          delete n._id;
+          return n;
+        }
+        return typeof x !== 'string' ? String(x) : x;
+      });
+    }
   }
-  return [];
+  return cloned as T;
 }
 
 async function call<T>(
@@ -72,7 +116,8 @@ async function call<T>(
     throw new Error(msg);
   }
   // Some endpoints return { data: <doc } envelope, others return the doc raw.
-  return (json && json.data !== undefined ? json.data : json) as T;
+  // Normalize IDs for all single-doc responses uniformly.
+  return unwrapSingle<T>(json);
 }
 
 // ============================ Categories =============================================
