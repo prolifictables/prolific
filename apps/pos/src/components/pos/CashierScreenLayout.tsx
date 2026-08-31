@@ -9,6 +9,7 @@ import type { ConnectionPillState, OpenShiftState } from '../../lib/types';
 import { pinLogin } from '../../lib/remote-auth';
 import { fetchPublicMenu } from '../../lib/remote-menu';
 import { fetchPosBootstrap } from '../../lib/remote-pos';
+import { applyRemoteMenuSnapshot } from '../../lib/mock-electron-shim';
 import Header from './Header';
 import MenuGrid from './MenuGrid';
 import CartPanel from './CartPanel';
@@ -138,6 +139,15 @@ export default function CashierScreenLayout() {
 
       try {
         const menu = await fetchPublicMenu(String(branch.id), undefined);
+        // Write to BOTH cache layers so the admin-uploaded menu is visible in
+        // every component regardless of where it reads from:
+        //  (a) browser-mode in-memory mock shim snapshot (applyRemoteMenuSnapshot)
+        //  (b) desktop-mode Electron SQLite (window.electronAPI.db.menu.applySnapshot)
+        applyRemoteMenuSnapshot({
+          categories: menu.categories,
+          items: menu.items,
+          modifiers: menu.modifiers,
+        });
         await window.electronAPI?.db?.menu?.applySnapshot?.({
           categories: menu.categories,
           items: menu.items,
@@ -148,10 +158,13 @@ export default function CashierScreenLayout() {
     };
 
     void refreshReferenceData();
+    // 15s polling: every admin-uploaded menu item shows up within one cashier
+    // interactive cycle (add-to-cart). Previously 60s which felt like "never
+    // updated" to managers watching POS after admin uploads.
     const t = setInterval(() => {
       if (!alive) return;
       void refreshReferenceData();
-    }, 60000);
+    }, 15000);
 
     return () => {
       alive = false;
@@ -1353,6 +1366,7 @@ export default function CashierScreenLayout() {
           <section className="flex-1 min-w-0 flex flex-col min-h-0">
             {activeTab === 'MENU' && (
               <MenuGrid
+                branchId={branch?.id}
                 onItemAdded={(item, modifiers) => {
                   cartActions.addItem(item, 1, modifiers);
                 }}

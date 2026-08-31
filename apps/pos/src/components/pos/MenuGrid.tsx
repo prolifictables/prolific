@@ -12,13 +12,20 @@ import {
 import { applyRemoteMenuSnapshot } from '@/lib/mock-electron-shim';
 
 interface MenuGridProps {
+  /**
+   * The authenticated employee's branch ID — this is the CANONICAL branch for
+   * menu fetching. If not provided (dev-only fallback), MenuGrid resolves the
+   * default public branch, but production always passes this prop so admin
+   * uploads made against the logged-in cashier's branch are reflected instantly.
+   */
+  branchId?: string | null;
   onItemAdded: (
     item: MenuItem,
     modifiers: { modifierId: string; optionIds: string[] }[]
   ) => void;
 }
 
-export default function MenuGrid({ onItemAdded }: MenuGridProps) {
+export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
   const [categories, setCategories] = useState<MenuCategory[]>([]);
   const [allItems, setAllItems] = useState<MenuItem[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -29,14 +36,20 @@ export default function MenuGrid({ onItemAdded }: MenuGridProps) {
 
   const refresh = async () => {
     try {
-      // Prefer the Admin Nest server (single source of truth).
-      const branchId = await resolveDefaultBranchId();
-      if (branchId) {
+      // Resolve branch: prefer the caller-supplied branch (logged-in cashier's
+      // branch) over any default-public-branch guess. This ensures admin menu
+      // uploads made under the employee's branch are shown immediately.
+      let resolvedBranchId: string | null = branchId || null;
+      if (!resolvedBranchId) {
+        resolvedBranchId = await resolveDefaultBranchId();
+      }
+      if (resolvedBranchId) {
         const { categories: apiCats, items: apiItems, modifiers: apiMods } =
-          await fetchPublicMenu(branchId);
-        // Write the snapshot into the shared mock/IPC source so every other
-        // POS component (ModifierModal, CartPanel, CartStore, etc.) also uses
-        // the server-owned data when it calls window.electronAPI.db.menuXxx.
+          await fetchPublicMenu(resolvedBranchId);
+        // Write BOTH cache layers so every POS consumer (ModifierModal,
+        // CartPanel, search, etc.) immediately sees admin-uploaded changes:
+        //  (a) mock-electron-shim in-memory snapshot (browser mode)
+        //  (b) Electron SQLite persistence (desktop mode via IPC)
         applyRemoteMenuSnapshot({
           categories: apiCats,
           items: apiItems,
@@ -55,7 +68,7 @@ export default function MenuGrid({ onItemAdded }: MenuGridProps) {
         setAllItems(apiItems);
         try {
           const list = await listPublicBranches();
-          const current = list.find((b) => b.id === branchId);
+          const current = list.find((b) => b.id === resolvedBranchId);
           setSourceLabel(current ? `📡 ${current.name}` : '📡 Live Menu');
         } catch {
           setSourceLabel('📡 Live Menu');
@@ -67,7 +80,7 @@ export default function MenuGrid({ onItemAdded }: MenuGridProps) {
     }
 
     // Local fallback: Electron IPC on desktop or the in-memory mock shim in
-    // pure browser preview mode.
+    // pure browser preview mode. Only reached when the server is truly down.
     try {
       const [catsRes, itemsRes]: any[] = await Promise.all([
         window.electronAPI?.db?.menuCategories?.listAll?.() || [],
@@ -88,9 +101,12 @@ export default function MenuGrid({ onItemAdded }: MenuGridProps) {
     }
   };
 
+  // Fetch every 8 seconds (faster than before) so admin menu uploads show
+  // within one interactive cycle. Also re-fetch when the caller changes the
+  // branchId prop (switching branches or login context changes).
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 15000);
+    const t = setInterval(refresh, 8000);
     const onFocus = () => {
       void refresh();
     };
@@ -104,7 +120,7 @@ export default function MenuGrid({ onItemAdded }: MenuGridProps) {
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, []);
+  }, [branchId]);
 
   useEffect(() => {
     if (!searchQuery.trim()) {

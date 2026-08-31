@@ -1154,6 +1154,26 @@ export function installMockElectronAPI() {
         },
       },
 
+      // Aggregated menu namespace. Electron SQLite implementation exists in the real
+      // desktop IPC bridge (ipc-db-bridge.ts). The browser mock shim was
+      // previously missing this, so LoginScreen + CashierScreenLayout calls to
+      // db.menu.applySnapshot were SILENT NO-OPS via the window.electronAPI?.db?.menu?.applySnapshot?.(...)
+      // optional chain — meaning the 60s / 15s reference refresh tick never actually
+      // populated the shared in-memory remoteMenuSnapshot from anywhere except in
+      // MenuGrid's own direct applyRemoteMenuSnapshot() call. Now both paths
+      // now both code paths converge to the same in-memory state:
+      menu: {
+        applySnapshot: async (snapshot: unknown) => {
+          const s = snapshot as { categories?: any[]; items?: any[]; modifiers?: any[] };
+          applyRemoteMenuSnapshot({
+            categories: Array.isArray(s?.categories) ? s.categories : [],
+            items: Array.isArray(s?.items) ? s.items : [],
+            modifiers: Array.isArray(s?.modifiers) ? s.modifiers : [],
+          });
+          return true;
+        },
+      },
+
       menuCategories: {
         listAll: async () => {
           await delay(5);
