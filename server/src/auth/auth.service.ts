@@ -10,8 +10,6 @@ import { Model, Types } from 'mongoose';
 import { JwtService } from '@nestjs/jwt';
 import { createHash, randomBytes } from 'crypto';
 import * as bcrypt from 'bcryptjs';
-import { readFileSync } from 'fs';
-import * as http from 'http';
 import * as S from '@prolific/shared-types';
 import { User } from '../users/schemas/user.schema';
 import { Employee } from '../employees/schemas/employee.schema';
@@ -20,79 +18,6 @@ import { Restaurant } from '../restaurants/schemas/restaurant.schema';
 import { Branch } from '../branches/schemas/branch.schema';
 import { RbacService } from '../rbac/rbac.service';
 import { AuthContext } from '../common/decorators/current-user.decorator';
-
-// #region debug-point employee-create-pos-pin:auth-service
-function dbgAuthService(event: Record<string, unknown>) {
-  try {
-    const fromEnv = process.env.DEBUG_SERVER_URL ? String(process.env.DEBUG_SERVER_URL) : '';
-    const sessionFromEnv = process.env.DEBUG_SESSION_ID ? String(process.env.DEBUG_SESSION_ID) : '';
-
-    const parsedFromFile = (() => {
-      try {
-        const candidates = [
-          `${process.cwd()}/.dbg/pos-pin-login-not-working.env`,
-          `${process.cwd()}/../.dbg/pos-pin-login-not-working.env`,
-          `${process.cwd()}/../../.dbg/pos-pin-login-not-working.env`,
-          `${process.cwd()}/.dbg/pos-invalid-pin.env`,
-          `${process.cwd()}/../.dbg/pos-invalid-pin.env`,
-          `${process.cwd()}/../../.dbg/pos-invalid-pin.env`,
-          `${process.cwd()}/.dbg/employee-create-pos-pin.env`,
-          `${process.cwd()}/../.dbg/employee-create-pos-pin.env`,
-          `${process.cwd()}/../../.dbg/employee-create-pos-pin.env`,
-        ];
-        const envPath = candidates.find((p) => {
-          try {
-            readFileSync(p, 'utf-8');
-            return true;
-          } catch {
-            return false;
-          }
-        });
-        if (!envPath) return { url: '', sessionId: '' };
-
-        const raw = readFileSync(envPath, 'utf-8');
-        const lines = raw.split('\n').map((l) => l.trim());
-        const urlLine = lines.find((l) => l.startsWith('DEBUG_SERVER_URL='));
-        const sessionLine = lines.find((l) => l.startsWith('DEBUG_SESSION_ID='));
-        return {
-          url: urlLine ? urlLine.replace('DEBUG_SERVER_URL=', '').trim() : '',
-          sessionId: sessionLine ? sessionLine.replace('DEBUG_SESSION_ID=', '').trim() : '',
-        };
-      } catch {
-        return { url: '', sessionId: '' };
-      }
-    })();
-
-    const envRaw = fromEnv || parsedFromFile.url;
-    const sessionId = sessionFromEnv || parsedFromFile.sessionId || 'pos-invalid-pin';
-    if (!envRaw) return;
-    const url = new URL(envRaw);
-    const body = JSON.stringify({
-      ts: Date.now(),
-      sessionId,
-      scope: 'server.auth.service',
-      ...event,
-    });
-    const req = http.request(
-      {
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      },
-      (res) => res.resume()
-    );
-    req.on('error', () => {});
-    req.write(body);
-    req.end();
-  } catch {
-  }
-}
-// #endregion
 
 export interface TokenPair {
   accessToken: string;
@@ -319,23 +244,12 @@ export class AuthService {
     opts: { branchId?: string; deviceId?: string } = {}
   ): Promise<LoginResult> {
     try {
-      void dbgAuthService({
-        event: 'loginWithPin.enter',
-        branchId: opts?.branchId,
-        pinLen: pin ? String(pin).trim().length : 0,
-        hasDeviceId: Boolean(opts?.deviceId),
-      });
-      // branchId is now OPTIONAL for loginWithPin — if omitted the system
-      // finds the employee by PIN alone and uses their assigned branch.
-      // This lets the POS skip branch selection UI entirely.
       const requestedBranchId = opts.branchId ? String(opts.branchId) : null;
       const pinStr = String(pin || '').trim();
       if (pinStr.length < 4 || pinStr.length > 6 || !/^\d+$/.test(pinStr)) {
         throw new BadRequestException('PIN must be 4-6 digits');
       }
 
-      // Phase 1: if a specific branch was requested, narrow candidate search
-      // to that branch first (existing behaviour).
       let employee: Employee | null = null;
       let branchDoc: (Branch & { _id: any }) | null = null;
       if (requestedBranchId) {
@@ -345,58 +259,20 @@ export class AuthService {
         const branchIdAliases = branchDoc?.name
           ? [requestedBranchId, String(branchDoc.name)]
           : [requestedBranchId];
-        void dbgAuthService({
-          event: 'loginWithPin.branchResolve',
-          branchId: requestedBranchId,
-          branchFound: Boolean(branchDoc),
-          branchName: branchDoc?.name || null,
-          branchIdAliases,
-        });
         const candidates = await this.employeeModel
           .find({
             branchId: { $in: branchIdAliases },
             pin: { $exists: true, $ne: null },
-            // Belt+suspenders: legacy employees may have no `status` field at all
-            // (Employee schema didn't define it originally). Treat missing/null
-            // as ACTIVE so they can still log in; only explicit INACTIVE blocks.
             $or: [{ status: { $exists: false } }, { status: null }, { status: 'ACTIVE' }],
           })
           .limit(500)
           .exec();
-        void dbgAuthService({
-          event: 'loginWithPin.candidates',
-          branchId: requestedBranchId,
-          candidateCount: candidates.length,
-          // H3: enumerate each candidate: _id, role, status (raw from doc), pin exists, pin hash prefix
-          candidates: candidates.map((e:any) => ({
-            _id: e._id ? String(e._id) : null,
-            role: e.role || null,
-            statusRaw: (e.status !== undefined ? String(e.status) : '__MISSING__'),
-            pinHashPrefix: typeof e.pin === 'string' ? e.pin.slice(0,15) : null,
-            branchId: e.branchId ? String(e.branchId) : null,
-          })),
-        });
         for (const e of candidates) {
           const status = String((e as any).status || 'ACTIVE').toUpperCase();
           if (status !== 'ACTIVE') continue;
           const hash = (e as any).pin;
           if (!hash) continue;
-          // H2: explicitly log before/after compare with types + lengths
-          const pinForCompare = pinStr;
-          const compareStart = {
-            candidateId: (e as any)._id ? String((e as any)._id) : null,
-            pinStrLen: pinForCompare.length,
-            pinStrType: typeof pinForCompare,
-            pinStrChars: pinForCompare, // raw digits to compare vs what admin typed
-            hashType: typeof hash,
-            hashPrefix: String(hash).slice(0,15),
-          };
-          const ok = await bcrypt.compare(pinForCompare, String(hash));
-          void dbgAuthService({
-            event: 'loginWithPin.branchBcrypt',
-            ...compareStart,
-            compareResult: ok,
-          });
+          const ok = await bcrypt.compare(pinStr, String(hash));
           if (ok) {
             employee = e;
             break;
@@ -404,55 +280,20 @@ export class AuthService {
         }
       }
 
-      // Phase 2: if no match yet (either branchId was omitted, or the PIN
-      // wasn't found in that branch) — search the entire employee collection
-      // globally. This handles the default "just enter PIN, no branch picker"
-      // POS login flow.
       if (!employee) {
         const globalCandidates = await this.employeeModel
           .find({
             pin: { $exists: true, $ne: null },
-            // Same belt+suspenders for legacy employees without a `status` field:
-            // missing/null → treated as ACTIVE in Mongo query, then double-checked
-            // in the inner loop below. Only explicit INACTIVE is excluded.
             $or: [{ status: { $exists: false } }, { status: null }, { status: 'ACTIVE' }],
           })
           .limit(2000)
           .exec();
-        void dbgAuthService({
-          event: 'loginWithPin.fallbackCandidates',
-          requestedBranchId,
-          candidateCount: globalCandidates.length,
-          // H3: enumerate each global candidate
-          candidates: globalCandidates.map((e:any) => ({
-            _id: e._id ? String(e._id) : null,
-            role: e.role || null,
-            statusRaw: (e.status !== undefined ? String(e.status) : '__MISSING__'),
-            pinHashPrefix: typeof e.pin === 'string' ? e.pin.slice(0,15) : null,
-            branchId: e.branchId ? String(e.branchId) : null,
-          })),
-        });
         for (const e of globalCandidates) {
           const status = String((e as any).status || 'ACTIVE').toUpperCase();
           if (status !== 'ACTIVE') continue;
           const hash = (e as any).pin;
           if (!hash) continue;
-          // H2: explicit before/after bcrypt.compare with pin literal shown
-          const pinForCompare = pinStr;
-          const compareStart = {
-            candidateId: (e as any)._id ? String((e as any)._id) : null,
-            pinStrLen: pinForCompare.length,
-            pinStrType: typeof pinForCompare,
-            pinStrChars: pinForCompare, // raw digits entered on POS keypad
-            hashType: typeof hash,
-            hashPrefix: String(hash).slice(0,15),
-          };
-          const ok = await bcrypt.compare(pinForCompare, String(hash));
-          void dbgAuthService({
-            event: 'loginWithPin.fallbackBcrypt',
-            ...compareStart,
-            compareResult: ok,
-          });
+          const ok = await bcrypt.compare(pinStr, String(hash));
           if (ok) {
             employee = e;
             break;
@@ -461,10 +302,6 @@ export class AuthService {
       }
 
       if (!employee) {
-        void dbgAuthService({
-          event: 'loginWithPin.invalidPin',
-          requestedBranchId,
-        });
         throw new UnauthorizedException('Invalid PIN');
       }
 
@@ -535,13 +372,6 @@ export class AuthService {
       };
 
       const tokens = await this.issueTokenPair(ctx);
-      void dbgAuthService({
-        event: 'loginWithPin.success',
-        branchId: employee.branchId,
-        employeeId: employee._id.toString(),
-        userId: user._id.toString(),
-        role,
-      });
 
       let restaurant: Partial<S.Restaurant> | null = null;
       let branch: Partial<S.Branch> | null = null;
@@ -616,14 +446,6 @@ export class AuthService {
         branches,
       };
     } catch (err) {
-      const e = err as any;
-      void dbgAuthService({
-        event: 'loginWithPin.error',
-        error: {
-          name: e?.name,
-          message: e?.message,
-        },
-      });
       throw err;
     }
   }

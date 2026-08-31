@@ -977,6 +977,67 @@ export function installMockElectronAPI() {
           await delay(25);
           const resolvedPin: string =
             typeof pin === 'string' && pin !== undefined ? pin : pinOrBranchId;
+
+          // ---------------------------------------------------------------------
+          // Belt + suspenders: In browser preview mode (this shim is active only
+          // when real Electron preload is absent), the SEEDED_EMPLOYEES array
+          // only contains demo cashiers, never employees created/reset via
+          // Admin Portal Mongo. So first try the real server-side PIN login
+          // endpoint: if it succeeds (returning an employee) we convert the
+          // returned {user,employee,restaurant,branch} envelope back into a
+          // flat employee document the caller expects. Only fall back to
+          // SEEDED_EMPLOYEES when the server is truly unreachable (offline)
+          // or explicitly rejects the PIN.
+          // ---------------------------------------------------------------------
+          try {
+            const API_BASE_FOR_SHIM =
+              (typeof import.meta !== 'undefined' &&
+                (import.meta as any).env &&
+                ((import.meta as any).env.VITE_API_BASE_URL ||
+                  (import.meta as any).env.VITE_API_URL ||
+                  (import.meta as any).env.VITE_PUBLIC_API_URL ||
+                  (import.meta as any).env.API_BASE_URL)) ||
+              'http://localhost:4000/api/v1';
+            const resp = await fetch(`${API_BASE_FOR_SHIM}/auth/pin/login`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ pin: resolvedPin }),
+            });
+            if (resp.ok) {
+              const payload = await resp.json().catch(() => ({}));
+              const envelope = (payload && payload.data) ? payload.data : payload;
+              const emp = envelope?.employee;
+              const usr = envelope?.user;
+              if (emp && emp.id) {
+                // Return a flat shape that matches the rest of the shim
+                // (callers downstream read .id / .userId / .firstName etc.)
+                return {
+                  id: emp.id,
+                  userId: emp.userId ?? usr?.id ?? null,
+                  restaurantId: emp.restaurantId ?? envelope?.restaurant?.id ?? null,
+                  branchId: emp.branchId ?? envelope?.branch?.id ?? null,
+                  role: emp.role,
+                  firstName: usr?.firstName ?? '',
+                  lastName: usr?.lastName ?? '',
+                  name: usr ? `${usr.firstName ?? ''} ${usr.lastName ?? ''}`.trim() : '',
+                  email: usr?.email ?? '',
+                  phone: usr?.phone ?? '',
+                  pin: resolvedPin,
+                  positionTitle: emp.positionTitle ?? '',
+                  status: 'ACTIVE',
+                };
+              }
+            }
+            // If server returned 401 (explicit Invalid PIN) propagate the
+            // miss: do NOT fall back to SEEDED (gives wrong UX).
+            if (resp.status === 401 || resp.status === 400 || resp.status === 403) {
+              return null;
+            }
+          } catch {
+            // Network / server unavailable → fall through to SEEDED_EMPLOYEES
+            // (the truly offline scenario / dev fallback).
+          }
+
           return SEEDED_EMPLOYEES.find((e) => e.pin === resolvedPin) || null;
         },
         applySnapshot: async (_employees: unknown) => {

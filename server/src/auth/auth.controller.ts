@@ -42,9 +42,6 @@ export class AuthController {
       deviceId?: string;
     }
   ) {
-    // #region debug-point pos-pin-login-not-working:F-controller-entry
-    (()=>{try{const fs=require('fs'),paths=[`${process.cwd()}/.dbg/pos-pin-login-not-working.env`,`${process.cwd()}/../.dbg/pos-pin-login-not-working.env`,`${process.cwd()}/../../.dbg/pos-pin-login-not-working.env`];let u='http://127.0.0.1:7777/event',s='pos-pin-login-not-working';try{const p=paths.find(p=>{try{fs.readFileSync(p,'utf8');return true}catch{return false}});if(p){const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}}catch{}const http=require('http');const body_s=JSON.stringify({ts:Date.now(),sessionId:s,runId:'pre-fix',hypothesisId:'H4',location:'auth.controller.ts:pin/login',msg:'[DEBUG] pin/login controller entry',data:{bodyKeys:Object.keys(body||{}),pinType:typeof body?.pin,pinLen:body?.pin?String(body.pin).length:0,pinDigitsOnly:body?.pin?!/^\d+$/.test(String(body.pin)):null,branchId:body?.branchId??null,hasDeviceId:Boolean(body?.deviceId)}});const url=require('url').parse(u);const req=http.request({hostname:url.hostname,port:url.port,path:url.pathname,method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body_s)}},r=>r.resume());req.on('error',()=>{});req.write(body_s);req.end()}catch{}})();
-    // #endregion
     if (!body?.pin) throw new Error('pin required');
     // branchId is now OPTIONAL — when omitted the backend resolves the
     // employee's assigned branch automatically so the POS no longer needs

@@ -9,69 +9,6 @@ import { RequiredPermissions } from '../common/decorators/permissions.decorator'
 import { TablesService } from '../tables/tables.service';
 import { Employee } from '../employees/schemas/employee.schema';
 import { User } from '../users/schemas/user.schema';
-import { readFileSync } from 'fs';
-import * as http from 'http';
-
-// #region debug-point employee-create-pos-pin:pos-bootstrap
-function dbgPosBootstrap(event: Record<string, unknown>) {
-  try {
-    const envRaw =
-      process.env.DEBUG_SERVER_URL ||
-      (() => {
-        try {
-          const candidates = [
-            `${process.cwd()}/.dbg/employee-create-pos-pin.env`,
-            `${process.cwd()}/../.dbg/employee-create-pos-pin.env`,
-            `${process.cwd()}/../../.dbg/employee-create-pos-pin.env`,
-          ];
-          const envPath = candidates.find((p) => {
-            try {
-              readFileSync(p, 'utf-8');
-              return true;
-            } catch {
-              return false;
-            }
-          });
-          if (!envPath) return '';
-
-          const raw = readFileSync(envPath, 'utf-8');
-          const line = raw
-            .split('\n')
-            .map((l) => l.trim())
-            .find((l) => l.startsWith('DEBUG_SERVER_URL='));
-          return line ? line.replace('DEBUG_SERVER_URL=', '').trim() : '';
-        } catch {
-          return '';
-        }
-      })();
-    if (!envRaw) return;
-    const url = new URL(envRaw);
-    const body = JSON.stringify({
-      ts: Date.now(),
-      sessionId: 'employee-create-pos-pin',
-      scope: 'server.pos.bootstrap',
-      ...event,
-    });
-    const req = http.request(
-      {
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      },
-      (res) => res.resume()
-    );
-    req.on('error', () => {});
-    req.write(body);
-    req.end();
-  } catch {
-  }
-}
-// #endregion
 
 @Controller('pos')
 @UseGuards(JwtAuthGuard, PermissionsGuard)
@@ -88,7 +25,6 @@ export class PosController {
   async bootstrap(@CurrentUser() ctx: AuthContext) {
     const branchId = ctx.branchId;
     if (!branchId) throw new BadRequestException('Branch context required');
-    void dbgPosBootstrap({ event: 'bootstrap.enter', branchId, userId: ctx.userId, role: ctx.role });
 
     const [employeeDocs, tables] = await Promise.all([
       this.employeeModel
@@ -129,13 +65,6 @@ export class PosController {
         email: u?.email,
         phone: u?.phone,
       };
-    });
-    void dbgPosBootstrap({
-      event: 'bootstrap.result',
-      branchId,
-      employeeCount: employees.length,
-      tableCount: tables.length,
-      employeesWithPinHash: employees.filter((e: any) => Boolean(e.pinHash)).length,
     });
 
     return {

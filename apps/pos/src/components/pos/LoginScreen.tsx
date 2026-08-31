@@ -103,13 +103,19 @@ export default function LoginScreen() {
 
   const pressPin = (k: string) => {
     if (k === '⌫') {
-      setPin((p) => p.slice(0, -1));
+      setPin((p) => {
+        const next = p.slice(0, -1);
+        return next;
+      });
       setPinError(null);
       return;
     }
     if (!k) return;
     if (pin.length >= 6) return;
-    setPin((p) => p + k);
+    setPin((p) => {
+      const next = p + k;
+      return next;
+    });
   };
 
   const submitPin = async () => {
@@ -194,39 +200,29 @@ export default function LoginScreen() {
         navigate('/pos', { replace: true });
         return;
       } catch (err: any) {
-        // #region debug-point pos-pin-login-not-working:F-submitPin-catch
-        (() => {
-          try {
-            fetch("http://127.0.0.1:7777/event", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                sessionId: "pos-pin-login-not-working",
-                runId: "pre-fix",
-                hypothesisId: "H4",
-                location: "apps/pos/src/components/pos/LoginScreen.tsx submitPin pinLogin catch",
-                msg: "[DEBUG] Online pinLogin FAILED — falling through to offline fallback shim findByPin",
-                data: {
-                  pinEntered: pin,
-                  pinType: typeof pin,
-                  pinLen: String(pin).length,
-                  errName: err?.name,
-                  errMessage: err?.message || String(err),
-                  hasElectronDbFindByPin: Boolean(window.electronAPI?.db?.employees?.findByPin),
-                },
-                ts: Date.now(),
-              }),
-            }).catch(() => {});
-          } catch {}
-        })();
-        // #endregion
-        // Always fall through to offline mock shim / local SQLite fallback
-        // regardless of the specific pinLogin failure type. This covers:
-        // network failures, HTTP 401/500 from backend, CORS issues, invalid
-        // deviceId, JSON parse errors, and any other unexpected exceptions.
-        // In dev browser mode the mock-electron-shim provides seeded PINs
-        // (1234 cashier, 0000 supervisor, 9999 manager); in production
-        // Electron builds the real local SQLite employee cache is used.
+        // --- Defensive guard: ONLY fall through to offline shim for real
+        // network/unreachable errors (TypeError "Failed to fetch",
+        // network errors, HTTP 5xx). If the backend explicitly said Invalid PIN
+        // (401 Unauthorized, Invalid PIN in message, or 4xx) we throw that
+        // message immediately so the user sees the real reason; do NOT blindly fall
+        // through to findByPin (which in dev browser mode only knows a
+        // small SEEDED_EMPLOYEES array and never matches admin-created pins.
+        // Normalize error message once for all credential-rejection patterns
+        const msg = String(err?.message || String(err));
+        const isInvalidPinResponse =
+          /invalid pin/i.test(msg) ||
+          /unauthorized/i.test(msg) ||
+          /http 4\d\d/i.test(msg) ||
+          /pin must be/i.test(msg);
+        if (isInvalidPinResponse) {
+          // Explicit credential rejection from backend: re-raise the exact
+          // error so the UI sets pinError and never touches the offline shim
+          // (which would only know hardcoded demo pins).
+          throw new Error(err?.message || 'Incorrect PIN.');
+        }
+        // Otherwise fall through to offline mock shim / local SQLite fallback
+        // when there was no real credential answer: network failures, HTTP 5xx, CORS
+        // issues, parse errors, missing fields, etc.
       }
 
       // --- Offline fallback: find employee by PIN across all locally cached

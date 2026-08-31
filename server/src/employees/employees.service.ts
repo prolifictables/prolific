@@ -7,90 +7,12 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import * as bcrypt from 'bcryptjs';
-import { readFileSync } from 'fs';
-import * as http from 'http';
 import * as S from '@prolific/shared-types';
 import { Employee } from './schemas/employee.schema';
 import { User } from '../users/schemas/user.schema';
 import { Branch } from '../branches/schemas/branch.schema';
 import type { AuthContext } from '../common/decorators/current-user.decorator';
 import { RbacService } from '../rbac/rbac.service';
-
-// #region debug-point employee-create-pos-pin:employees-service
-function dbgEmployeesService(event: Record<string, unknown>) {
-  try {
-    const fromEnv = process.env.DEBUG_SERVER_URL ? String(process.env.DEBUG_SERVER_URL) : '';
-    const sessionFromEnv = process.env.DEBUG_SESSION_ID ? String(process.env.DEBUG_SESSION_ID) : '';
-
-    const parsedFromFile = (() => {
-      try {
-        const candidates = [
-          `${process.cwd()}/.dbg/pos-pin-login-not-working.env`,
-          `${process.cwd()}/../.dbg/pos-pin-login-not-working.env`,
-          `${process.cwd()}/../../.dbg/pos-pin-login-not-working.env`,
-          `${process.cwd()}/.dbg/reset-pin-not-found.env`,
-          `${process.cwd()}/../.dbg/reset-pin-not-found.env`,
-          `${process.cwd()}/../../.dbg/reset-pin-not-found.env`,
-          `${process.cwd()}/.dbg/employees-500-error.env`,
-          `${process.cwd()}/../.dbg/employees-500-error.env`,
-          `${process.cwd()}/../../.dbg/employees-500-error.env`,
-          `${process.cwd()}/.dbg/employee-create-pos-pin.env`,
-          `${process.cwd()}/../.dbg/employee-create-pos-pin.env`,
-          `${process.cwd()}/../../.dbg/employee-create-pos-pin.env`,
-        ];
-        const envPath = candidates.find((p) => {
-          try {
-            readFileSync(p, 'utf-8');
-            return true;
-          } catch {
-            return false;
-          }
-        });
-        if (!envPath) return { url: '', sessionId: '' };
-
-        const raw = readFileSync(envPath, 'utf-8');
-        const lines = raw.split('\n').map((l) => l.trim());
-        const urlLine = lines.find((l) => l.startsWith('DEBUG_SERVER_URL='));
-        const sessionLine = lines.find((l) => l.startsWith('DEBUG_SESSION_ID='));
-        return {
-          url: urlLine ? urlLine.replace('DEBUG_SERVER_URL=', '').trim() : '',
-          sessionId: sessionLine ? sessionLine.replace('DEBUG_SESSION_ID=', '').trim() : '',
-        };
-      } catch {
-        return { url: '', sessionId: '' };
-      }
-    })();
-
-    const envRaw = fromEnv || parsedFromFile.url;
-    const sessionId = sessionFromEnv || parsedFromFile.sessionId || 'employees-500-error';
-    if (!envRaw) return;
-    const url = new URL(envRaw);
-    const body = JSON.stringify({
-      ts: Date.now(),
-      sessionId,
-      scope: 'server.employees.service',
-      ...event,
-    });
-    const req = http.request(
-      {
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      },
-      (res) => res.resume()
-    );
-    req.on('error', () => {});
-    req.write(body);
-    req.end();
-  } catch {
-  }
-}
-// #endregion
 
 export interface CreateEmployeeInput {
   branchId?: string;
@@ -160,19 +82,6 @@ export class EmployeesService {
     ctx: AuthContext,
     filters: ListEmployeesFilters = {}
   ): Promise<PaginatedResult<any>> {
-    void dbgEmployeesService({
-      event: 'listEmployees.enter',
-      ctxPresent: Boolean(ctx),
-      ctx: ctx
-        ? {
-            role: (ctx as any).role,
-            branchId: (ctx as any).branchId,
-            restaurantId: (ctx as any).restaurantId,
-            userId: (ctx as any).userId,
-          }
-        : null,
-      filters,
-    });
     const isSuperAdmin = ctx.role === S.Role.SUPER_ADMIN;
     const branchId = ctx.branchId;
     if (!branchId && !isSuperAdmin) throw new BadRequestException('Branch context required');
@@ -222,20 +131,6 @@ export class EmployeesService {
       const branchIds = Array.from(new Set(data.map((e: any) => String(e.branchId || '')).filter(Boolean)));
       const validBranchIds = branchIds.filter((id) => Types.ObjectId.isValid(id));
       const invalidBranchIds = branchIds.filter((id) => !Types.ObjectId.isValid(id));
-      void dbgEmployeesService({
-        event: 'listEmployees.ids',
-        count,
-        uniqueUserIds: userIds.length,
-        uniqueBranchIds: branchIds.length,
-        sampleBranchIds: branchIds.slice(0, 10),
-      });
-      if (invalidBranchIds.length) {
-        void dbgEmployeesService({
-          event: 'listEmployees.invalidBranchIds',
-          invalidBranchIds: invalidBranchIds.slice(0, 20),
-          invalidBranchIdsCount: invalidBranchIds.length,
-        });
-      }
 
       const [users, branches] = await Promise.all([
         userIds.length ? this.userModel.find({ _id: { $in: userIds } }).exec() : Promise.resolve([]),
@@ -287,22 +182,8 @@ export class EmployeesService {
         };
       });
 
-      void dbgEmployeesService({
-        event: 'listEmployees.success',
-        count,
-        hasMore,
-      });
       return { data: enriched, meta: { cursor, count, hasMore } };
     } catch (err) {
-      const e = err as any;
-      void dbgEmployeesService({
-        event: 'listEmployees.error',
-        error: {
-          name: e?.name,
-          message: e?.message,
-          stack: typeof e?.stack === 'string' ? e.stack.slice(0, 2000) : undefined,
-        },
-      });
       throw err;
     }
   }
@@ -311,27 +192,6 @@ export class EmployeesService {
     ctx: AuthContext,
     input: CreateEmployeeInput
   ): Promise<Employee> {
-    void dbgEmployeesService({
-      event: 'createEmployee.enter',
-      ctxPresent: Boolean(ctx),
-      ctx: ctx
-        ? {
-            role: (ctx as any).role,
-            branchId: (ctx as any).branchId,
-            restaurantId: (ctx as any).restaurantId,
-            userId: (ctx as any).userId,
-          }
-        : null,
-      input: {
-        branchId: input.branchId,
-        email: input.email,
-        role: input.role,
-        hasPin: Boolean(input.pin),
-        pinLen: input.pin ? String(input.pin).length : 0,
-        employeeNumber: input.employeeNumber ?? null,
-      },
-    });
-
     try {
     const isSuperAdmin = ctx.role === S.Role.SUPER_ADMIN;
     const branchId = (isSuperAdmin ? input.branchId : ctx.branchId) || ctx.branchId;
@@ -417,26 +277,8 @@ export class EmployeesService {
       joinedAt: input.joinedAt ?? new Date(),
     });
 
-    void dbgEmployeesService({
-      event: 'createEmployee.success',
-      employeeId: employee?._id?.toString?.() || null,
-      branchId,
-      restaurantId,
-      role: input.role,
-      pinSaved: Boolean((employee as any)?.pin),
-    });
-
     return employee;
     } catch (err) {
-      const e = err as any;
-      void dbgEmployeesService({
-        event: 'createEmployee.error',
-        error: {
-          name: e?.name,
-          message: e?.message,
-          code: e?.code,
-        },
-      });
       throw err;
     }
   }
@@ -524,21 +366,6 @@ export class EmployeesService {
     id: string
   ): Promise<ResetPinResult> {
     try {
-      void dbgEmployeesService({
-        event: 'resetPin.enter',
-        ctxPresent: Boolean(ctx),
-        ctx: ctx
-          ? {
-              role: (ctx as any).role,
-              branchId: (ctx as any).branchId,
-              restaurantId: (ctx as any).restaurantId,
-              userId: (ctx as any).userId,
-              employeeId: (ctx as any).employeeId,
-            }
-          : null,
-        id,
-        idIsObjectId: Types.ObjectId.isValid(id),
-      });
       const branchId = ctx.branchId;
       if (!branchId) throw new BadRequestException('Branch context required');
 
@@ -548,58 +375,21 @@ export class EmployeesService {
         this.employeeModel.findOne({ _id: id, branchId: { $in: branchIdAliases } }).exec(),
         this.employeeModel.findOne({ _id: id }).exec(),
       ]);
-      void dbgEmployeesService({
-        event: 'resetPin.lookup',
-        id,
-        branchId,
-        branchIdAliases,
-        inBranchFound: Boolean(employeeInBranch),
-        anyBranchFound: Boolean(employeeAnyBranch),
-        anyBranchEmployeeBranchId: employeeAnyBranch
-          ? (employeeAnyBranch as any).branchId
-          : null,
-        anyBranchEmployeeUserId: employeeAnyBranch ? (employeeAnyBranch as any).userId : null,
-      });
       const employee = employeeInBranch;
       if (!employee) throw new NotFoundException(`Employee ${id} not found`);
 
       const rawPin = Math.floor(1000 + Math.random() * 9000).toString();
       const hashedPin = await bcrypt.hash(rawPin, 10);
 
-      const updatedDoc = await this.employeeModel
+      await this.employeeModel
         .findByIdAndUpdate(employee._id, { $set: { pin: hashedPin } }, { new: true })
         .exec();
 
-      // Verify the write actually landed by re-reading
-      const postRead = await this.employeeModel.findById(employee._id).exec();
-      void dbgEmployeesService({
-        event: 'resetPin.success',
-        employeeId: employee?._id?.toString?.() || null,
-        branchId: (employee as any)?.branchId ?? null,
-        // H1: exact rawPin that will be shown to the admin in the toast
-        rawPin,
-        // H1: hashed pin prefix (first 15 chars of $2b$...) to compare with post-write
-        hashedPinPrefix: hashedPin.slice(0, 15),
-        // H5: whether findByIdAndUpdate returned a document
-        updateReturnedDoc: Boolean(updatedDoc),
-        // H5: post-read pin field matches expected hash
-        postReadPinMatches: postRead && (postRead as any).pin === hashedPin,
-        postReadPinPrefix: postRead && (postRead as any).pin ? (postRead as any).pin.slice(0, 15) : null,
-      });
       return {
         employeeId: id,
         rawPin,
       };
     } catch (err) {
-      const e = err as any;
-      void dbgEmployeesService({
-        event: 'resetPin.error',
-        id,
-        error: {
-          name: e?.name,
-          message: e?.message,
-        },
-      });
       throw err;
     }
   }

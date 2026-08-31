@@ -1,7 +1,24 @@
 import { nanoid } from 'nanoid';
-import { createHash } from 'crypto';
 import clsx, { ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+
+// Node's `crypto` module is NOT available in browser environments and Vite
+// externalizes it to a proxy that throws on property access. To avoid the
+// entire utils module failing to import when loaded by browser frontends
+// (POS / Admin / Website / KDS — none of which actually need sha256 hashing)
+// we resolve `createHash` on-demand inside generateIdempotencyKey rather
+// than via a top-level static ESM import. Browser callers that reach
+// generateIdempotencyKey (none today) fall back to nanoid-based UUID.
+function tryGetNodeCreateHash() {
+  try {
+    // require-style dynamic resolution works in Node / Nest runtimes; the
+    // string literal avoids bundlers (Vite / Webpack) from tracing it.
+    const mod = (globalThis as any).require?.('crypto');
+    return mod?.createHash as typeof import('crypto').createHash | undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(...inputs));
@@ -28,7 +45,13 @@ export const generateIdempotencyKey = (
   entityUniqueInput: string
 ): string => {
   const base = `${entityType}:${entityUniqueInput}:${Date.now()}`;
-  return createHash('sha256').update(base).digest('hex');
+  const createHash = tryGetNodeCreateHash();
+  // Node runtime (server-side) -> use sha256 for a stable opaque digest.
+  if (createHash) return createHash('sha256').update(base).digest('hex');
+  // Browser runtime -> the function is not called from frontends today, but
+  // if it ever is we still need a sync unique string. nanoid is
+  // cryptographically random and collision-safe for idempotency keys.
+  return `${base}__${nanoid(40)}`;
 };
 
 export const formatMoney = (

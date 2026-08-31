@@ -56,34 +56,6 @@ export async function pinLogin(opts: {
   if (opts.branchId) payload.branchId = opts.branchId;
   if (opts.deviceId !== undefined) payload.deviceId = opts.deviceId;
 
-  // #region debug-point pos-pin-login-not-working:F-remote-auth
-  (() => {
-    try {
-      fetch("http://127.0.0.1:7777/event", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId: "pos-pin-login-not-working",
-          runId: "pre-fix",
-          hypothesisId: "H4",
-          location: "apps/pos/src/lib/remote-auth.ts pinLogin",
-          msg: "[DEBUG] POS pinLogin remote-auth request built",
-          data: {
-            apiBase: API_BASE,
-            bodyPinType: typeof payload.pin,
-            bodyPinStr: String(payload.pin),
-            bodyPinLen: String(payload.pin).length,
-            hasBranchId: 'branchId' in payload,
-            branchId: (payload as any).branchId || null,
-            hasDeviceId: 'deviceId' in payload,
-          },
-          ts: Date.now(),
-        }),
-      }).catch(() => {});
-    } catch {}
-  })();
-  // #endregion
-
   let res: Response;
   try {
     res = await guardedFetch(() =>
@@ -95,41 +67,13 @@ export async function pinLogin(opts: {
       })
     );
   } catch (err: any) {
-    // H4: network-level exception before any response
-    (() => { try { fetch("http://127.0.0.1:7777/event", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: "pos-pin-login-not-working", runId: "pre-fix", hypothesisId: "H4", location: "apps/pos/src/lib/remote-auth.ts pinLogin catch", msg: "[DEBUG] POS pinLogin network error", data: { errName: err?.name, errMessage: err?.message || String(err) }, ts: Date.now() }) }).catch(() => {}); } catch {} })();
     throw err;
   }
-
-  // #region debug-point pos-pin-login-not-working:F-remote-auth-response
-  (() => {
-    try {
-      fetch("http://127.0.0.1:7777/event", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId: "pos-pin-login-not-working",
-          runId: "pre-fix",
-          hypothesisId: "H4",
-          location: "apps/pos/src/lib/remote-auth.ts pinLogin response",
-          msg: "[DEBUG] POS pinLogin HTTP response received",
-          data: {
-            statusCode: res.status,
-            statusText: res.statusText,
-            contentType: res.headers.get('content-type'),
-          },
-          ts: Date.now(),
-        }),
-      }).catch(() => {});
-    } catch {}
-  })();
-  // #endregion
 
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     const msg =
       (json && (json.error?.message || json.message || json.error)) || `HTTP ${res.status}`;
-    // H4: log backend error message that gets thrown -> propagates to submitPin catch
-    (() => { try { fetch("http://127.0.0.1:7777/event", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: "pos-pin-login-not-working", runId: "pre-fix", hypothesisId: "H4", location: "apps/pos/src/lib/remote-auth.ts pinLogin !ok", msg: "[DEBUG] POS pinLogin !2xx error thrown", data: { msg, jsonTrunc: json ? String(JSON.stringify(json)).slice(0,200) : null }, ts: Date.now() }) }).catch(() => {}); } catch {} })();
     throw new Error(msg);
   }
   return (json && (json.data ?? json)) || null;
