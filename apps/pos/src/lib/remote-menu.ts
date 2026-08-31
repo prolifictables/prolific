@@ -1,6 +1,11 @@
 import type { MenuCategory, MenuItem, MenuModifier } from '@prolific/shared-types';
 import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
 import { beginWake, endWake, publishApiWake } from './api-wake';
+// Reuse the professional 4-tier API base resolver from remote-auth.ts so the
+// public menu client never falls back to a hardcoded localhost:4000 on
+// production hostnames. This resolver is also used by the authenticated
+// remote-auth / remote-menu-admin clients for identical behaviour.
+import { resolveApiBase } from './remote-auth';
 
 // Remote public API client so the POS cashier terminal (both Electron desktop
 // and the browser preview mode) reads menu data from the Nest server so any
@@ -8,14 +13,11 @@ import { beginWake, endWake, publishApiWake } from './api-wake';
 // back to the local Electron IPC / in-memory mock shim when the server is
 // unreachable (café offline scenario) so terminals keep working.
 
-const API_BASE =
-  (typeof import.meta !== 'undefined' &&
-    (import.meta as any).env &&
-    ((import.meta as any).env.VITE_API_BASE_URL ||
-      (import.meta as any).env.VITE_API_URL ||
-      (import.meta as any).env.VITE_PUBLIC_API_URL ||
-      (import.meta as any).env.API_BASE_URL)) ||
-  'http://localhost:4000/api/v1';
+// Read resolveApiBase() lazily at call time (not module-load time) so
+// localStorage operator overrides applied mid-session are picked up.
+function getApiBase(): string {
+  return resolveApiBase();
+}
 
 const DEFAULT_BRANCH_OVERRIDE =
   (typeof import.meta !== 'undefined' &&
@@ -25,13 +27,17 @@ const DEFAULT_BRANCH_OVERRIDE =
   null;
 
 // ---------- Render cold-start resilience wrapper (POS is browser-only, never SSR) ----------
+// Delegate to remote-auth.ts guardedFetch which has identical wake + timeout
+// semantics plus the SERVER_UNREACHABLE marker; we pass the dynamic apiBase
+// so hostname-based resolution happens per-call, not per-module-load.
 async function guardedFetch(doFetch: () => Promise<Response>): Promise<Response> {
+  const apiBase = getApiBase();
   let res: Response;
   try {
     res = await doFetch();
   } catch (err) {
     beginWake();
-    await waitForApiWake(API_BASE, {
+    await waitForApiWake(apiBase, {
       onProgress: (p) =>
         publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
       onWakeResolved: endWake,
@@ -50,7 +56,7 @@ async function guardedFetch(doFetch: () => Promise<Response>): Promise<Response>
   }
   if (isApiWakingResponse(res.status, ct, bodyStart)) {
     beginWake();
-    await waitForApiWake(API_BASE, {
+    await waitForApiWake(apiBase, {
       onProgress: (p) =>
         publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
       onWakeResolved: endWake,
@@ -129,7 +135,7 @@ export async function listPublicBranches(
   signal?: AbortSignal
 ): Promise<PublicBranch[]> {
   const res = await guardedFetch(() =>
-    fetch(`${API_BASE}/public/branches`, {
+    fetch(`${getApiBase()}/public/branches`, {
       method: 'GET',
       signal,
       cache: 'no-store',
@@ -165,7 +171,7 @@ export async function fetchPublicMenu(
   modifiers: MenuModifier[];
 }> {
   const res = await guardedFetch(() =>
-    fetch(`${API_BASE}/public/menu?branchId=${encodeURIComponent(branchId)}`, {
+    fetch(`${getApiBase()}/public/menu?branchId=${encodeURIComponent(branchId)}`, {
       method: 'GET',
       signal,
       cache: 'no-store',
@@ -235,4 +241,7 @@ export async function fetchPublicMenu(
   return { envelope, categories, items, modifiers };
 }
 
-export const REMOTE_MENU_API_BASE = API_BASE;
+// Dynamic getter so callers always see the latest resolveApiBase() result
+// (e.g. if operator applies a prolific_api_base localStorage override
+// mid-session, they don't have to refresh to pick it up).
+export const REMOTE_MENU_API_BASE = { toString: getApiBase, valueOf: getApiBase };

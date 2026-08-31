@@ -149,21 +149,65 @@ function emitCustomerState(partial: Partial<CustomerStatePayload>): void {
 }
 
 // =========================================================================
-// Backend base URL resolution — mirrors the same logic used by the sync
-// bridge's upsertBackendExternalOrders() below. Resolves Vite env vars first
-// (VITE_API_BASE_URL or NEXT_PUBLIC_*), then falls back to localhost:4000.
-// This MUST be used for ALL backend fetches from the browser shim, because
-// the POS runs on :5173 and Vite has no /api proxy configured, so relative
-// URLs like "/api/v1/public/branches" hit Vite directly and ERR_ABORTED.
+// Backend base URL resolution — professional grade 4-tier fallback chain
+// (mirrors resolveApiBase in remote-auth.ts exactly).
+//
+// Priority (highest wins):
+//   0. localStorage operator override: key = "prolific_api_base"
+//   1. Vite / Next build-time env vars
+//   2. Runtime hostname: *.prolifictables.com / *.onrender.com
+//      → real Render slug https://prolific-api.onrender.com/api/v1
+//   3. Local dev: http://localhost:4000/api/v1 (only for localhost hostname)
+//
+// Used by shimGuardedFetch for every backend call in this shim.
 // =========================================================================
 function resolvePublicApiBase(): string {
-  if (typeof window === 'undefined') return 'http://localhost:4000/api/v1';
-  const env: any = (window as any).process?.env ?? {};
-  const base =
-    (env.VITE_API_BASE_URL as string) ||
-    (env.NEXT_PUBLIC_API_BASE_URL as string) ||
-    'http://localhost:4000/api/v1';
-  return base.replace(/\/$/, '');
+  // (0) localStorage operator override — highest priority.
+  if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
+    try {
+      const override = window.localStorage.getItem('prolific_api_base');
+      if (typeof override === 'string' && override.trim().length > 3) {
+        const trimmed = override.trim().replace(/\/+$/, '');
+        if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
+          return trimmed;
+        }
+        return `${trimmed}/api/v1`;
+      }
+    } catch { /* storage access denied → ignore */ }
+  }
+
+  // (1) Build-time env vars.
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
+    const viteEnv: any = (import.meta as any).env;
+    const explicit =
+      viteEnv.VITE_API_BASE_URL ||
+      viteEnv.VITE_API_URL ||
+      viteEnv.VITE_PUBLIC_API_URL ||
+      viteEnv.API_BASE_URL;
+    if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+  }
+  if (typeof window !== 'undefined') {
+    const env: any = (window as any).process?.env ?? {};
+    const fromProcess =
+      (env.VITE_API_BASE_URL as string) ||
+      (env.NEXT_PUBLIC_API_BASE_URL as string);
+    if (typeof fromProcess === 'string' && fromProcess.length > 0) return fromProcess;
+  }
+
+  // (2) Production hostnames → REAL confirmed Render API slug.
+  const REAL_PRODUCTION_API_BASE = 'https://prolific-api.onrender.com/api/v1';
+  if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
+    const hn = window.location.hostname.toLowerCase();
+    const prod =
+      hn === 'prolifictables.com' ||
+      hn.endsWith('.prolifictables.com') ||
+      hn === 'onrender.com' ||
+      hn.endsWith('.onrender.com');
+    if (prod) return REAL_PRODUCTION_API_BASE;
+  }
+
+  // (3) Local dev fallback.
+  return 'http://localhost:4000/api/v1';
 }
 
 function resolveDefaultBranchId(): string {

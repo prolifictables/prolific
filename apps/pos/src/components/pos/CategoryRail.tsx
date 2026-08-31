@@ -8,6 +8,11 @@ interface CategoryRailProps {
   onSelect: (categoryId: string) => void;
 }
 
+// Safe ID equality: coerce both sides to strings. Server responses or
+// localStorage-mirrored docs may contain raw Mongoose ObjectId instances
+// in mixed _id / id fields; strict === would otherwise always be false.
+const sidEq = (a: unknown, b: unknown) => String(a ?? '') === String(b ?? '');
+
 export default function CategoryRail({
   categories,
   activeCategoryId,
@@ -27,11 +32,12 @@ export default function CategoryRail({
         🍽️ All Items
       </button>
       {items.map((c) => {
-        const active = c.id === activeCategoryId;
+        const catId = String(c.id ?? (c as any)._id ?? '');
+        const active = sidEq(catId, activeCategoryId);
         return (
           <button
-            key={c.id}
-            onClick={() => onSelect(c.id)}
+            key={catId}
+            onClick={() => onSelect(catId)}
             className={`shrink-0 h-14 px-6 rounded-full font-semibold text-base transition-all active:scale-[0.97] flex items-center gap-2 ${
               active
                 ? 'bg-emerald-600 text-white ring-2 ring-emerald-400/40 shadow-soft'
