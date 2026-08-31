@@ -36,6 +36,10 @@ const DEFAULT_ROLE_PERMISSIONS: Record<S.Role, S.Permission[]> = {
   [S.Role.MANAGER]: [
     S.Permission.VIEW_DASHBOARD, S.Permission.VIEW_REPORTS, S.Permission.VIEW_FINANCIALS,
     S.Permission.MENU_VIEW, S.Permission.MENU_CREATE, S.Permission.MENU_EDIT,
+    // Also grant DELETE so managers can soft-remove items/categories/modifiers
+    // directly from the POS terminal (Admin parity) — the server controller
+    // actually soft-deletes via status change so this just gates access.
+    S.Permission.MENU_DELETE,
     S.Permission.MENU_MARK_OOS, S.Permission.MENU_CHANGE_PRICE,
     S.Permission.ORDER_VIEW, S.Permission.ORDER_CREATE, S.Permission.ORDER_EDIT,
     S.Permission.ORDER_CANCEL, S.Permission.ORDER_HOLD, S.Permission.ORDER_VOID,

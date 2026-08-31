@@ -19,7 +19,7 @@ import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
  *   3. Local dev fallback: http://localhost:4000/api/v1 (only when hostname is
  *      localhost / 127.0.0.1 / 0.0.0.0, i.e. `npm run dev` mode).
  */
-function resolveApiBase(): string {
+export function resolveApiBase(): string {
   // (0) HIGHEST PRIORITY — localStorage operator override.
   // Professional escape hatch: manager / DevOps can paste the exact real
   // backend base URL into the browser's localStorage on ANY terminal and
@@ -115,7 +115,7 @@ export const SERVER_UNREACHABLE_MARKER = '🔴 SERVER_UNREACHABLE';
 const unreachableErr = (why: string) =>
   new Error(`${SERVER_UNREACHABLE_MARKER}: ${why}. Check your internet connection, wait 60 seconds, or ask your manager to verify the backend service.`);
 
-async function guardedFetch(
+export async function guardedFetch(
   doFetch: () => Promise<Response>,
   wakeSource: WakeSource = 'reactive',
   opts: { timeoutMs?: number; perAttemptMs?: number } = {}

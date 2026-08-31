@@ -15,16 +15,36 @@ import MenuGrid from './MenuGrid';
 import CartPanel from './CartPanel';
 import ShiftModal from './ShiftModal';
 import TableTabDetailsModal from './TableTabDetailsModal';
+import ManagerTools from './ManagerTools';
 
-type SidebarTab = 'MENU' | 'TABLES' | 'HISTORY' | 'SHIFT' | 'REPORTS';
+type SidebarTab = 'MENU' | 'TABLES' | 'HISTORY' | 'SHIFT' | 'REPORTS' | 'MANAGER';
 
-const SIDEBAR_TABS: { id: SidebarTab; label: string; icon: string; desc: string }[] = [
+const SIDEBAR_TABS_BASE: { id: SidebarTab; label: string; icon: string; desc: string }[] = [
   { id: 'MENU', label: 'Menu', icon: '🍽️', desc: 'Browse menu & add items' },
   { id: 'TABLES', label: 'Tables', icon: '🪑', desc: 'Floor plan & table service' },
   { id: 'HISTORY', label: 'History', icon: '📋', desc: 'Live orders & recall' },
   { id: 'SHIFT', label: 'Shift', icon: '🕒', desc: 'Open / close your shift' },
   { id: 'REPORTS', label: 'Reports', icon: '📊', desc: 'Sales performance' },
 ];
+const SIDEBAR_TABS_MANAGER: { id: SidebarTab; label: string; icon: string; desc: string } = {
+  id: 'MANAGER',
+  label: 'Manager',
+  icon: '🛠️',
+  desc: 'Edit menu, items & categories',
+};
+// Roles that are allowed to view Manager Tools tab (MENU_EDIT permission maps to these
+// RBAC matrix in server rbac.service.ts default for MANAGER/ADMIN/SUPER_ADMIN).
+const MANAGER_TAB_ROLES = new Set([
+  'MANAGER',
+  'SUPERVISOR',
+  'ADMIN',
+  'SUPER_ADMIN',
+  'OWNER',
+]);
+// Combined static metadata array for places that need to look up any tab's
+// label/icon (e.g. PlaceholderPanel icon). The runtime sidebar rendering uses
+// the dynamic role-gated `sidebarTabs` computed inside the component.
+const ALL_SIDEBAR_TABS_META = [...SIDEBAR_TABS_BASE, SIDEBAR_TABS_MANAGER];
 
 const ORDER_STATUS_STYLES: Record<string, { bg: string; text: string; dot: string; label: string }> = {
   NEW: { bg: 'bg-[linear-gradient(120deg,rgba(34,211,238,0.20),rgba(251,191,36,0.14))]', text: 'text-cyan-200', dot: 'status-dot-new', label: 'New' },
@@ -73,6 +93,16 @@ export default function CashierScreenLayout() {
   const authActions = useAuthStore((s) => s.actions);
   const cartActions = useCartStore((s) => s.actions);
   const [activeTab, setActiveTab] = useState<SidebarTab>('MENU');
+
+  // Role-gated sidebar tabs: MANAGER tab rail is only shown to
+  // MANAGER/ADMIN/SUPER_ADMIN/OWNER roles per RBAC matrix (MENU_EDIT).
+  const sidebarTabs = useMemo(() => {
+    const tabs = [...SIDEBAR_TABS_BASE];
+    if (employee && MANAGER_TAB_ROLES.has(String(employee.role))) {
+      tabs.push(SIDEBAR_TABS_MANAGER);
+    }
+    return tabs;
+  }, [employee?.role]);
 
   // Reactive visual indicator for the 🖥️ Display sidebar button (amber when
   // the customer-facing popup window is open; ink-300 when closed).
@@ -1211,7 +1241,7 @@ export default function CashierScreenLayout() {
         <aside className="w-24 shrink-0 border-r border-white/5 bg-slate-900/40 backdrop-blur-xl flex flex-col py-4 relative overflow-hidden">
           <div className="absolute inset-0 opacity-50 pointer-events-none bg-gradient-mesh-warm" />
           <nav className="flex-1 flex flex-col items-center gap-2 px-2 relative">
-            {SIDEBAR_TABS.map((t) => {
+            {sidebarTabs.map((t) => {
               const active = activeTab === t.id;
               return (
                 <button
@@ -1434,6 +1464,31 @@ export default function CashierScreenLayout() {
             )}
             {activeTab === 'REPORTS' && (
               <ReportsPanel orders={orders} employee={employee} shift={openShift} />
+            )}
+            {activeTab === 'MANAGER' && (
+              <ManagerTools
+                accessToken={accessToken!}
+                restaurantId={restaurant?.id}
+                branchId={branch?.id}
+                employeeRole={employee?.role as any}
+                connectionStatus={connection.status}
+                onMenuChanged={async () => {
+                  // After a manager edit, re-fetch the full public menu and
+                  // dual-write the snapshot to in-memory cache + localStorage
+                  // offline mirror so POS menu grid matches instantly.
+                  try {
+                    if (!branch?.id) return;
+                    const snap = await fetchPublicMenu(branch.id);
+                    applyRemoteMenuSnapshot({
+                      categories: snap.categories,
+                      items: snap.items,
+                      modifiers: snap.modifiers,
+                    });
+                  } catch (e) {
+                    console.warn('[manager-tools] post-save snapshot refresh failed', e);
+                  }
+                }}
+              />
             )}
           </section>
           <CartPanel />
@@ -1723,7 +1778,7 @@ function PlaceholderPanel({ tab, subtitle, actions }: {
   subtitle?: string;
   actions?: { label: string; variant: 'primary' | 'secondary' | 'neon-pink' | 'neon-cyan'; onClick: () => void }[];
 }) {
-  const tabMeta = SIDEBAR_TABS.find((t) => t.id === tab);
+  const tabMeta = ALL_SIDEBAR_TABS_META.find((t) => t.id === tab);
   const icon = tabMeta?.icon || '🧭';
   return (
     <div className="flex-1 p-10 flex items-center justify-center overflow-y-auto min-h-0">
