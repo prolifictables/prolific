@@ -5,6 +5,8 @@ import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
  * resolveApiBase — professional grade fallback chain for API host.
  *
  * Priority (highest wins):
+ *   0. localStorage operator override (manager paste-in URL — permanent escape
+ *      hatch, no deploy needed). Key: "prolific_api_base".
  *   1. Vite build-time env: VITE_API_BASE_URL > VITE_API_URL > VITE_PUBLIC_API_URL > API_BASE_URL
  *      (set explicitly on Render static site service build env tab).
  *   2. Runtime hostname fallback: when browser is on a known production domain
@@ -17,7 +19,36 @@ import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
  *      localhost / 127.0.0.1 / 0.0.0.0, i.e. `npm run dev` mode).
  */
 function resolveApiBase(): string {
-  // (1) Highest priority: build-time Vite env override (still honored, never broken)
+  // (0) HIGHEST PRIORITY — localStorage operator override.
+  // Professional escape hatch: manager / DevOps can paste the exact real
+  // backend base URL into the browser's localStorage on ANY terminal and
+  // bypass ALL build-env + runtime-guess logic. No code deploy needed.
+  //
+  // How to use (manager-only):
+  //   1. Open POS login screen
+  //   2. Press F12 → Application → Local Storage → pos.prolifictables.com
+  //   3. Add key = "prolific_api_base" with value like
+  //      "https://prolific-api-abc123.onrender.com" (omit or include /api/v1)
+  //   4. Cmd+Shift+R hard refresh. Done.
+  //
+  // This key is stored PER BROWSER / PER TERMINAL. If you ever move backends,
+  // just change the value and refresh. No build, no deploy, no env var.
+  if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
+    try {
+      const override = window.localStorage.getItem('prolific_api_base');
+      if (typeof override === 'string' && override.trim().length > 3) {
+        const trimmed = override.trim().replace(/\/+$/, '');
+        // Append /api/v1 suffix if the operator forgot it (saves 1 support ticket)
+        if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
+          return trimmed;
+        }
+        return `${trimmed}/api/v1`;
+      }
+    } catch {
+      // localStorage access denied (rare: Safari private mode, etc.) → ignore.
+    }
+  }
+  // (1) Vite build env override (still honored — never broken)
   if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
     const viteEnv = (import.meta as any).env;
     const explicit =
@@ -28,9 +59,7 @@ function resolveApiBase(): string {
     if (typeof explicit === 'string' && explicit.length > 0) return explicit;
   }
 
-  // (2) Medium priority: production hostnames → canonical api.prolifictables.com.
-  //    Works even when Render static build env var was not configured (most common
-  //    misconfiguration; CSP already whitelisted this origin in index.html meta).
+  // (2) Production hostnames → canonical api.prolifictables.com.
   if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
     const hn = window.location.hostname.toLowerCase();
     const prod =
@@ -41,7 +70,7 @@ function resolveApiBase(): string {
     if (prod) return 'https://api.prolifictables.com/api/v1';
   }
 
-  // (3) Dev fallback: localhost API (never reaches in real user production)
+  // (3) Dev fallback: localhost API
   return 'http://localhost:4000/api/v1';
 }
 

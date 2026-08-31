@@ -989,9 +989,8 @@ export function installMockElectronAPI() {
           const unreachableShimErr = (why: string) =>
             new Error(`${SERVER_UNREACHABLE_MARKER_SHIM}: ${why}`);
 
-          // Shared API base resolver (duplicated locally to avoid circular import
-          // from remote-auth into shim, but same rule: prod hostnames →
-          // https://api.prolifictables.com/api/v1 by default).
+          // Hostname booleans used both by resolveShimApiBase below AND by the
+          // try/catch block that decides whether to fall to SEEDED_EMPLOYEES.
           const prodHostname = (() => {
             if (typeof window === 'undefined' || typeof window.location?.hostname !== 'string')
               return false;
@@ -1010,15 +1009,47 @@ export function installMockElectronAPI() {
             return hn === 'localhost' || hn === '127.0.0.1' || hn === '';
           })();
 
-          try {
-            const API_BASE_FOR_SHIM =
+          // Shared API base resolver (duplicated locally to avoid circular import
+          // from remote-auth into shim, but SAME CHAIN — 4-tier priority exactly
+          // matches resolveApiBase in ../remote-auth.ts:
+          //   (0) localStorage "prolific_api_base" operator override (HIGHEST)
+          //   (1) VITE_API_BASE_URL / VITE_API_URL / VITE_PUBLIC_API_URL / API_BASE_URL
+          //   (2) prod hostname → https://api.prolifictables.com/api/v1
+          //   (3) localhost → http://localhost:4000/api/v1
+          const resolveShimApiBase = (): string => {
+            // (0) localStorage operator override — HIGHEST priority.
+            if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
+              try {
+                const override = window.localStorage.getItem('prolific_api_base');
+                if (typeof override === 'string' && override.trim().length > 3) {
+                  const trimmed = override.trim().replace(/\/+$/, '');
+                  if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
+                    return trimmed;
+                  }
+                  return `${trimmed}/api/v1`;
+                }
+              } catch {
+                // localStorage blocked (Safari private, etc.) → fall through
+              }
+            }
+            // (1) Vite build env
+            const viteExplicit =
               (typeof import.meta !== 'undefined' &&
                 (import.meta as any).env &&
                 ((import.meta as any).env.VITE_API_BASE_URL ||
                   (import.meta as any).env.VITE_API_URL ||
                   (import.meta as any).env.VITE_PUBLIC_API_URL ||
                   (import.meta as any).env.API_BASE_URL)) ||
-              (prodHostname ? 'https://api.prolifictables.com/api/v1' : 'http://localhost:4000/api/v1');
+              null;
+            if (viteExplicit) return viteExplicit;
+            // (2) Prod hostname
+            if (prodHostname) return 'https://api.prolifictables.com/api/v1';
+            // (3) Dev localhost
+            return 'http://localhost:4000/api/v1';
+          };
+
+          try {
+            const API_BASE_FOR_SHIM = resolveShimApiBase();
 
             // Short timeout: we don't want pinLogin → shim → another 120s wait
             // (would double/treble total time). 15s is enough for any

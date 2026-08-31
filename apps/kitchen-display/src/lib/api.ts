@@ -3,10 +3,28 @@ import { beginWake, endWake, publishApiWake } from './api-wake';
 
 /**
  * resolveKdsApiBase — same fallback chain.
- * Priority: NEXT_PUBLIC_API_URL env build > runtime hostname *.prolifictables.com
- * → canonical https://api.prolifictables.com/api/v1 > localhost dev.
+ * Priority:
+ *   0. localStorage prolific_api_base operator override
+ *   1. NEXT_PUBLIC_API_URL env build
+ *   2. runtime hostname *.prolifictables.com → https://api.prolifictables.com/api/v1
+ *   3. localhost dev
  */
 function resolveKdsApiBase(): string {
+  // (0) localStorage operator override — HIGHEST priority.
+  if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
+    try {
+      const override = window.localStorage.getItem('prolific_api_base');
+      if (typeof override === 'string' && override.trim().length > 3) {
+        const trimmed = override.trim().replace(/\/+$/, '');
+        if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
+          return trimmed;
+        }
+        return `${trimmed}/api/v1`;
+      }
+    } catch {
+      // ignore
+    }
+  }
   const explicit = process.env.NEXT_PUBLIC_API_URL;
   if (typeof explicit === 'string' && explicit.length > 0) return explicit;
   if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {

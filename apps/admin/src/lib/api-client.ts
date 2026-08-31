@@ -3,12 +3,30 @@ import { beginWake, endWake, publishApiWake } from './api-wake';
 
 /**
  * resolveAdminApiBase — professional fallback chain (matches POS pattern, see
- * apps/pos/src/lib/remote-auth.ts resolveApiBase for docstring).
- * Priority: NEXT_PUBLIC_API_URL env build > runtime hostname *.prolifictables.com
- * → canonical https://api.prolifictables.com/api/v1 > localhost dev.
+ * apps/pos/src/lib/remote-auth.ts resolveApiBase for detailed docstring).
+ * Priority:
+ *   0. localStorage prolific_api_base operator override (HIGHEST, manager paste-in)
+ *   1. NEXT_PUBLIC_API_URL env build
+ *   2. runtime hostname *.prolifictables.com → https://api.prolifictables.com/api/v1
+ *   3. localhost dev http://localhost:4000/api/v1
  */
 function resolveAdminApiBase(): string {
-  // (1) Highest: explicit build env (Next.js)
+  // (0) localStorage operator override — HIGHEST priority, no deploy needed.
+  if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
+    try {
+      const override = window.localStorage.getItem('prolific_api_base');
+      if (typeof override === 'string' && override.trim().length > 3) {
+        const trimmed = override.trim().replace(/\/+$/, '');
+        if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
+          return trimmed;
+        }
+        return `${trimmed}/api/v1`;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  // (1) Explicit build env (Next.js)
   const explicit = process.env.NEXT_PUBLIC_API_URL;
   if (typeof explicit === 'string' && explicit.length > 0) return explicit;
 
