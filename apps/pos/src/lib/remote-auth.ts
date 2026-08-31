@@ -10,11 +10,12 @@ import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
  *   1. Vite build-time env: VITE_API_BASE_URL > VITE_API_URL > VITE_PUBLIC_API_URL > API_BASE_URL
  *      (set explicitly on Render static site service build env tab).
  *   2. Runtime hostname fallback: when browser is on a known production domain
- *      (*.prolifictables.com / *.onrender.com), resolve to canonical production
- *      https://api.prolifictables.com/api/v1 even if build env was forgotten.
- *      This prevents the all-too-common "forgot to set VITE env on static build"
- *      causing localhost:4000 leak into production bundle (the exact root cause
- *      debugged in pos-pin-modal-v4 via live browser network requests).
+ *      (*.prolifictables.com / *.onrender.com), resolve to the REAL confirmed
+ *      Render Node API service: https://prolific-api.onrender.com/api/v1.
+ *      The canonical api.prolifictables.com DNS record may not exist yet on
+ *      the user's Cloudflare setup, but we know the Render slug for the
+ *      server web service so we use that directly. CSP connect-src in POS
+ *      index.html already whitelists https://*.onrender.com.
  *   3. Local dev fallback: http://localhost:4000/api/v1 (only when hostname is
  *      localhost / 127.0.0.1 / 0.0.0.0, i.e. `npm run dev` mode).
  */
@@ -28,7 +29,7 @@ function resolveApiBase(): string {
   //   1. Open POS login screen
   //   2. Press F12 → Application → Local Storage → pos.prolifictables.com
   //   3. Add key = "prolific_api_base" with value like
-  //      "https://prolific-api-abc123.onrender.com" (omit or include /api/v1)
+  //      "https://prolific-api.onrender.com" (omit or include /api/v1)
   //   4. Cmd+Shift+R hard refresh. Done.
   //
   // This key is stored PER BROWSER / PER TERMINAL. If you ever move backends,
@@ -59,7 +60,13 @@ function resolveApiBase(): string {
     if (typeof explicit === 'string' && explicit.length > 0) return explicit;
   }
 
-  // (2) Production hostnames → canonical api.prolifictables.com.
+  // (2) Production hostnames → REAL confirmed Render API slug.
+  // NOTE: User explicitly confirmed the API is hosted at
+  //       https://prolific-api.onrender.com. We use that onrender.com URL
+  //       for the production default. If the operator later wires up a custom
+  //       domain (api.prolifictables.com) they can simply set localStorage
+  //       `prolific_api_base` once per browser and it overrides this.
+  const REAL_PRODUCTION_API_BASE = 'https://prolific-api.onrender.com/api/v1';
   if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
     const hn = window.location.hostname.toLowerCase();
     const prod =
@@ -67,7 +74,7 @@ function resolveApiBase(): string {
       hn.endsWith('.prolifictables.com') ||
       hn === 'onrender.com' ||
       hn.endsWith('.onrender.com');
-    if (prod) return 'https://api.prolifictables.com/api/v1';
+    if (prod) return REAL_PRODUCTION_API_BASE;
   }
 
   // (3) Dev fallback: localhost API

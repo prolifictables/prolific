@@ -30,7 +30,12 @@ function resolveAdminApiBase(): string {
   const explicit = process.env.NEXT_PUBLIC_API_URL;
   if (typeof explicit === 'string' && explicit.length > 0) return explicit;
 
-  // (2) Runtime: production hostnames → canonical API
+  // (2) Runtime: production hostnames → REAL confirmed Render API slug.
+  // NOTE: User explicitly confirmed the API is hosted at
+  //       https://prolific-api.onrender.com. Use that for the production
+  //       default. localStorage `prolific_api_base` still overrides this
+  //       at priority 0 if the operator sets a custom domain later.
+  const REAL_PRODUCTION_API_BASE = 'https://prolific-api.onrender.com/api/v1';
   if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
     const hn = window.location.hostname.toLowerCase();
     const prod =
@@ -38,7 +43,7 @@ function resolveAdminApiBase(): string {
       hn.endsWith('.prolifictables.com') ||
       hn === 'onrender.com' ||
       hn.endsWith('.onrender.com');
-    if (prod) return 'https://api.prolifictables.com/api/v1';
+    if (prod) return REAL_PRODUCTION_API_BASE;
   }
 
   // (3) Local dev fallback

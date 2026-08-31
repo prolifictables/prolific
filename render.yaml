@@ -78,7 +78,7 @@ services:
         value: prolific.clients
 
       - key: CORS_ORIGIN
-        value: https://prolifictables.com
+        value: "https://prolifictables.com,https://www.prolifictables.com,https://admin.prolifictables.com,https://pos.prolifictables.com"
 
       - key: DEFAULT_PAYMENT_PROVIDER
         value: PAYSTACK

@@ -1042,8 +1042,10 @@ export function installMockElectronAPI() {
                   (import.meta as any).env.API_BASE_URL)) ||
               null;
             if (viteExplicit) return viteExplicit;
-            // (2) Prod hostname
-            if (prodHostname) return 'https://api.prolifictables.com/api/v1';
+            // (2) Prod hostname → REAL confirmed Render API slug.
+            // NOTE: User explicitly confirmed the API is hosted at
+            //       https://prolific-api.onrender.com.
+            if (prodHostname) return 'https://prolific-api.onrender.com/api/v1';
             // (3) Dev localhost
             return 'http://localhost:4000/api/v1';
           };

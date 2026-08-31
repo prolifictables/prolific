@@ -11,15 +11,35 @@ const WEBHOOK_PATH_RE = /\/payments\/webhook\/(paystack|flutterwave)$/;
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const corsOriginEnv = process.env.CORS_ORIGIN?.split(',').map((s) => s.trim()).filter(Boolean) ?? null;
+  // Subdomain regex patterns for trusted production domains.
+  // NOTE: Exact origin match (corsOriginEnv.includes) is still HIGHEST priority (explicit
+  // operator list wins). Patterns below are defensive catch-all so we never block
+  // newly-provisioned subdomains like kitchen-display.prolifictables.com or
+  // admin-v2-staging.onrender.com without a server redeploy.
+  const CORS_TRUSTED_SUFFIXES = [
+    /^https:\/\/(?:[a-zA-Z0-9-]+\.)*prolifictables\.com(?::\d+)?$/,
+    /^https:\/\/(?:[a-zA-Z0-9-]+\.)*onrender\.com(?::\d+)?$/,
+  ];
   const app = await NestFactory.create(AppModule, {
     logger: ['log', 'error', 'warn', 'debug', 'verbose'],
     cors: {
       origin: corsOriginEnv
         ? (origin, cb) => {
+            // (0) Missing Origin header (curl / SSR / internal microservice calls) → allow.
             if (!origin) return cb(null, true);
+            // (1) Explicit comma-separated operator allowlist wins.
             if (corsOriginEnv.includes(origin)) return cb(null, true);
+            // (2) Local developer hosts (belt+suspenders — localhost ports).
             if (/^https?:\/\/localhost:\d+$/.test(origin)) return cb(null, true);
             if (/^https?:\/\/127\.0\.0\.1:\d+$/.test(origin)) return cb(null, true);
+            // (3) Trusted subdomain suffixes: *.prolifictables.com / *.onrender.com
+            // Handles all subdomains (pos, admin, www, kitchen-display, api, staging-*, etc.)
+            // without requiring a server deploy every time we add a new Render service
+            // or flip a DNS record.
+            for (const re of CORS_TRUSTED_SUFFIXES) {
+              if (re.test(origin)) return cb(null, true);
+            }
+            // (4) Unknown origin → reject (default secure).
             return cb(null, false);
           }
         : true,
