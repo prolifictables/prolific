@@ -9,7 +9,7 @@ import {
   resolveDefaultBranchId,
   listPublicBranches,
 } from '@/lib/remote-menu';
-import { applyRemoteMenuSnapshot } from '@/lib/mock-electron-shim';
+import { applyRemoteMenuSnapshot, readOfflineMenuSnapshotMirror } from '@/lib/mock-electron-shim';
 
 interface MenuGridProps {
   /**
@@ -81,17 +81,36 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
 
     // Local fallback: Electron IPC on desktop or the in-memory mock shim in
     // pure browser preview mode. Only reached when the server is truly down.
+    // Also reads the localStorage offline mirror (populated on every
+    // successful live fetch) so page refresh + full network loss still
+    // renders the admin-uploaded menu we last saw online, NEVER the SEEDED
+    // demo hardcoded data on production hostnames.
     try {
+      let cats: MenuCategory[] = [];
+      let items: MenuItem[] = [];
       const [catsRes, itemsRes]: any[] = await Promise.all([
         window.electronAPI?.db?.menuCategories?.listAll?.() || [],
         window.electronAPI?.db?.menuItems?.list?.() || [],
       ]);
-      const cats: MenuCategory[] = Array.isArray(catsRes)
+      cats = Array.isArray(catsRes)
         ? catsRes
         : ((catsRes as any)?.data as MenuCategory[]) || [];
-      const items: MenuItem[] = Array.isArray(itemsRes)
+      items = Array.isArray(itemsRes)
         ? itemsRes
         : ((itemsRes as any)?.data as MenuItem[]) || [];
+
+      // If electronAPI returned nothing (pure browser mode and the in-memory
+      // snapshot hasn't warmed up yet, e.g. IIFE couldn't guess branchId),
+      // also try the direct localStorage offline mirror of the last
+      // successful live fetch for the provided branchId.
+      if (cats.length === 0 && items.length === 0) {
+        const mirror = readOfflineMenuSnapshotMirror(branchId || null);
+        if (mirror) {
+          cats = Array.isArray(mirror.categories) ? (mirror.categories as MenuCategory[]) : [];
+          items = Array.isArray(mirror.items) ? (mirror.items as MenuItem[]) : [];
+        }
+      }
+
       setCategories(cats.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)));
       setAllItems(items);
       setSourceLabel('💾 Offline Menu');

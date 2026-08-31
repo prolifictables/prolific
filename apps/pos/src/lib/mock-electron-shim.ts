@@ -597,11 +597,38 @@ const SEEDED_TAXES = [
   { id: 'tax-service', name: 'Service Charge', rate: 5, isIncludedInPrice: false, isDefault: true, status: 'ACTIVE', branchId: 'br-main-01' },
 ];
 
+// localStorage durable key for offline menu persistence. Each SAVED branch
+// gets its own document so multi-branch deployments keep an independent
+// offline cache per branch (which matches admin uploads per-branch).
+//
+// Read priority for every db.menuXxx call in this shim:
+//   (1) in-memory `remoteMenuSnapshot` (warm: already set by applyRemoteMenuSnapshot)
+//   (2) localStorage `OFFLINE_MENU_KEY` document for the requested branch (persists
+//       across refresh / browser restart)
+//   (3) Localhost-only: SEEDED_* demo data (dev preview only — production hostnames
+//       never fall to SEEDED because they'd show stale demo items that never
+//       correspond to the admin-uploaded menu)
+const OFFLINE_MENU_KEY = 'pos_offline_menu_snapshot_v1';
+
+type OfflineMenuStoreShape = {
+  // keyed by branchId
+  [branchId: string]: {
+    categories: any[];
+    items: any[];
+    modifiers: any[];
+    fetchedAt: number;
+  };
+};
+
 // When the remote Nest Admin server is reachable, MenuGrid loads the live
 // menu data (categories / items / modifiers) and calls `applyRemoteMenuSnapshot`
 // so every subsequent db.menuXxx.listAll() / list() / search() call returns
 // the server-owned admin data — source of truth for the POS UI. If this is
-// null (offline / server unreachable) the legacy SEEDED_* demo data is used.
+// null (offline / server unreachable) we fall to (a) localStorage offline
+// snapshot for the branch, (b) SEEDED demo only on localhost dev.
+//
+// Declared BEFORE any code that reads/writes it so the IIFE below can seed it
+// from localStorage without hitting a let-TDZ ReferenceError.
 let remoteMenuSnapshot: {
   categories: any[];
   items: any[];
@@ -609,25 +636,196 @@ let remoteMenuSnapshot: {
   fetchedAt: number;
 } | null = null;
 
+function readOfflineStore(): OfflineMenuStoreShape {
+  try {
+    if (typeof localStorage === 'undefined') return {};
+    const raw = localStorage.getItem(OFFLINE_MENU_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as OfflineMenuStoreShape) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeOfflineStore(store: OfflineMenuStoreShape): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    localStorage.setItem(OFFLINE_MENU_KEY, JSON.stringify(store));
+  } catch {
+    // QuotaExceeded / Safari private mode / storage disabled — don't throw,
+    // caller keeps using in-memory state which still works for this session.
+  }
+}
+
+// Module-level hostname helper. Determines whether we are running on a
+// developer localhost hostname (where SEEDED_* demo data is acceptable as a
+// last-resort fallback). On ANY production hostname (prolifictables.com,
+// onrender.com, etc.), we NEVER fall to SEEDED — instead we either show
+// (a) server-fetched live data, (b) localStorage offline snapshot of that
+// data, or (c) an empty menu so cashiers never ring up demo prices/items.
+function isLocalhostHostname(): boolean {
+  try {
+    if (typeof window === 'undefined' || !window.location?.hostname) return true;
+    const hn = window.location.hostname.toLowerCase();
+    if (hn === 'localhost' || hn === '127.0.0.1' || hn === '0.0.0.0') return true;
+    if (hn.endsWith('.local')) return true;
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(hn)) return true; // any IPv4 = dev preview
+    return false;
+  } catch {
+    // Fail-open on any access error: if we can't tell, assume production so
+    // no SEEDED items leak onto a live terminal.
+    return false;
+  }
+}
+
+// Resolve a reasonable "default branch id" for the localStorage lookup when
+// a db.listAll() call is made without explicit branch context (e.g. during
+// initial page paint before CashierScreenLayout has authenticated). Returns
+// null when no such inference is possible — caller will fall to SEEDED.
+function guessCurrentBranchId(): string | null {
+  try {
+    // First: auth-store branch (persisted by zustand createJSONStorage(localStorage))
+    if (typeof localStorage !== 'undefined') {
+      const authRaw = localStorage.getItem('prolific-pos-auth');
+      if (authRaw) {
+        const parsed: any = JSON.parse(authRaw);
+        const state: any = parsed?.state ?? parsed;
+        const bid: unknown = state?.branch?.id ?? state?.branchId;
+        if (typeof bid === 'string' && bid.length > 0) return bid;
+      }
+    }
+  } catch { /* malformed JSON / storage disabled — ignore */ }
+  try {
+    // Second: look at the currently-warmed in-memory snapshot (already set by
+    // applyRemoteMenuSnapshot earlier in this session, or seeded from offline
+    // localStorage IIFE below). Pulls branchId from first category/item.
+    if (remoteMenuSnapshot) {
+      const anyCat = (remoteMenuSnapshot.categories || [])[0];
+      if (anyCat?.branchId) return String(anyCat.branchId);
+      const anyItem = (remoteMenuSnapshot.items || [])[0];
+      if (anyItem?.branchId) return String(anyItem.branchId);
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+// Read the localStorage offline doc for a given branch — used by list/listAll
+// helpers when remoteMenuSnapshot is null (page just refreshed while offline).
+// Always returns a DEEP copy so callers never mutate the shared in-memory one.
+function readOfflineSnapshotForBranch(branchId?: string | null): typeof remoteMenuSnapshot {
+  const bid = branchId || guessCurrentBranchId();
+  if (!bid) return null;
+  const store = readOfflineStore();
+  const doc = store[bid];
+  if (!doc) return null;
+  return {
+    categories: Array.isArray(doc.categories) ? doc.categories : [],
+    items: Array.isArray(doc.items) ? doc.items : [],
+    modifiers: Array.isArray(doc.modifiers) ? doc.modifiers : [],
+    fetchedAt: typeof doc.fetchedAt === 'number' ? doc.fetchedAt : Date.now(),
+  };
+}
+
+// On module load, attempt to seed in-memory remoteMenuSnapshot from the most
+// recent localStorage offline document for the best-guess current branch.
+// This ensures: "refresh + OFFLINE = same menu we had when online" — never
+// fall to SEEDED_* demo items on production hostnames.
+(function initializeRemoteSnapshotFromOfflineStore() {
+  const bid = guessCurrentBranchId();
+  if (!bid) return;
+  const doc = readOfflineSnapshotForBranch(bid);
+  if (!doc) return;
+  remoteMenuSnapshot = doc;
+})();
+
+// Infer a branchId from the snapshot contents (every category/item has one).
+// Needed so localStorage writes are correctly namespaced even when the caller
+// (e.g. MenuGrid dev-mode fallback) doesn't pass branchId explicitly as a
+// separate argument.
+function inferBranchIdFromSnapshot(snapshot: { categories?: any[]; items?: any[] }): string | null {
+  const anyCat = (snapshot.categories || [])[0];
+  if (anyCat?.branchId) return String(anyCat.branchId);
+  const anyItem = (snapshot.items || [])[0];
+  if (anyItem?.branchId) return String(anyItem.branchId);
+  return null;
+}
+
 export function applyRemoteMenuSnapshot(snapshot: {
   categories: any[];
   items: any[];
   modifiers: any[];
 }): void {
-  remoteMenuSnapshot = {
-    categories: Array.isArray(snapshot.categories) ? snapshot.categories : [],
-    items: Array.isArray(snapshot.items) ? snapshot.items : [],
-    modifiers: Array.isArray(snapshot.modifiers) ? snapshot.modifiers : [],
-    fetchedAt: Date.now(),
-  };
+  const categories = Array.isArray(snapshot.categories) ? snapshot.categories : [];
+  const items = Array.isArray(snapshot.items) ? snapshot.items : [];
+  const modifiers = Array.isArray(snapshot.modifiers) ? snapshot.modifiers : [];
+  const fetchedAt = Date.now();
+
+  // (1) warm in-memory cache (fast path for all reads in this session)
+  remoteMenuSnapshot = { categories, items, modifiers, fetchedAt };
+
+  // (2) persist to localStorage branch-scoped so page reload + OFFLINE still
+  // sees the admin-uploaded menu exactly as it was when online (no SEEDED demo)
+  const bid = inferBranchIdFromSnapshot({ categories, items }) || guessCurrentBranchId();
+  if (!bid) return;
+  const store = readOfflineStore();
+  store[bid] = { categories, items, modifiers, fetchedAt };
+  writeOfflineStore(store);
 }
 
 export function hasRemoteMenuSnapshot(): boolean {
-  return !!remoteMenuSnapshot;
+  if (remoteMenuSnapshot) return true;
+  return !!readOfflineSnapshotForBranch();
 }
 
 export function getRemoteMenuSnapshotMeta(): { fetchedAt: number } | null {
-  return remoteMenuSnapshot ? { fetchedAt: remoteMenuSnapshot.fetchedAt } : null;
+  if (remoteMenuSnapshot) return { fetchedAt: remoteMenuSnapshot.fetchedAt };
+  return readOfflineSnapshotForBranch() ? { fetchedAt: readOfflineSnapshotForBranch()!.fetchedAt } : null;
+}
+
+// Public helper for MenuGrid fallback block: if the Electron SQLite path is
+// unavailable (browser mode) and in-memory snapshot is empty (e.g. user
+// refreshed while offline before our IIFE ran), return the localStorage
+// offline snapshot. Callers can render the offline menu without ever hitting
+// SEEDED demo data on production hostnames.
+export function readOfflineMenuSnapshotMirror(branchId?: string | null): {
+  categories: any[];
+  items: any[];
+  modifiers: any[];
+  fetchedAt: number;
+} | null {
+  return readOfflineSnapshotForBranch(branchId);
+}
+
+// Shared 3-tier source resolver used by every db.menuCategories / menuItems /
+// menuModifiers list* / search / findById call.
+//
+//   (1) Warm in-memory remoteMenuSnapshot (freshly fetched this session)
+//   (2) localStorage offline snapshot for the current branch (persists across
+//       refresh + browser close — mirrors the admin-uploaded menu)
+//   (3) Localhost ONLY: SEEDED_* demo data (for dev previews). On ANY
+//       production hostname, return empty arrays so the POS never shows
+//       stale demo items that don't correspond to the Admin upload.
+function resolveMenuSource<TKey extends 'categories' | 'items' | 'modifiers'>(
+  key: TKey,
+): any[] {
+  if (remoteMenuSnapshot) {
+    const v = remoteMenuSnapshot[key];
+    if (Array.isArray(v)) return v;
+  }
+  const offline = readOfflineSnapshotForBranch();
+  if (offline) {
+    const v = offline[key];
+    if (Array.isArray(v)) return v;
+  }
+  if (isLocalhostHostname()) {
+    switch (key) {
+      case 'categories': return [...SEEDED_CATEGORIES];
+      case 'items': return [...SEEDED_MENU_ITEMS];
+      case 'modifiers': return [...SEEDED_MODIFIERS];
+    }
+  }
+  return [];
 }
 
 function modifiersForItem(item: any, allModifiers: any[]): any[] {
@@ -1179,9 +1377,7 @@ export function installMockElectronAPI() {
           await delay(5);
           // Mirror SQLite repo: only ACTIVE categories so the POS never shows
           // categories the admin has toggled off on the menu.
-          const source = remoteMenuSnapshot
-            ? remoteMenuSnapshot.categories
-            : SEEDED_CATEGORIES;
+          const source = resolveMenuSource('categories');
           return source.filter(
             (c) => (c as any).isActive !== false && (c as any).is_active !== 0
           );
@@ -1194,10 +1390,8 @@ export function installMockElectronAPI() {
           // Only allow admin-configured visibility statuses — matches the
           // server public.menu + SQLite menu repository filters.
           const allowed = new Set(['AVAILABLE', 'OUT_OF_STOCK', 'OOS', 'SCHEDULED']);
-          const source = remoteMenuSnapshot
-            ? remoteMenuSnapshot.items
-            : SEEDED_MENU_ITEMS;
-          let out = source.filter((m) => {
+          const source = resolveMenuSource('items');
+          const out = source.filter((m) => {
             if ((m as any).isActive === false || (m as any).is_active === 0) return false;
             if (!allowed.has(String(m.status || 'AVAILABLE'))) return false;
             if (filters?.status && String(m.status) !== String(filters.status)) return false;
@@ -1208,13 +1402,13 @@ export function installMockElectronAPI() {
         },
         findById: async (id: string) => {
           await delay(5);
-          const source = remoteMenuSnapshot ? remoteMenuSnapshot.items : SEEDED_MENU_ITEMS;
+          const source = resolveMenuSource('items');
           return source.find((m) => String(m.id) === String(id)) || null;
         },
         listByCategory: async (categoryId: string) => {
           await delay(5);
           const allowed = new Set(['AVAILABLE', 'OUT_OF_STOCK', 'OOS', 'SCHEDULED']);
-          const source = remoteMenuSnapshot ? remoteMenuSnapshot.items : SEEDED_MENU_ITEMS;
+          const source = resolveMenuSource('items');
           return source.filter((m) => {
             if ((m as any).isActive === false || (m as any).is_active === 0) return false;
             if (!allowed.has(String(m.status || 'AVAILABLE'))) return false;
@@ -1224,7 +1418,7 @@ export function installMockElectronAPI() {
         search: async (q: string) => {
           await delay(10);
           const allowed = new Set(['AVAILABLE', 'OUT_OF_STOCK', 'OOS', 'SCHEDULED']);
-          const source = remoteMenuSnapshot ? remoteMenuSnapshot.items : SEEDED_MENU_ITEMS;
+          const source = resolveMenuSource('items');
           const pool = source.filter((m) => {
             if ((m as any).isActive === false || (m as any).is_active === 0) return false;
             return allowed.has(String(m.status || 'AVAILABLE'));
@@ -1244,18 +1438,12 @@ export function installMockElectronAPI() {
         // like "· Medium · Grilled Chicken" instead of "· option · option").
         listAll: async () => {
           await delay(5);
-          return remoteMenuSnapshot
-            ? [...remoteMenuSnapshot.modifiers]
-            : [...SEEDED_MODIFIERS];
+          return [...resolveMenuSource('modifiers')];
         },
         listForItemId: async (itemId: string) => {
           await delay(10);
-          const itemsSource = remoteMenuSnapshot
-            ? remoteMenuSnapshot.items
-            : SEEDED_MENU_ITEMS;
-          const modifiersSource = remoteMenuSnapshot
-            ? remoteMenuSnapshot.modifiers
-            : SEEDED_MODIFIERS;
+          const itemsSource = resolveMenuSource('items');
+          const modifiersSource = resolveMenuSource('modifiers');
           const item = itemsSource.find((m) => m.id === itemId);
           if (!item) return [];
           return modifiersForItem(item, modifiersSource);
