@@ -3,11 +3,21 @@ import { subscribeApiWake, ApiWakeState } from '../lib/api-wake';
 
 // POS Terminal branded overlay — amber/rust palette matches Prolific POS cash-register aesthetic.
 // Mounted as the FIRST child inside <App/> so it sits above all routes/screens.
-// The entire POS DOM (Login screen, cashier grid, etc.) renders BEHIND this overlay
-// while the server sleeps — satisfying "UI loads first, silently waits."
+//
+// Key UX rule (professional-grade cold-start handling, post-692128b fix):
+//   We NEVER show a full-screen blocking modal for "proactive" pre-warm calls
+//   (LoginScreen is already warming the API silently in the background and
+//   renders its own inline "Checking server…" pill under the connection chip).
+//   Full blocking modal only appears on "reactive" wake — i.e. the user
+//   actually clicked "Sign In" while the server was still sleeping. That way:
+//     • User lands on login → types PIN without any jarring popup (no modal).
+//     • If they press Sign In while cold → modal says "Waking the server…"
+//       AND THE PIN THEY ENTERED IS KEPT INTACT so they don't retype.
+//   See LoginScreen inline status pill + guardedFetch wake-source tagging.
 export function ApiWakeOverlay({ appName = 'Prolific POS Terminal' }: { appName?: string }) {
   const [s, setS] = useState<ApiWakeState>({
     isWaking: false,
+    source: null,
     attempt: 0,
     elapsedMs: 0,
     etaMs: 0,
@@ -16,8 +26,11 @@ export function ApiWakeOverlay({ appName = 'Prolific POS Terminal' }: { appName?
 
   useEffect(() => subscribeApiWake((n) => setS(n)), []);
 
-  // Hidden by default; only rendered when guardedFetch() publishes beginWake()
-  if (!s.isWaking) return null;
+  // (1) Not waking → render nothing (fast path).
+  // (2) Waking but source="proactive" → silent: LoginScreen shows its own
+  //     inline pill; do NOT block the whole screen. This is the professional
+  //     default — first page-load should be usable without popups.
+  if (!s.isWaking || s.source === 'proactive') return null;
 
   const elapsedSec = Math.max(0, Math.floor(s.elapsedMs / 1000));
   const etaSec = Math.max(0, Math.floor(s.etaMs / 1000));

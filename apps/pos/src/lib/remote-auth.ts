@@ -1,5 +1,5 @@
 import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
-import { beginWake, endWake, publishApiWake } from './api-wake';
+import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
 
 const API_BASE =
   (typeof import.meta !== 'undefined' &&
@@ -11,13 +11,25 @@ const API_BASE =
   'http://localhost:4000/api/v1';
 
 // POS is always browser; always show overlay on wake. SSR never runs.
-async function guardedFetch(doFetch: () => Promise<Response>): Promise<Response> {
+//
+// wakeSource controls overlay rendering:
+//   'proactive' = background pre-warm from LoginScreen mount. Do NOT show the
+//                 full-screen blocking modal (the overlay skips rendering;
+//                 LoginScreen renders its own inline "Checking server…" pill).
+//   'reactive'  = triggered during actual user action (Sign In click). Show
+//                 full modal so user knows why the submit is taking time (not
+//                 frozen). The PIN they typed remains intact on LoginScreen.
+async function guardedFetch(
+  doFetch: () => Promise<Response>,
+  wakeSource: WakeSource = 'reactive'
+): Promise<Response> {
   let res: Response;
   try {
     res = await doFetch();
   } catch (err) {
-    beginWake();
+    beginWake('Server waking up — one moment…', wakeSource);
     await waitForApiWake(API_BASE, {
+      timeoutMs: 120_000,
       onProgress: (p) =>
         publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
       onWakeResolved: endWake,
@@ -35,8 +47,9 @@ async function guardedFetch(doFetch: () => Promise<Response>): Promise<Response>
     // ignore
   }
   if (isApiWakingResponse(res.status, ct, bodyStart)) {
-    beginWake();
+    beginWake('Server waking up — one moment…', wakeSource);
     await waitForApiWake(API_BASE, {
+      timeoutMs: 120_000,
       onProgress: (p) =>
         publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
       onWakeResolved: endWake,
@@ -44,6 +57,35 @@ async function guardedFetch(doFetch: () => Promise<Response>): Promise<Response>
     return doFetch();
   }
   return res;
+}
+
+/**
+ * Pre-warm the backend from LoginScreen on mount. If the Render backend is
+ * currently asleep, begin the health ping loop silently so by the time the
+ * cashier finishes typing their 4-6 digit PIN the backend is almost always
+ * already awake. Only escalate to a full modal if the cashier clicks Sign In
+ * while still waking — see wakeSource='reactive' branch in pinLogin().
+ */
+export async function preWakeApi(): Promise<void> {
+  // Fire guardedFetch against the cheapest public endpoint (health), but tag
+  // it 'proactive' so the overlay skips rendering its blocking modal.
+  try {
+    await guardedFetch(
+      () =>
+        fetch(API_BASE.replace(/\/+$/, '') + '/health', {
+          method: 'GET',
+          // Pass via type assertion — older TS DOM libs omit cache prop string
+          // literal 'no-store' but it's Fetch spec standard.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ...({ cache: 'no-store' } as any),
+          credentials: 'omit',
+        }),
+      'proactive'
+    );
+  } catch {
+    // ignore — guardedFetch swallowed wake loop + any real error gets surfaced
+    // later when we actually call pinLogin() and the user needs an answer.
+  }
 }
 
 export async function pinLogin(opts: {
@@ -58,13 +100,15 @@ export async function pinLogin(opts: {
 
   let res: Response;
   try {
-    res = await guardedFetch(() =>
-      fetch(`${API_BASE}/auth/pin/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: opts.signal,
-      })
+    res = await guardedFetch(
+      () =>
+        fetch(`${API_BASE}/auth/pin/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: opts.signal,
+        }),
+      'reactive'
     );
   } catch (err: any) {
     throw err;
@@ -85,19 +129,21 @@ export async function changePin(opts: {
   newPin: string;
   signal?: AbortSignal;
 }): Promise<{ ok: true }> {
-  const res = await guardedFetch(() =>
-    fetch(`${API_BASE}/auth/pin/change`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${opts.accessToken}`,
-      },
-      body: JSON.stringify({
-        currentPin: opts.currentPin,
-        newPin: opts.newPin,
+  const res = await guardedFetch(
+    () =>
+      fetch(`${API_BASE}/auth/pin/change`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${opts.accessToken}`,
+        },
+        body: JSON.stringify({
+          currentPin: opts.currentPin,
+          newPin: opts.newPin,
+        }),
+        signal: opts.signal,
       }),
-      signal: opts.signal,
-    })
+    'reactive'
   );
   const json = await res.json().catch(() => null);
   if (!res.ok) {

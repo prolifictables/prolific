@@ -5,8 +5,9 @@ import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../../lib/auth-store';
 import type { ConnectionPillState } from '../../lib/types';
 import { fetchPublicMenu } from '../../lib/remote-menu';
-import { pinLogin } from '../../lib/remote-auth';
+import { pinLogin, preWakeApi } from '../../lib/remote-auth';
 import { fetchPosBootstrap } from '../../lib/remote-pos';
+import { ApiWakeState, subscribeApiWake } from '../../lib/api-wake';
 
 const PIN_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', '⌫'];
 
@@ -54,6 +55,37 @@ export default function LoginScreen() {
   const [pinError, setPinError] = useState<string | null>(null);
   const [pinSubmitting, setPinSubmitting] = useState(false);
   const [resolvedBranch, setResolvedBranch] = useState<any>(null);
+
+  // --- Render cold-start: subscribe to the global API wake bus so we can
+  // surface an inline "Checking server…" pill above the PIN pad (instead of
+  // throwing a jarring full-screen modal at the user the second they land on
+  // the page). If the server is asleep, we silently start warming it in the
+  // background; if the user taps Sign In BEFORE the warm completes, we then
+  // escalate to a full overlay (see guardedFetch source='reactive' branch).
+  const [wake, setWake] = useState<ApiWakeState>({
+    isWaking: false,
+    source: null,
+    attempt: 0,
+    elapsedMs: 0,
+    etaMs: 0,
+    message: '',
+  });
+  useEffect(() => subscribeApiWake((n) => setWake(n)), []);
+
+  // Kick off a SILENT (no blocking modal) pre-warm the instant LoginScreen
+  // mounts. 90%+ of the time the server is already awake by the time the
+  // cashier finds their name badge, reads the 4-6 digit PIN off the admin
+  // reset toast, and types it in on the physical PIN pad.
+  useEffect(() => {
+    void preWakeApi();
+  }, []);
+
+  // Pill status label + dot class are overridden during proactive (background)
+  // wake. We keep the connection chip style (SYNCHRONIZING amber pulse) so the
+  // cashier can immediately tell "the system is doing something, not dead"
+  // without an ugly popup blocking the screen.
+  const pillStatus = wake.isWaking && wake.source === 'proactive' ? 'SYNCHRONIZING' : connection.status;
+  const pillLabel = wake.isWaking && wake.source === 'proactive' ? 'Checking server…' : connection.status;
 
   useEffect(() => {
     let alive = true;
@@ -299,13 +331,17 @@ export default function LoginScreen() {
       {/* Cyber grid backdrop */}
       <div className="absolute inset-0 pointer-events-none opacity-[0.18] bg-cyber-grid animate-grid-scroll" />
 
-      {/* Connection pill */}
+      {/* Connection pill — upgraded post-692128b professional fix:
+          When server is cold-booting, show "Checking server…" with amber SYNCHRONIZING
+          pulse (inline chip, NO full-blocking modal). Only escalates to a real modal
+          if the cashier taps Sign In while still waking. See ApiWakeOverlay source
+          rule: isWaking && source === 'proactive' → render nothing. */}
       <div className="absolute top-5 right-5 z-10">
         <div
-          className={`inline-flex items-center gap-2 rounded-full px-3.5 py-2 text-sm font-semibold ${connectionChipClasses(connection.status)}`}
+          className={`inline-flex items-center gap-2 rounded-full px-3.5 py-2 text-sm font-semibold ${connectionChipClasses(pillStatus)}`}
         >
-          <span className={`h-2.5 w-2.5 rounded-full ${connectionDotClass(connection.status)}`} />
-          <span className="uppercase tracking-wider text-xs font-bold">{connection.status}</span>
+          <span className={`h-2.5 w-2.5 rounded-full ${connectionDotClass(pillStatus)}`} />
+          <span className="uppercase tracking-wider text-xs font-bold">{pillLabel}</span>
           {connection.pendingCount > 0 && (
             <span className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] font-black tabular-nums">
               {connection.pendingCount} pending
@@ -317,6 +353,14 @@ export default function LoginScreen() {
             </span>
           )}
         </div>
+        {/* Inline 1-line estimate for proactive wake — sits UNDER the chip so
+            cashiers know the server will be ready in < 90s. Collapses to nothing
+            once API is online. */}
+        {wake.isWaking && wake.source === 'proactive' && wake.elapsedMs > 0 ? (
+          <div className="mt-1.5 text-right text-[11px] font-semibold tabular-nums text-amber-300/70 pr-2">
+            {Math.max(1, Math.floor(wake.elapsedMs / 1000))}s · ~{Math.max(0, Math.floor(wake.etaMs / 1000))}s left
+          </div>
+        ) : null}
       </div>
 
       {/* Bump 2-column layout from md (768px) to lg (1024px) so short-but-wide cashier terminals
