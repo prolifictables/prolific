@@ -4,9 +4,46 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
     <meta name="theme-color" content="#0B1220" />
+    <!--
+      Content-Security-Policy for Prolific POS terminal (fix for CSP-blocked API fetches
+      that caused "Incorrect PIN" on live Render URLs because connect-src was
+      localhost-only, blocking every real production fetch before it even left the
+      browser).
+
+      Whitelist for connect-src (fetch / XHR / WebSocket):
+        • 'self'                         — same origin (future rewrites, static /api)
+        • *.prolifictables.com           — all subdomains (api/admin/pos/www) on both
+                                           https:// REST + wss:// WebSocket
+        • prolifictables.com (no sub)    — apex domain
+        • *.onrender.com                 — Render free-tier service slugs
+                                           (e.g. prolific-api-xxx.onrender.com) both
+                                           https:// + wss:// (so we don't need to know
+                                           the exact slug assigned by Render).
+        • localhost + 127.0.0.1 + 0.0.0.0 on HTTP/WS ports 4000/5173 — keep dev
+                                           environment working (Vite HMR + local API).
+
+      All other CSP directives remain tight: default-src self, object-src none,
+      base-uri self, form-action self. No changes to script-src / style-src since
+      those only needed local dev + self for production.
+    -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:5173 ws://localhost:5173; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:5173 http://localhost:5173 ws://localhost:4000 http://localhost:4000 ws://127.0.0.1:4000 http://127.0.0.1:4000 ws://0.0.0.0:4000 http://0.0.0.0:4000; font-src 'self' data:; img-src 'self' data: blob:; object-src 'none'; base-uri 'self'; form-action 'self';"
+      content="default-src 'self';
+        script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:5173 ws://localhost:5173;
+        style-src 'self' 'unsafe-inline';
+        connect-src 'self'
+          https://*.prolifictables.com wss://*.prolifictables.com
+          https://prolifictables.com wss://prolifictables.com
+          https://*.onrender.com wss://*.onrender.com
+          ws://localhost:5173 http://localhost:5173
+          ws://localhost:4000 http://localhost:4000
+          ws://127.0.0.1:4000 http://127.0.0.1:4000
+          ws://0.0.0.0:4000 http://0.0.0.0:4000;
+        font-src 'self' data:;
+        img-src 'self' data: blob:;
+        object-src 'none';
+        base-uri 'self';
+        form-action 'self';"
     />
     <title>Prolific POS</title>
   </head>
