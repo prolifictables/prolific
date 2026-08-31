@@ -5,7 +5,27 @@ import {
 } from '@prolific/utils';
 import { beginWake, endWake, publishApiWake } from './api-wake';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
+/**
+ * resolveWebsiteApiBase — same fallback chain as Admin/POS.
+ * Priority: NEXT_PUBLIC_API_URL env build > runtime hostname *.prolifictables.com
+ * → canonical https://api.prolifictables.com/api/v1 > localhost dev.
+ */
+function resolveWebsiteApiBase(): string {
+  const explicit = process.env.NEXT_PUBLIC_API_URL;
+  if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+  if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
+    const hn = window.location.hostname.toLowerCase();
+    const prod =
+      hn === 'prolifictables.com' ||
+      hn.endsWith('.prolifictables.com') ||
+      hn === 'onrender.com' ||
+      hn.endsWith('.onrender.com');
+    if (prod) return 'https://api.prolifictables.com/api/v1';
+  }
+  return 'http://localhost:4000/api/v1';
+}
+
+const API_BASE = resolveWebsiteApiBase();
 
 type NextFetchRequestConfig = {
   revalidate?: number | false;

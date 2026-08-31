@@ -1,7 +1,33 @@
 import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
 import { beginWake, endWake, publishApiWake } from './api-wake';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
+/**
+ * resolveAdminApiBase — professional fallback chain (matches POS pattern, see
+ * apps/pos/src/lib/remote-auth.ts resolveApiBase for docstring).
+ * Priority: NEXT_PUBLIC_API_URL env build > runtime hostname *.prolifictables.com
+ * → canonical https://api.prolifictables.com/api/v1 > localhost dev.
+ */
+function resolveAdminApiBase(): string {
+  // (1) Highest: explicit build env (Next.js)
+  const explicit = process.env.NEXT_PUBLIC_API_URL;
+  if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+
+  // (2) Runtime: production hostnames → canonical API
+  if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
+    const hn = window.location.hostname.toLowerCase();
+    const prod =
+      hn === 'prolifictables.com' ||
+      hn.endsWith('.prolifictables.com') ||
+      hn === 'onrender.com' ||
+      hn.endsWith('.onrender.com');
+    if (prod) return 'https://api.prolifictables.com/api/v1';
+  }
+
+  // (3) Local dev fallback
+  return 'http://localhost:4000/api/v1';
+}
+
+const API_BASE = resolveAdminApiBase();
 
 const getToken = (): string | null => {
   if (typeof document === 'undefined') return null;

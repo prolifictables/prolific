@@ -1,14 +1,51 @@
 import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
 import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
 
-const API_BASE =
-  (typeof import.meta !== 'undefined' &&
-    (import.meta as any).env &&
-    ((import.meta as any).env.VITE_API_BASE_URL ||
-      (import.meta as any).env.VITE_API_URL ||
-      (import.meta as any).env.VITE_PUBLIC_API_URL ||
-      (import.meta as any).env.API_BASE_URL)) ||
-  'http://localhost:4000/api/v1';
+/**
+ * resolveApiBase — professional grade fallback chain for API host.
+ *
+ * Priority (highest wins):
+ *   1. Vite build-time env: VITE_API_BASE_URL > VITE_API_URL > VITE_PUBLIC_API_URL > API_BASE_URL
+ *      (set explicitly on Render static site service build env tab).
+ *   2. Runtime hostname fallback: when browser is on a known production domain
+ *      (*.prolifictables.com / *.onrender.com), resolve to canonical production
+ *      https://api.prolifictables.com/api/v1 even if build env was forgotten.
+ *      This prevents the all-too-common "forgot to set VITE env on static build"
+ *      causing localhost:4000 leak into production bundle (the exact root cause
+ *      debugged in pos-pin-modal-v4 via live browser network requests).
+ *   3. Local dev fallback: http://localhost:4000/api/v1 (only when hostname is
+ *      localhost / 127.0.0.1 / 0.0.0.0, i.e. `npm run dev` mode).
+ */
+function resolveApiBase(): string {
+  // (1) Highest priority: build-time Vite env override (still honored, never broken)
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
+    const viteEnv = (import.meta as any).env;
+    const explicit =
+      viteEnv.VITE_API_BASE_URL ||
+      viteEnv.VITE_API_URL ||
+      viteEnv.VITE_PUBLIC_API_URL ||
+      viteEnv.API_BASE_URL;
+    if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+  }
+
+  // (2) Medium priority: production hostnames → canonical api.prolifictables.com.
+  //    Works even when Render static build env var was not configured (most common
+  //    misconfiguration; CSP already whitelisted this origin in index.html meta).
+  if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
+    const hn = window.location.hostname.toLowerCase();
+    const prod =
+      hn === 'prolifictables.com' ||
+      hn.endsWith('.prolifictables.com') ||
+      hn === 'onrender.com' ||
+      hn.endsWith('.onrender.com');
+    if (prod) return 'https://api.prolifictables.com/api/v1';
+  }
+
+  // (3) Dev fallback: localhost API (never reaches in real user production)
+  return 'http://localhost:4000/api/v1';
+}
+
+const API_BASE = resolveApiBase();
 
 // POS is always browser; always show overlay on wake. SSR never runs.
 //
