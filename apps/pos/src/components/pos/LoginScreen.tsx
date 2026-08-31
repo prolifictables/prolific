@@ -5,11 +5,42 @@ import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../../lib/auth-store';
 import type { ConnectionPillState } from '../../lib/types';
 import { fetchPublicMenu } from '../../lib/remote-menu';
-import { pinLogin, preWakeApi } from '../../lib/remote-auth';
+import {
+  pinLogin,
+  preWakeApi,
+  SERVER_UNREACHABLE_MARKER,
+} from '../../lib/remote-auth';
 import { fetchPosBootstrap } from '../../lib/remote-pos';
 import { ApiWakeState, subscribeApiWake } from '../../lib/api-wake';
 
 const PIN_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', '⌫'];
+
+// Server unreachable error-message marker — same string set by remote-auth.ts AND
+// mock-electron-shim.ts. When any error .message includes this token we treat
+// the error as TRANSPORT-LEVEL (server unreachable / DNS / CORS / Render cold-
+// start timed out) rather than an actual credential mismatch. LoginScreen
+// shows an AMBER warning chip instead of the rose-red "Incorrect PIN" chip
+// for this case. This also short-circuits the shim fallback entirely so we
+// don't waste the user's time on another 15-30s double-wait.
+const hasUnreachableMarker = (msg: string): boolean => {
+  if (typeof msg !== 'string') return false;
+  return (
+    msg.includes(SERVER_UNREACHABLE_MARKER) ||
+    /SERVER_UNREACHABLE/.test(msg)
+  );
+};
+
+/**
+ * For Server-Unreachable error messages: cashier never typed the wrong PIN.
+ * The backend is simply unreachable / sleeping / timing out / DNS failing.
+ * Show an amber warning (no auto-clear PIN) instead of rose (wrong PIN).
+ */
+const humanUnreachableChip = (rawMsg: string): string => {
+  const without = rawMsg
+    .replace(/🔴\s*SERVER_UNREACHABLE:\s*/, '')
+    .replace(/SERVER_UNREACHABLE:\s*/, '');
+  return `⚠️ ${without.replace(/^⚠️\s*/, '')}`;
+};
 
 // Returns gold/amber status chip classes based on connection status
 function connectionChipClasses(status: string) {
@@ -53,6 +84,12 @@ export default function LoginScreen() {
   const [onlineBranches, setOnlineBranches] = useState<any[]>([]);
   const [pin, setPin] = useState('');
   const [pinError, setPinError] = useState<string | null>(null);
+  // Distinct error class: true when pinError was caused by SERVER_UNREACHABLE
+  // (transport-level), false when caused by an actual credential mismatch.
+  // This exists because we transform the raw error marker string into a
+  // human-friendly message before storing it to pinError (so the marker is
+  // no longer present at render-time to be re-detected via hasUnreachableMarker).
+  const [pinErrorUnreachable, setPinErrorUnreachable] = useState<boolean>(false);
   const [pinSubmitting, setPinSubmitting] = useState(false);
   const [resolvedBranch, setResolvedBranch] = useState<any>(null);
 
@@ -140,6 +177,7 @@ export default function LoginScreen() {
         return next;
       });
       setPinError(null);
+      setPinErrorUnreachable(false);
       return;
     }
     if (!k) return;
@@ -148,15 +186,21 @@ export default function LoginScreen() {
       const next = p + k;
       return next;
     });
+    // Typing a digit → clear any prior error (both unreachable and
+    // Incorrect PIN) so the cashier's new attempt feels fresh.
+    setPinError(null);
+    setPinErrorUnreachable(false);
   };
 
   const submitPin = async () => {
     if (pin.length < 4) {
+      setPinErrorUnreachable(false);
       setPinError('PIN must be 4–6 digits.');
       return;
     }
     setPinSubmitting(true);
     setPinError(null);
+    setPinErrorUnreachable(false);
     try {
       const device = await window.electronAPI?.getDeviceId?.();
       const deviceId = device?.deviceId;
@@ -232,36 +276,52 @@ export default function LoginScreen() {
         navigate('/pos', { replace: true });
         return;
       } catch (err: any) {
-        // --- Defensive guard: ONLY fall through to offline shim for real
-        // network/unreachable errors (TypeError "Failed to fetch",
-        // network errors, HTTP 5xx). If the backend explicitly said Invalid PIN
-        // (401 Unauthorized, Invalid PIN in message, or 4xx) we throw that
-        // message immediately so the user sees the real reason; do NOT blindly fall
-        // through to findByPin (which in dev browser mode only knows a
-        // small SEEDED_EMPLOYEES array and never matches admin-created pins.
-        // Normalize error message once for all credential-rejection patterns
+        // --- Defensive guard (v1 + v4 marker extension):
+        //
+        // Priority A: SERVER_UNREACHABLE marker — transport-level error.
+        //   • NEVER fall to offline shim (SEEDED_EMPLOYEES has no admin-reset
+        //     pins anyway so shim fallback always wrongly returns Incorrect PIN).
+        //   • Show AMBER warning chip, NOT rose.
+        //   • DO NOT auto-clear PIN digits (user typed correct PIN, it's not
+        //     their fault the server is down).
+        //   • Rethrow as a specially-marked error to the outer catch.
+        //
+        // Priority B: Explicit Invalid PIN / 401 / 4xx.
+        //   • Real credential mismatch → show ROSE Incorrect PIN chip, clear PIN.
+        //   • Never fall to offline shim (SEEDED_EMPLOYEES never knows admin
+        //     pins anyway, shim would return null too).
+        //
+        // Priority C: Anything else (network failure, CORS, 5xx, parse errors,
+        //            missing fields) — fall through to offline shim ONLY if
+        //            we can't identify the error class above.
         const msg = String(err?.message || String(err));
+        if (hasUnreachableMarker(msg)) {
+          throw err; // propagate SERVER_UNREACHABLE to outer catch verbatim
+        }
         const isInvalidPinResponse =
           /invalid pin/i.test(msg) ||
           /unauthorized/i.test(msg) ||
           /http 4\d\d/i.test(msg) ||
           /pin must be/i.test(msg);
         if (isInvalidPinResponse) {
-          // Explicit credential rejection from backend: re-raise the exact
-          // error so the UI sets pinError and never touches the offline shim
-          // (which would only know hardcoded demo pins).
+          // Explicit credential rejection from backend: raise so UI sets
+          // pinError and NEVER touches offline shim (which only knows demo).
           throw new Error(err?.message || 'Incorrect PIN.');
         }
         // Otherwise fall through to offline mock shim / local SQLite fallback
-        // when there was no real credential answer: network failures, HTTP 5xx, CORS
-        // issues, parse errors, missing fields, etc.
+        // when there was no real credential answer.
       }
 
-      // --- Offline fallback: find employee by PIN across all locally cached
-      // employees, then use the assigned branch (or fallback branch shape)
-      // without asking the cashier to pick a branch explicitly.
+      // --- Offline fallback (SEEDED_EMPLOYEES + local SQLite). ONLY reaches
+      // here when Priority A and B were NOT detected above.
+      // NOTE: On production hostnames (pos.prolifictables.com) the mock shim
+      // itself ALSO throws SERVER_UNREACHABLE on network/5xx failures so this
+      // line still propagates unreachable → outer catch → amber chip, no
+      // Incorrect PIN fallthrough. On localhost it falls normally to SEEDED.
       const found: any = await window.electronAPI?.db?.employees?.findByPin?.('', pin);
       if (!found) {
+        // On localhost this is a real miss. On production we should never get
+        // here (shim throws unreachable first), but belt+suspenders just in case.
         throw new Error('Incorrect PIN. Please try again or ask your manager for assistance.');
       }
       const offlineEmployee = {
@@ -309,8 +369,31 @@ export default function LoginScreen() {
       authActions.setOfflinePinLogin(offlineEmployee, offlineBranch, pin);
       navigate('/pos', { replace: true });
     } catch (e: any) {
-      setPinError(e?.message || 'PIN does not match.');
-      setPin('');
+      // --- Professional classification of errors in the FINAL catch block.
+      // Two distinct user-facing error classes, with different chip colors +
+      // different PIN-clear behaviour. This ensures the cashier is never
+      // misdirected to retype their PIN 10x when the server is actually down.
+      const finalMsg = String(e?.message || String(e));
+      if (hasUnreachableMarker(finalMsg)) {
+        // AMBER warning: backend unreachable. User's PIN is PROBABLY correct.
+        // Do NOT auto-clear the PIN (they should only re-type if they think
+        // they made a typo).
+        setPinErrorUnreachable(true);
+        setPinError(
+          humanUnreachableChip(finalMsg) ||
+            '⚠️ Server unreachable. Wait 60 seconds, then try again, or contact your manager if the problem continues.'
+        );
+        // PIN digits INTENTIONALLY preserved. No setPin('').
+      } else {
+        // ROSE error: real credential mismatch (or shim returned null, etc.)
+        // This IS a pin-typed-wrong problem → show Incorrect PIN chip, clear
+        // PIN digits so the cashier can type it again cleanly.
+        setPinErrorUnreachable(false);
+        setPinError(
+          finalMsg || 'Incorrect PIN. Please try again or ask your manager for assistance.'
+        );
+        setPin('');
+      }
     } finally {
       setPinSubmitting(false);
     }
@@ -473,11 +556,18 @@ export default function LoginScreen() {
               </div>
             </div>
 
-            {pinError && (
-              <div className="rounded-2xl bg-rose-500/10 text-rose-200 text-sm font-bold px-4 py-2.5 ring-1 ring-inset ring-rose-500/25">
-                ⚠️ {pinError}
-              </div>
-            )}
+            {pinError && (() => {
+              // Professional two-class error chip.
+              //  • SERVER_UNREACHABLE → AMBER background, warning implies
+              //    "system problem, not your fault". PIN digits are preserved.
+              //  • Incorrect PIN → ROSE background, implies wrong digits.
+              //    PIN digits auto-cleared on this path so cashier retypes.
+              const unreachable = pinErrorUnreachable;
+              const cls = unreachable
+                ? 'rounded-2xl bg-amber-500/10 text-amber-200 text-sm font-bold px-4 py-2.5 ring-1 ring-inset ring-amber-500/25'
+                : 'rounded-2xl bg-rose-500/10 text-rose-200 text-sm font-bold px-4 py-2.5 ring-1 ring-inset ring-rose-500/25';
+              return <div className={cls}>{pinError}</div>;
+            })()}
 
             <button
               onClick={submitPin}

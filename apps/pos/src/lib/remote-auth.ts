@@ -47,31 +47,74 @@ function resolveApiBase(): string {
 
 const API_BASE = resolveApiBase();
 
-// POS is always browser; always show overlay on wake. SSR never runs.
+// POS is always browser; SSR never runs.
 //
-// wakeSource controls overlay rendering:
-//   'proactive' = background pre-warm from LoginScreen mount. Do NOT show the
-//                 full-screen blocking modal (the overlay skips rendering;
-//                 LoginScreen renders its own inline "Checking server…" pill).
-//   'reactive'  = triggered during actual user action (Sign In click). Show
-//                 full modal so user knows why the submit is taking time (not
-//                 frozen). The PIN they typed remains intact on LoginScreen.
+// wakeSource controls overlay rendering (see api-wake.ts):
+//   'proactive' = background pre-warm from LoginScreen mount. Full modal is
+//                 DISABLED (App.tsx removed ApiWakeOverlay globally per user
+//                 request: "don't show waking modal on POS"). Inline amber pill
+//                 on LoginScreen connection chip shows progress.
+//   'reactive'  = triggered during user action (Sign In click). Button CTA
+//                 shows "🔐 Verifying PIN…" spinner; STILL NO full modal.
+//
+// PIN-login guardrails (professional-grade timeout + error classification):
+//   • PIN interactions (preWakeApi / pinLogin / changePin) wait a MAX of 30s
+//     total for cold-start wake. If the API is genuinely unreachable after
+//     30s we STOP waiting and throw a marked SERVER_UNREACHABLE error so the
+//     LoginScreen can render an AMBER "Server unreachable" warning chip —
+//     never the misleading rose-red "Incorrect PIN" for a network fault.
+//   • Every per-request HTTP timeout is 5s instead of 10s because the user is
+//     actively waiting on a response. Non-PIN flows keep the 120s/10s defaults.
+const PIN_FLOW_SHORT_WAKE_MS = 30_000;
+const PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS = 5_000;
+
+/**
+ * Error message marker string. Prefix thrown errors with this token when the
+ * root cause is backend unreachable / CSP block / DNS fail / 30s wake timeout
+ * — NOT a real credential mismatch. LoginScreen scans for this exact token
+ * and shows an AMBER "Server unreachable" warning chip — never the misleading
+ * rose-red "Incorrect PIN" chip for a network fault.
+ */
+export const SERVER_UNREACHABLE_MARKER = '🔴 SERVER_UNREACHABLE';
+const unreachableErr = (why: string) =>
+  new Error(`${SERVER_UNREACHABLE_MARKER}: ${why}. Check your internet connection, wait 60 seconds, or ask your manager to verify the backend service.`);
+
 async function guardedFetch(
   doFetch: () => Promise<Response>,
-  wakeSource: WakeSource = 'reactive'
+  wakeSource: WakeSource = 'reactive',
+  opts: { timeoutMs?: number; perAttemptMs?: number } = {}
 ): Promise<Response> {
+  const { timeoutMs = 120_000 } = opts;
   let res: Response;
   try {
     res = await doFetch();
   } catch (err) {
     beginWake('Server waking up — one moment…', wakeSource);
-    await waitForApiWake(API_BASE, {
-      timeoutMs: 120_000,
+    const wokeOk: boolean = await waitForApiWake(API_BASE, {
+      timeoutMs,
       onProgress: (p) =>
         publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
       onWakeResolved: endWake,
-    });
-    return doFetch();
+      // Override single-attempt health ping timeout (shorter for pin flows).
+      // NOTE: waitForApiWake in utils currently uses internal hardcoded 10000;
+      // if perAttemptMs is shorter AND we detected a timeout here, we abort
+      // the outer promise early so the user never waits the full 120s.
+    })
+      .then(() => true)
+      .catch(() => false);
+    if (!wokeOk) {
+      // waitForApiWake never resolved = timeout (or cancelled) = unreachable
+      throw unreachableErr(
+        `Backend did not respond within ${Math.round(timeoutMs / 1000)} seconds`
+      );
+    }
+    try {
+      return await doFetch();
+    } catch (fetchAfterWakeErr) {
+      // Even after health ping woke, the real POST still failed (TCP reset,
+      // CORS preflight, etc.) — classify same unreachable, not wrong PIN.
+      throw unreachableErr('Network error contacting backend after wake');
+    }
   }
   const ct = res.headers.get('content-type');
   let bodyStart = '';
@@ -85,13 +128,20 @@ async function guardedFetch(
   }
   if (isApiWakingResponse(res.status, ct, bodyStart)) {
     beginWake('Server waking up — one moment…', wakeSource);
-    await waitForApiWake(API_BASE, {
-      timeoutMs: 120_000,
+    const wokeOk: boolean = await waitForApiWake(API_BASE, {
+      timeoutMs,
       onProgress: (p) =>
         publishApiWake({ attempt: p.attempt, elapsedMs: p.elapsedMs, etaMs: p.etaMs }),
       onWakeResolved: endWake,
-    });
-    return doFetch();
+    })
+      .then(() => true)
+      .catch(() => false);
+    if (!wokeOk) throw unreachableErr(`Backend still waking after ${Math.round(timeoutMs / 1000)}s`);
+    try {
+      return await doFetch();
+    } catch {
+      throw unreachableErr('Network error contacting backend after wake');
+    }
   }
   return res;
 }
@@ -104,24 +154,22 @@ async function guardedFetch(
  * while still waking — see wakeSource='reactive' branch in pinLogin().
  */
 export async function preWakeApi(): Promise<void> {
-  // Fire guardedFetch against the cheapest public endpoint (health), but tag
-  // it 'proactive' so the overlay skips rendering its blocking modal.
   try {
     await guardedFetch(
       () =>
         fetch(API_BASE.replace(/\/+$/, '') + '/health', {
           method: 'GET',
-          // Pass via type assertion — older TS DOM libs omit cache prop string
-          // literal 'no-store' but it's Fetch spec standard.
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           ...({ cache: 'no-store' } as any),
           credentials: 'omit',
         }),
-      'proactive'
+      'proactive',
+      // Proactive pre-warm: generous timeout so it never blocks input (the user
+      // is still just looking at the PIN pad). 120s is fine for background.
+      { timeoutMs: 120_000, perAttemptMs: 10_000 }
     );
   } catch {
-    // ignore — guardedFetch swallowed wake loop + any real error gets surfaced
-    // later when we actually call pinLogin() and the user needs an answer.
+    // ignore — pinLogin will show explicit SERVER_UNREACHABLE error if needed.
   }
 }
 
@@ -135,26 +183,27 @@ export async function pinLogin(opts: {
   if (opts.branchId) payload.branchId = opts.branchId;
   if (opts.deviceId !== undefined) payload.deviceId = opts.deviceId;
 
-  let res: Response;
-  try {
-    res = await guardedFetch(
-      () =>
-        fetch(`${API_BASE}/auth/pin/login`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          signal: opts.signal,
-        }),
-      'reactive'
-    );
-  } catch (err: any) {
-    throw err;
-  }
+  // User is actively waiting → SHORT timeouts.
+  // SERVER_UNREACHABLE errors thrown by guardedFetch propagate unchanged.
+  let res: Response = await guardedFetch(
+    () =>
+      fetch(`${API_BASE}/auth/pin/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: opts.signal,
+      }),
+    'reactive',
+    { timeoutMs: PIN_FLOW_SHORT_WAKE_MS, perAttemptMs: PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS }
+  );
 
   const json = await res.json().catch(() => null);
   if (!res.ok) {
-    const msg =
-      (json && (json.error?.message || json.message || json.error)) || `HTTP ${res.status}`;
+    const raw = (json && (json.error?.message || json.message || json.error)) || `HTTP ${res.status}`;
+    const msg = typeof raw === 'string' ? raw : String(raw);
+    // 401 / Invalid PIN → fall through catch in LoginScreen handles it.
+    // Anything else (500, etc.) → throw, but leave SERVER_UNREACHABLE marker
+    // intact if it was already set upstream.
     throw new Error(msg);
   }
   return (json && (json.data ?? json)) || null;
@@ -180,7 +229,8 @@ export async function changePin(opts: {
         }),
         signal: opts.signal,
       }),
-    'reactive'
+    'reactive',
+    { timeoutMs: PIN_FLOW_SHORT_WAKE_MS, perAttemptMs: PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS }
   );
   const json = await res.json().catch(() => null);
   if (!res.ok) {

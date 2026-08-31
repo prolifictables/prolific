@@ -965,30 +965,51 @@ export function installMockElectronAPI() {
           return [...SEEDED_EMPLOYEES];
         },
         findByPin: async (pinOrBranchId: string, pin?: string) => {
-          // Mirror the real ipc-db-bridge flexible arg-resolution: callers may
-          // invoke as findByPin(pin) [1 arg, ShiftModal], findByPin(pin, branchId)
-          // [vite-env.d.ts type signature], or findByPin('', pin) [LoginScreen
-          // offline fallback passes EMPTY branchId + real PIN as 2 args].
-          // Resolution matches ipc-db-bridge wrap() exactly:
-          //   If second arg is defined → (branchId = arg1, pin = arg2)
-          //   Else (single arg)       → pin = arg1, branchId = ''
-          // Then resolve branchId to empty = "search all employees" matching
-          // employees.repository.findByPin behavior.
           await delay(25);
           const resolvedPin: string =
             typeof pin === 'string' && pin !== undefined ? pin : pinOrBranchId;
 
           // ---------------------------------------------------------------------
-          // Belt + suspenders: In browser preview mode (this shim is active only
-          // when real Electron preload is absent), the SEEDED_EMPLOYEES array
-          // only contains demo cashiers, never employees created/reset via
-          // Admin Portal Mongo. So first try the real server-side PIN login
-          // endpoint: if it succeeds (returning an employee) we convert the
-          // returned {user,employee,restaurant,branch} envelope back into a
-          // flat employee document the caller expects. Only fall back to
-          // SEEDED_EMPLOYEES when the server is truly unreachable (offline)
-          // or explicitly rejects the PIN.
+          // Belt + suspenders: browser shim only. SEEDED_EMPLOYEES never contains
+          // employees created/reset via Admin (Mongo-only). So we hit the real
+          // server first. Professional behaviour:
+          //   • HTTP 200 with employee → return it.
+          //   • 401/400/403 (real "Invalid PIN" from server) → return null
+          //     (do NOT fall to SEEDED; gives wrong UX and masks root cause).
+          //   • NETWORK ERROR / 5xx (server unreachable / asleep) → throw a
+          //     SERVER_UNREACHABLE marker so LoginScreen can show AMBER "Server
+          //     unreachable" warning instead of the misleading rose-red
+          //     "Incorrect PIN". We DO NOT silently fall to SEEDED because
+          //     Admin-reset PINs are never in SEEDED anyway and silent fallback
+          //     caused the 3-minute hang + wrong error symptom.
+          //   • DEV ONLY: localhost hostname → still fall to SEEDED (so `npm
+          //     run dev` works with offline demo cashiers 1234/0000).
           // ---------------------------------------------------------------------
+          const SERVER_UNREACHABLE_MARKER_SHIM = '🔴 SERVER_UNREACHABLE';
+          const unreachableShimErr = (why: string) =>
+            new Error(`${SERVER_UNREACHABLE_MARKER_SHIM}: ${why}`);
+
+          // Shared API base resolver (duplicated locally to avoid circular import
+          // from remote-auth into shim, but same rule: prod hostnames →
+          // https://api.prolifictables.com/api/v1 by default).
+          const prodHostname = (() => {
+            if (typeof window === 'undefined' || typeof window.location?.hostname !== 'string')
+              return false;
+            const hn = window.location.hostname.toLowerCase();
+            return (
+              hn === 'prolifictables.com' ||
+              hn.endsWith('.prolifictables.com') ||
+              hn === 'onrender.com' ||
+              hn.endsWith('.onrender.com')
+            );
+          })();
+          const localhostHostname = (() => {
+            if (typeof window === 'undefined' || typeof window.location?.hostname !== 'string')
+              return false;
+            const hn = window.location.hostname.toLowerCase();
+            return hn === 'localhost' || hn === '127.0.0.1' || hn === '';
+          })();
+
           try {
             const API_BASE_FOR_SHIM =
               (typeof import.meta !== 'undefined' &&
@@ -997,20 +1018,36 @@ export function installMockElectronAPI() {
                   (import.meta as any).env.VITE_API_URL ||
                   (import.meta as any).env.VITE_PUBLIC_API_URL ||
                   (import.meta as any).env.API_BASE_URL)) ||
-              'http://localhost:4000/api/v1';
-            const resp = await fetch(`${API_BASE_FOR_SHIM}/auth/pin/login`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ pin: resolvedPin }),
-            });
+              (prodHostname ? 'https://api.prolifictables.com/api/v1' : 'http://localhost:4000/api/v1');
+
+            // Short timeout: we don't want pinLogin → shim → another 120s wait
+            // (would double/treble total time). 15s is enough for any
+            // reasonable POST, including a Render cold-start that already woke.
+            // If the POST itself takes >15s we classify as unreachable, not
+            // wrong PIN.
+            const abortCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const SHIM_PIN_HTTP_TIMEOUT = 15_000;
+            let timeoutHandle: any = null;
+            if (abortCtrl) {
+              timeoutHandle = setTimeout(() => abortCtrl.abort(), SHIM_PIN_HTTP_TIMEOUT);
+            }
+            let resp: Response;
+            try {
+              resp = await fetch(`${API_BASE_FOR_SHIM}/auth/pin/login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pin: resolvedPin }),
+                signal: abortCtrl ? abortCtrl.signal : undefined,
+              });
+            } finally {
+              if (timeoutHandle) clearTimeout(timeoutHandle);
+            }
             if (resp.ok) {
               const payload = await resp.json().catch(() => ({}));
-              const envelope = (payload && payload.data) ? payload.data : payload;
+              const envelope = payload && payload.data ? payload.data : payload;
               const emp = envelope?.employee;
               const usr = envelope?.user;
               if (emp && emp.id) {
-                // Return a flat shape that matches the rest of the shim
-                // (callers downstream read .id / .userId / .firstName etc.)
                 return {
                   id: emp.id,
                   userId: emp.userId ?? usr?.id ?? null,
@@ -1028,16 +1065,50 @@ export function installMockElectronAPI() {
                 };
               }
             }
-            // If server returned 401 (explicit Invalid PIN) propagate the
-            // miss: do NOT fall back to SEEDED (gives wrong UX).
             if (resp.status === 401 || resp.status === 400 || resp.status === 403) {
+              // Real explicit 4xx: server says wrong PIN. Return null (caller
+              // shows Incorrect PIN). Do NOT fall to SEEDED.
               return null;
             }
-          } catch {
-            // Network / server unavailable → fall through to SEEDED_EMPLOYEES
-            // (the truly offline scenario / dev fallback).
+            // Any other non-2xx (502/503/504 Render sleeping, or 404 for wrong
+            // API path, etc.) → unreachable if not localhost. On localhost it
+            // means dev server is down → fall to SEEDED demo cashiers.
+            if (localhostHostname) {
+              // fall through
+            } else {
+              throw unreachableShimErr(
+                `Server returned HTTP ${resp.status} instead of rejecting PIN`
+              );
+            }
+          } catch (err) {
+            // Always re-throw the SERVER_UNREACHABLE marker if we set it.
+            if (typeof err === 'object' && err !== null && (err as any).message?.includes?.(SERVER_UNREACHABLE_MARKER_SHIM)) {
+              throw err;
+            }
+            // AbortError (timeout 15s) → unreachable, not wrong PIN.
+            // (Hard-coded literal 15 here instead of SHIM_PIN_HTTP_TIMEOUT to
+            // avoid TDZ issues if the const declaration ever moves.)
+            if (typeof err === 'object' && err !== null && ((err as any).name === 'AbortError' || (err as any).code === 20)) {
+              throw unreachableShimErr(`POST /auth/pin/login timed out after 15s`);
+            }
+            // Real network-level error (no connectivity, CORS, DNS not
+            // resolving): on localhost we fall to SEEDED demo cashiers; on
+            // ANY production hostname we mark unreachable (SEEDED is useless
+            // because admin PINs never make it to SEEDED).
+            if (localhostHostname) {
+              // fall through to SEEDED below
+            } else {
+              const reason =
+                (typeof err === 'object' && err !== null && typeof (err as any).message === 'string'
+                  ? (err as any).message
+                  : 'network error');
+              throw unreachableShimErr(`Network fail on PIN POST: ${reason}`);
+            }
           }
 
+          // ONLY REACHABLE on localhost hostnames where the developer has no
+          // backend running. Show SEEDED demo cashiers. Production hostnames
+          // will have thrown unreachable above so never get here.
           return SEEDED_EMPLOYEES.find((e) => e.pin === resolvedPin) || null;
         },
         applySnapshot: async (_employees: unknown) => {
