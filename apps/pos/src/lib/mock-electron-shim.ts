@@ -621,19 +621,18 @@ const SEEDED_MENU_ITEMS = [
   { id: 'mi-tiramisu', name: 'Gold Rush Tiramisu', description: 'Coffee-soaked ladyfingers, mascarpone, gold leaf dust', price: 1800, categoryId: 'cat-desserts', sortOrder: 13, status: 'AVAILABLE', isTaxable: true, modifierIds: [], modifiers: [], imageUrl: '', emoji: '🍰', branchId: 'br-main-01', restaurantId: 'rst-prolific' },
 ];
 
+// Exactly 7 tables (T1-T7) per customer requirement. T1/T2 = 2-seater, T3-T5 = 4-seater,
+// T6/T7 = 6-seater. Deterministic `qrCodeId` tokens match the 6-char format the server
+// `generateRandomToken()` produces so QR scans resolve to the same table identity
+// whether the POS is online (resolves via Nest public/qr/:token) or offline (shim).
 const SEEDED_TABLES = [
-  { id: 'tbl-a1', name: 'A1', zone: 'Main Hall', capacity: 2, status: 'AVAILABLE', shape: 'square', x: 0, y: 0 },
-  { id: 'tbl-a2', name: 'A2', zone: 'Main Hall', capacity: 2, status: 'AVAILABLE', shape: 'square', x: 1, y: 0 },
-  { id: 'tbl-a3', name: 'A3', zone: 'Main Hall', capacity: 4, status: 'OCCUPIED', shape: 'square', x: 2, y: 0, orderCount: 1 },
-  { id: 'tbl-a4', name: 'A4', zone: 'Main Hall', capacity: 4, status: 'AVAILABLE', shape: 'square', x: 3, y: 0 },
-  { id: 'tbl-b1', name: 'B1', zone: 'Main Hall', capacity: 6, status: 'OCCUPIED', shape: 'round', x: 0, y: 1, orderCount: 2 },
-  { id: 'tbl-b2', name: 'B2', zone: 'Main Hall', capacity: 6, status: 'AVAILABLE', shape: 'round', x: 1, y: 1 },
-  { id: 'tbl-b3', name: 'B3', zone: 'Main Hall', capacity: 6, status: 'RESERVED', shape: 'round', x: 2, y: 1 },
-  { id: 'tbl-b4', name: 'B4', zone: 'Main Hall', capacity: 6, status: 'AVAILABLE', shape: 'round', x: 3, y: 1 },
-  { id: 'tbl-c1', name: 'VIP 1', zone: 'VIP Lounge', capacity: 8, status: 'OCCUPIED', shape: 'square', x: 0, y: 2, orderCount: 3 },
-  { id: 'tbl-c2', name: 'VIP 2', zone: 'VIP Lounge', capacity: 8, status: 'AVAILABLE', shape: 'square', x: 1, y: 2 },
-  { id: 'tbl-ot1', name: 'Terrace 1', zone: 'Terrace', capacity: 4, status: 'AVAILABLE', shape: 'round', x: 0, y: 3 },
-  { id: 'tbl-ot2', name: 'Terrace 2', zone: 'Terrace', capacity: 4, status: 'CLEANING', shape: 'round', x: 1, y: 3 },
+  { id: 'tbl-t1', name: 'T1', zone: 'Main Hall', capacity: 2, status: 'AVAILABLE', shape: 'square', x: 0, y: 0, qrCodeId: 'QR-T-0001' },
+  { id: 'tbl-t2', name: 'T2', zone: 'Main Hall', capacity: 2, status: 'AVAILABLE', shape: 'square', x: 1, y: 0, qrCodeId: 'QR-T-0002' },
+  { id: 'tbl-t3', name: 'T3', zone: 'Main Hall', capacity: 4, status: 'AVAILABLE', shape: 'square', x: 2, y: 0, qrCodeId: 'QR-T-0003' },
+  { id: 'tbl-t4', name: 'T4', zone: 'Main Hall', capacity: 4, status: 'AVAILABLE', shape: 'square', x: 3, y: 0, qrCodeId: 'QR-T-0004' },
+  { id: 'tbl-t5', name: 'T5', zone: 'Main Hall', capacity: 4, status: 'AVAILABLE', shape: 'round',  x: 0, y: 1, qrCodeId: 'QR-T-0005' },
+  { id: 'tbl-t6', name: 'T6', zone: 'Main Hall', capacity: 6, status: 'AVAILABLE', shape: 'round',  x: 1, y: 1, qrCodeId: 'QR-T-0006' },
+  { id: 'tbl-t7', name: 'T7', zone: 'Main Hall', capacity: 6, status: 'AVAILABLE', shape: 'round',  x: 2, y: 1, qrCodeId: 'QR-T-0007' },
 ];
 
 const SEEDED_TAXES = [

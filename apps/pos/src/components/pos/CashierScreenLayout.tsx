@@ -1828,15 +1828,27 @@ function TablesPanel({ tables, tablesZone, setTablesZone, onSelectTable, orders,
     return ['ALL', ...Array.from(set)];
   }, [tables]);
 
+  // Aggregate orders per table, keyed by String(tableId) so ObjectId/string keys always
+  // mismatch is impossible. Also counts source==='QR' orders separately so we can
+  // explicitly show a scanner-occupied badge on the floor plan.
   const orderCountsByTable = useMemo(() => {
-    const map: Record<string, { open: number; total: number; last: any }> = {};
+    const map: Record<string, { open: number; total: number; last: any; qrOpen: number; qrTotal: number }> = {};
     for (const o of orders) {
-      if (!o.tableId) continue;
-      const entry = map[o.tableId] || { open: 0, total: 0, last: o };
+      const rawTid = o.tableId;
+      if (!rawTid) continue;
+      const tid = String(rawTid);
+      const entry = map[tid] || { open: 0, total: 0, last: null as any, qrOpen: 0, qrTotal: 0 };
       entry.total += 1;
-      if (!['CLOSED', 'COMPLETED', 'CANCELLED'].includes(o.status || '')) entry.open += 1;
-      if ((o.createdAt || 0) > (entry.last?.createdAt || 0)) entry.last = o;
-      map[o.tableId] = entry;
+      if (o.source === 'QR') entry.qrTotal += 1;
+      const finalised = ['CLOSED', 'COMPLETED', 'CANCELLED', 'PAID'].includes((o.status || '').toUpperCase());
+      if (!finalised) {
+        entry.open += 1;
+        if (o.source === 'QR') entry.qrOpen += 1;
+      }
+      const lastTs = o.updatedAt || o.createdAt || 0;
+      const entryTs = entry.last?.updatedAt || entry.last?.createdAt || 0;
+      if (lastTs > entryTs || !entry.last) entry.last = o;
+      map[tid] = entry;
     }
     return map;
   }, [orders]);
@@ -1868,11 +1880,33 @@ function TablesPanel({ tables, tablesZone, setTablesZone, onSelectTable, orders,
   };
 
   const shown = tables.filter((t) => tablesZone === 'ALL' || !tablesZone || t.zone === tablesZone);
+
+  // Compute a derived / effective status per table (not just the raw `t.status` seed).
+  // This is the critical function that ensures a customer who scans a table's QR code
+  // and places an order → the POS floor plan instantly shows the table as "Occupied"
+  // (with the amber pulse + Running Tab / QR badges) even if the raw status was
+  // "AVAILABLE" and no staff explicitly flipped the status enum on the row.
+  const effectiveStatus = (t: any): string => {
+    const raw = (t.status || 'AVAILABLE').toUpperCase();
+    // If the backend status is already explicitly set, trust it first.
+    if (raw in TABLE_STATUS_TINTS && raw !== 'AVAILABLE') return raw;
+    const tid = String(t.id ?? (t as any)._id ?? '');
+    const meta = orderCountsByTable[tid];
+    const session = sessionByTableId.get(tid);
+    // Any open order (incl. QR-source) or any running tab session = Occupied.
+    if ((meta?.open ?? 0) > 0 || session) return 'OCCUPIED';
+    return 'AVAILABLE';
+  };
+
   const totalsByStatus = useMemo(() => {
     const m: Record<string, number> = {};
-    for (const t of tables) m[t.status || 'AVAILABLE'] = (m[t.status || 'AVAILABLE'] || 0) + 1;
+    for (const t of tables) {
+      const st = effectiveStatus(t);
+      m[st] = (m[st] || 0) + 1;
+    }
     return m;
-  }, [tables]);
+    // orderCountsByTable / sessionByTableId re-compute whenever orders/sessions change.
+  }, [tables, orders, sessions]);
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -1930,16 +1964,18 @@ function TablesPanel({ tables, tablesZone, setTablesZone, onSelectTable, orders,
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
             {shown.map((t) => {
-              const st = t.status || 'AVAILABLE';
+              const tid = String(t.id ?? (t as any)._id ?? '');
+              const st = effectiveStatus(t);
               const tint = TABLE_STATUS_TINTS[st] || TABLE_STATUS_TINTS.AVAILABLE;
-              const meta = orderCountsByTable[t.id];
+              const meta = orderCountsByTable[tid];
               const round = t.shape === 'round';
-              const session = sessionByTableId.get(String(t.id));
+              const session = sessionByTableId.get(tid);
+              const hasQrOpen = (meta?.qrOpen || 0) > 0;
               const isOccupied =
                 st === 'OCCUPIED' || (meta?.open || 0) > 0 || Boolean(session);
               return (
                 <button
-                  key={t.id}
+                  key={tid}
                   onClick={() => onSelectTable(t)}
                   className={`relative group card p-5 hover:shadow-glow-restaurant transition-all active:scale-[0.97] ring-1 ring-inset ${tint.ring} overflow-hidden ${round ? 'rounded-[2rem]' : ''}`}
                 >
@@ -1961,7 +1997,14 @@ function TablesPanel({ tables, tablesZone, setTablesZone, onSelectTable, orders,
                     >
                       <span className="text-lg">{t.name || '?'}</span>
                     </div>
-                    <span className={`h-3 w-3 rounded-full ${tint.dot}`} />
+                    <div className="flex flex-col items-end gap-1.5">
+                      <span className={`h-3 w-3 rounded-full ${tint.dot}`} />
+                      {hasQrOpen && (
+                        <span className="chip !py-0.5 !px-2 !text-[9px] !font-black uppercase tracking-[0.14em] ring-1 ring-inset ring-amber-400/40 bg-amber-500/20 text-amber-200">
+                          📷 QR Scan
+                        </span>
+                      )}
+                    </div>
                   </div>
 
                   <div className="relative">

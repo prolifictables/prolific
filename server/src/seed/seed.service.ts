@@ -563,9 +563,22 @@ export class SeedService implements OnModuleInit {
   ): Promise<{ tables: Table[]; qrCodes: QRCode[] }> {
     const tables: Table[] = [];
     const qrCodes: QRCode[] = [];
-    for (let i = 1; i <= 10; i++) {
-      const tableName = `T${i}`;
-      const capacity = 2 + Math.floor(Math.random() * 7);
+    // Exactly 7 tables per branch per customer requirement.
+    // Deterministic capacities so the floor plan is predictable:
+    //   T1-T2: 2-seater (small window tables)
+    //   T3-T5: 4-seater (family booths)
+    //   T6-T7: 6-seater (large groups / VIP)
+    const SEVEN_TABLE_PLAN: Array<{ name: string; capacity: number; zone: string }> = [
+      { name: 'T1', capacity: 2, zone: 'Main Hall' },
+      { name: 'T2', capacity: 2, zone: 'Main Hall' },
+      { name: 'T3', capacity: 4, zone: 'Main Hall' },
+      { name: 'T4', capacity: 4, zone: 'Main Hall' },
+      { name: 'T5', capacity: 4, zone: 'Main Hall' },
+      { name: 'T6', capacity: 6, zone: 'Main Hall' },
+      { name: 'T7', capacity: 6, zone: 'Main Hall' },
+    ];
+    for (const plan of SEVEN_TABLE_PLAN) {
+      const { name: tableName, capacity, zone } = plan;
 
       const existingTable = await this.tableModel
         .findOne({ branchId, name: tableName })
@@ -581,7 +594,7 @@ export class SeedService implements OnModuleInit {
       }
 
       const qrToken = this.generateRandomToken(6);
-      const tableIdStub = `pending-${branchId}-${i}`;
+      const tableIdStub = `pending-${branchId}-${tableName}`;
       const qr = await this.qrCodeModel.create({
         restaurantId,
         branchId,
@@ -596,7 +609,7 @@ export class SeedService implements OnModuleInit {
         branchId,
         name: tableName,
         capacity,
-        zone: 'Main Hall',
+        zone,
         isActive: true,
         qrCodeId: qr._id.toString(),
       });
@@ -608,6 +621,29 @@ export class SeedService implements OnModuleInit {
       tables.push(table);
       qrCodes.push(qr);
     }
+
+    // Soft-deactivate any pre-existing tables beyond the 7 we keep.
+    // This ensures branches that were previously seeded with 10 tables
+    // automatically collapse to exactly 7 the next time seed runs without
+    // deleting historical order rows that reference those tableIds.
+    const allActive = await this.tableModel
+      .find({ branchId, isActive: true }, { _id: 1, name: 1 })
+      .lean()
+      .exec();
+    const keepNames = new Set(SEVEN_TABLE_PLAN.map((p) => p.name));
+    const extras = allActive.filter((t) => !keepNames.has(t.name));
+    if (extras.length > 0) {
+      await this.tableModel
+        .updateMany(
+          { _id: { $in: extras.map((t) => t._id) } },
+          { $set: { isActive: false } }
+        )
+        .exec();
+      this.logger.log(
+        `  Branch "${branchId}": Soft-deactivated ${extras.length} excess tables (${extras.map((e) => e.name).join(', ')}) to enforce exactly-7 rule.`
+      );
+    }
+
     return { tables, qrCodes };
   }
 
