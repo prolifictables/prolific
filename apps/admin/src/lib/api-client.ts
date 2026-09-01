@@ -80,6 +80,17 @@ const handleUnauthorized = () => {
   }
 };
 
+// Tolerant unwrapper — Nest controller payloads are inconsistent across the
+// codebase: auth endpoints envelope as {data:T} but tables / qr-codes /
+// table-sessions / orders list actions return raw arrays / raw docs. Accept
+// either shape so Admin pages never silently read "undefined" empty lists.
+const smartUnwrap = <T = any>(json: any): T => {
+  if (json === null || json === undefined) return json as T;
+  if (Array.isArray(json)) return json as unknown as T;
+  if (typeof json === 'object' && 'data' in json) return json.data as T;
+  return json as T;
+};
+
 const unwrap = async <T>(res: Response): Promise<T> => {
   let json: any;
   try {
@@ -95,7 +106,7 @@ const unwrap = async <T>(res: Response): Promise<T> => {
     const msg = json?.error?.message || json?.message || `HTTP ${res.status}`;
     throw new Error(msg);
   }
-  return json.data as T;
+  return smartUnwrap<T>(json);
 };
 
 const authHeaders = (): HeadersInit => {
@@ -225,4 +236,50 @@ export async function apiDelete<T>(path: string, opts?: { headers?: HeadersInit 
 }
 
 export const API_BASE_URL = API_BASE;
+
+// Public website base used when generating scannable QR codes that point at
+// the menu viewer (NOT admin). Customers scan the QR on a table's sticker,
+// which resolves to a public page on the Website surface that calls the Nest
+// public/qr/:token endpoint. For production *.prolifictables.com hosts the
+// Website is www.prolifictables.com.
+export function resolveWebsiteBase(): string {
+  if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
+    try {
+      const override = window.localStorage.getItem('prolific_website_base');
+      if (typeof override === 'string' && override.trim().length > 3) {
+        return override.trim().replace(/\/+$/, '');
+      }
+    } catch { /* storage access denied */ }
+  }
+  if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
+    const hn = window.location.hostname.toLowerCase();
+    const prod =
+      hn === 'prolifictables.com' ||
+      hn.endsWith('.prolifictables.com') ||
+      hn === 'onrender.com' ||
+      hn.endsWith('.onrender.com');
+    if (prod) return 'https://www.prolifictables.com';
+  }
+  const explicit = process.env.NEXT_PUBLIC_WEBSITE_URL;
+  if (typeof explicit === 'string' && explicit.length > 0) return explicit.replace(/\/+$/, '');
+  return 'http://localhost:3000';
+}
+
+export const WEBSITE_BASE_URL = resolveWebsiteBase();
+
+// Utility used by every Admin list page so both raw arrays returned directly
+// by Nest list actions and wrapped { data: […] } payloads (auth controller
+// inconsistencies currently exist) are handled without fragile brittle code.
+export function unwrapList<T = any>(payload: unknown): T[] {
+  if (Array.isArray(payload)) return payload;
+  if (payload && typeof payload === 'object') {
+    const p = payload as Record<string, unknown>;
+    if (Array.isArray(p.data)) return p.data as T[];
+  }
+  return [];
+}
+
+export const sidEq = (a: unknown, b: unknown) => String(a ?? '') === String(b ?? '');
+export const sid = (x: unknown) => String(x ?? '');
+
 export { withFallbackNull } from './api-wake';

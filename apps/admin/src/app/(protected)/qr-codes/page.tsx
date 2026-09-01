@@ -1,34 +1,31 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Card, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Input';
 import { DataTable, Column } from '@/components/ui/Table';
 import { Modal } from '@/components/ui/Modal';
-import { apiGet, apiPost } from '@/lib/api-client';
+import { apiGet, apiPost, unwrapList, sid, sidEq, resolveWebsiteBase } from '@/lib/api-client';
 import { useAuthStore } from '@/lib/auth-store';
 import { formatDateTime, formatNumber } from '@/lib/format';
 import { toast } from '@/components/ui/Toast';
-import { API_BASE_URL } from '@/lib/api-client';
 import type { QRCode, Table as TableType } from '@prolific/shared-types';
 
 interface QRExtended extends QRCode {
   table?: TableType;
 }
 
+// Exactly matches server seed Main Hall zone + Tables page DEFAULT_ZONES so
+// the filter dropdown never mismatches against T1..T7 floor plan.
 const ZONES = [
   { value: '', label: 'All Zones' },
-  { value: 'Main Floor', label: 'Main Floor' },
-  { value: 'Bar', label: 'Bar' },
-  { value: 'VIP', label: 'VIP' },
-  { value: 'Outdoor', label: 'Outdoor' },
-  { value: 'Private', label: 'Private Room' },
+  { value: 'Main Hall', label: 'Main Hall' },
 ];
 
 export default function QRCodesPage() {
-  const { branch, accessToken } = useAuthStore();
+  const { branch } = useAuthStore();
   const [loading, setLoading] = useState(true);
   const [codes, setCodes] = useState<QRExtended[]>([]);
   const [tables, setTables] = useState<TableType[]>([]);
@@ -40,6 +37,10 @@ export default function QRCodesPage() {
   const [downloading, setDownloading] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
 
+  // Resolve Website surface public URL once per render (stable — function has
+  // localStorage + env + hostname chain internally, same as POS/api shims).
+  const websiteBase = useMemo(() => resolveWebsiteBase(), []);
+
   const fetchAll = async () => {
     setLoading(true);
     try {
@@ -48,26 +49,29 @@ export default function QRCodesPage() {
         apiGet('/tables'),
       ]);
 
-      const tables: TableType[] = (Array.isArray(tablesRes) ? tablesRes : (tablesRes?.data ?? [])).map((t: any) => ({
+      const tablesRaw = unwrapList<TableType>(tablesRes);
+      // String-normalize ids immediately so joins below are never subject to
+      // Mongoose ObjectId vs string mismatch (the same bug that bit CategoryRail).
+      const normalizedTables: TableType[] = tablesRaw.map((t: any) => ({
         ...t,
-        id: String(t.id || t._id || ''),
+        id: sid(t.id ?? t._id),
       }));
-      setTables(tables);
+      setTables(normalizedTables);
+      const byId = new Map<string, TableType>();
+      for (const t of normalizedTables) byId.set(t.id, t);
 
-      const rawQrs: QRCode[] = Array.isArray(qrRes) ? qrRes : (qrRes?.data ?? []);
-
-      if (rawQrs.length === 0) {
-        setCodes([]);
-        return;
-      }
-
+      const rawQrs = unwrapList<QRCode>(qrRes);
       setCodes(
-        rawQrs.map((q: any) => ({
-          ...q,
-          id: String(q.id || q._id || q.qrCodeId || q.token),
-          tableId: q.tableId,
-          table: tables.find((t) => t.id === q.tableId),
-        }))
+        rawQrs.map((q: any) => {
+          const qid = sid(q.id ?? q._id ?? q.qrCodeId ?? q.token);
+          const tid = sid(q.tableId);
+          return {
+            ...q,
+            id: qid,
+            tableId: tid,
+            table: tid ? byId.get(tid) : undefined,
+          };
+        })
       );
     } catch (err: any) {
       toast(err.message, { variant: 'error' });
@@ -82,20 +86,34 @@ export default function QRCodesPage() {
 
   const filtered = codes.filter((q) => {
     if (zoneFilter && (q.table as any)?.zone !== zoneFilter) return false;
-    if (search && !(q.table as any)?.name?.toLowerCase().includes(search.toLowerCase()) && !q.token.toLowerCase().includes(search.toLowerCase())) return false;
+    const s = String(search || '').toLowerCase();
+    if (s) {
+      const tableName = String((q.table as any)?.name || '').toLowerCase();
+      const token = String(q.token || '').toLowerCase();
+      if (!tableName.includes(s) && !token.includes(s)) return false;
+    }
     return true;
   });
 
   const toggleSelect = (id: string) => {
-    setSelected((s) => s.find((x) => x.id === id) ? s.filter((x) => x.id !== id) : [...s, ...filtered.filter((x) => x.id === id)]);
+    setSelected((prev) => {
+      if (prev.find((x) => sidEq(x.id, id))) return prev.filter((x) => !sidEq(x.id, id));
+      const add = filtered.filter((x) => sidEq(x.id, id));
+      return [...prev, ...add];
+    });
   };
-  const selectAll = () => setSelected(selected.length === filtered.length ? [] : [...filtered]);
+  const selectAll = () => {
+    setSelected((prev) => (prev.length === filtered.length && filtered.length > 0 ? [] : [...filtered]));
+  };
 
-  const qrDataUrl = (token: string, tableName: string) => {
-    const text = `${window.location.origin}/t/${token}`;
+  // Generate QR image URL pointing at the Website surface — NOT admin origin.
+  // Customer scans → lands on www.prolifictables.com/t/<token> → resolveQr +
+  // joinOrStartTableSession public endpoints take over (pre-wired in Nest).
+  const qrDataUrl = (token: string) => {
+    const publicUrl = `${websiteBase}/t/${token}`;
     const size = 200;
     const base = `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&margin=10&data=`;
-    return base + encodeURIComponent(text);
+    return base + encodeURIComponent(publicUrl);
   };
 
   const downloadPDF = async () => {
@@ -105,21 +123,21 @@ export default function QRCodesPage() {
     try {
       const tableIds = targets.map((t) => t.tableId).filter(Boolean);
       const params = new URLSearchParams({ tableIds: tableIds.join(',') });
-      const url = `${API_BASE_URL}/qr-codes/pdf?${params.toString()}`;
-      const res = await fetch(url, {
-        headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const payload: any = await res.json().catch(() => null);
-      const qrPacks = payload?.qrPacks ?? payload?.data?.qrPacks;
-      if (!qrPacks || !Array.isArray(qrPacks)) {
-        setShowPreview(true);
-        toast('QR pack ready', { variant: 'success' });
+      // Route through apiGet so we inherit the guarded Render wake-up cycle +
+      // JWT auth header, instead of raw fetch that would 401 / timeout.
+      const payload: any = await apiGet(`/qr-codes/pdf?${params.toString()}`);
+      // Controller returns {qrPacks:[...], layout:{...}} directly (no .data
+      // envelope) — keep dual-shape guard in case it changes later.
+      const qrPacks: any[] = payload?.qrPacks ?? payload?.data?.qrPacks ?? [];
+      if (!qrPacks.length) {
+        toast('No QR packs returned', { variant: 'warning' });
         return;
       }
 
+      // Merge fresh tokens from server (regenerate-on-empty) into the list so
+      // the preview modal renders the exact same tokens the PDF will print.
       const now = new Date();
-      const next: QRExtended[] = qrPacks.map((p: any) => ({
+      const next: QRExtended[] = qrPacks.map((p) => ({
         id: `${p.token}`,
         restaurantId: '',
         branchId: '',
@@ -134,7 +152,7 @@ export default function QRCodesPage() {
           branchId: '',
           name: p.tableName || 'Table',
           capacity: 0,
-          zone: p.zone,
+          zone: p.zone || 'Main Hall',
           isActive: true,
           qrCodeId: '',
           createdAt: new Date() as any,
@@ -153,8 +171,8 @@ export default function QRCodesPage() {
   };
 
   const regenerateMissing = async () => {
-    const existingTableIds = new Set(codes.map((c) => c.tableId).filter(Boolean));
-    const missingTables = tables.filter((t) => !existingTableIds.has(t.id));
+    const existingTableIds = new Set(codes.map((c) => sid(c.tableId)).filter(Boolean));
+    const missingTables = tables.filter((t) => !existingTableIds.has(sid(t.id)));
     if (missingTables.length === 0) {
       toast('All tables already have QR codes', { variant: 'success' });
       return;
@@ -162,7 +180,7 @@ export default function QRCodesPage() {
     setRegenerating(true);
     try {
       await Promise.all(
-        missingTables.map((t) => apiPost(`/qr-codes/tables/${t.id}/regenerate`, {}))
+        missingTables.map((t) => apiPost(`/qr-codes/tables/${encodeURIComponent(sid(t.id))}/regenerate`, {}))
       );
       toast('QR codes generated', { description: `${missingTables.length} table(s) updated`, variant: 'success' });
       fetchAll();
@@ -189,12 +207,12 @@ export default function QRCodesPage() {
         (q.table as any)?.name || '',
         (q.table as any)?.zone || '',
         q.token,
-        `${window.location.origin}/t/${q.token}`,
+        `${websiteBase}/t/${q.token}`,
         q.isActive ? 'Active' : 'Inactive',
         formatDateTime(q.createdAt),
       ]);
     });
-    const csv = rows.map((r) => r.map((c) => `"${c.replace(/"/g, '""')}"`).join(',')).join('\n');
+    const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
@@ -205,7 +223,18 @@ export default function QRCodesPage() {
 
   const downloadJSON = () => {
     const targets = selected.length ? selected : filtered;
-    const blob = new Blob([JSON.stringify(targets, null, 2)], { type: 'application/json' });
+    // Website URLs embedded in JSON dump too — so operators can paste into
+    // sticker printers without running the Admin UI.
+    const enriched = targets.map((q) => ({
+      token: q.token,
+      tableName: (q.table as any)?.name || '',
+      zone: (q.table as any)?.zone || '',
+      capacity: (q.table as any)?.capacity,
+      url: `${websiteBase}/t/${q.token}`,
+      isActive: q.isActive,
+      createdAt: q.createdAt,
+    }));
+    const blob = new Blob([JSON.stringify(enriched, null, 2)], { type: 'application/json' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
     link.download = `qr-codes-${new Date().toISOString().slice(0, 10)}.json`;
@@ -232,8 +261,8 @@ export default function QRCodesPage() {
         <input
           type="checkbox"
           className="h-4 w-4 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
-          checked={!!selected.find((s) => s.id === r.id)}
-          onChange={() => toggleSelect(r.id)}
+          checked={!!selected.find((s) => sidEq(s.id, r.id))}
+          onChange={() => toggleSelect(sid(r.id))}
           onClick={(e) => e.stopPropagation()}
         />
       ),
@@ -245,7 +274,7 @@ export default function QRCodesPage() {
       render: (r) => (
         <div className="h-12 w-12 rounded-lg bg-white border border-slate-200 p-1.5">
           <img
-            src={qrDataUrl(r.token, (r.table as any)?.name || '')}
+            src={qrDataUrl(r.token)}
             alt={`QR ${r.token}`}
             className="h-full w-full object-contain"
             loading="lazy"
@@ -273,7 +302,17 @@ export default function QRCodesPage() {
       key: 'capacity',
       title: 'Capacity',
       className: 'tabular-nums text-slate-600',
-      render: (r) => `${(r.table as any)?.capacity || '—'} pax`,
+      render: (r) => `${(r.table as any)?.capacity ?? '—'} pax`,
+    },
+    {
+      key: 'url',
+      title: 'Public URL',
+      className: 'text-xs text-slate-500',
+      render: (r) => (
+        <div className="font-mono truncate max-w-[220px]" title={`${websiteBase}/t/${r.token}`}>
+          {`${websiteBase}/t/${r.token}`}
+        </div>
+      ),
     },
     {
       key: 'status',
@@ -347,7 +386,7 @@ export default function QRCodesPage() {
         <DataTable
           columns={columns}
           data={filtered}
-          rowKey={(r) => r.id}
+          rowKey={(r) => sid(r.id)}
           loading={loading}
           emptyText="No QR codes found"
         />
@@ -378,13 +417,13 @@ export default function QRCodesPage() {
               const tCap = (q.table as any)?.capacity;
               return (
                 <div
-                  key={q.id}
+                  key={sid(q.id)}
                   className="rounded-2xl border-2 border-slate-200 bg-white p-4 flex flex-col items-center text-center shadow-sm hover:border-brand-200 transition print:shadow-none print:break-inside-avoid"
                   style={{ printColorAdjust: 'exact' } as React.CSSProperties}
                 >
                   <div className="w-full aspect-square max-w-[200px] mx-auto rounded-xl bg-slate-50 p-3 flex items-center justify-center">
                     <img
-                      src={qrDataUrl(q.token, tName)}
+                      src={qrDataUrl(q.token)}
                       alt={`QR ${q.token}`}
                       className="w-full h-full object-contain"
                     />
@@ -395,8 +434,11 @@ export default function QRCodesPage() {
                     <div className="mt-2 font-mono text-xs font-bold text-brand-700 bg-brand-50 inline-block px-2 py-1 rounded-md">
                       {q.token}
                     </div>
+                    <div className="mt-2 text-[10px] text-slate-500 truncate font-mono">
+                      {`${websiteBase}/t/${q.token}`}
+                    </div>
                     {tCap !== undefined && (
-                      <div className="mt-2 text-xs text-slate-500">
+                      <div className="mt-1 text-xs text-slate-500">
                         Seats <span className="font-semibold text-slate-700">{tCap}</span>
                       </div>
                     )}

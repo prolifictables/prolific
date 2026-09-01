@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Input';
 import { Drawer } from '@/components/ui/Drawer';
 import { ConfirmDialog } from '@/components/ui/Modal';
-import { apiGet, apiPost, apiPatch, apiDelete } from '@/lib/api-client';
+import { apiGet, apiPost, apiPatch, apiDelete, unwrapList, sid, sidEq } from '@/lib/api-client';
 import { useAuthStore } from '@/lib/auth-store';
 import { formatNGN, formatDateTime, formatNumber } from '@/lib/format';
 import { cn } from '@/lib/cn';
@@ -16,6 +16,10 @@ import { toast } from '@/components/ui/Toast';
 import type { QRCode, Table as TableType, TableSession, TableSessionStatus } from '@prolific/shared-types';
 
 type TableStatus = 'AVAILABLE' | 'OCCUPIED' | 'RESERVED' | 'DIRTY';
+
+// Exactly 7 tables (T1..T7) / Main Hall only — per customer requirement the
+// Admin surface must match the POS surface one-to-one.
+const TABLE_COUNT_CAP = 7;
 
 const STATUS_MAP: Record<TableStatus, { variant: any; label: string; ring: string; bg: string }> = {
   AVAILABLE: { variant: 'success', label: 'Available', ring: 'ring-emerald-500/20', bg: 'bg-emerald-50 border-emerald-200' },
@@ -32,13 +36,11 @@ const STATUS_OPTIONS = [
   { value: 'DIRTY', label: 'Dirty' },
 ];
 
+// Exactly mirrors the server seed Main Hall zone so the Admin surface never
+// shows mismatched zones relative to the POS 7-table floor.
 const DEFAULT_ZONES = [
   { value: '', label: 'All Zones' },
-  { value: 'Main Floor', label: 'Main Floor' },
-  { value: 'Bar', label: 'Bar' },
-  { value: 'VIP', label: 'VIP' },
-  { value: 'Outdoor', label: 'Outdoor' },
-  { value: 'Private', label: 'Private Room' },
+  { value: 'Main Hall', label: 'Main Hall' },
 ];
 
 interface FormState {
@@ -50,13 +52,19 @@ interface FormState {
   isActive: boolean;
 }
 
-const EMPTY: FormState = { name: '', capacity: 4, zone: 'Main Floor', floor: '1', isActive: true };
+const EMPTY: FormState = { name: '', capacity: 4, zone: 'Main Hall', floor: '1', isActive: true };
+
+// Statuses that (for occupancy derivation) mean the order is still on the
+// table, not finalised — so the table card should show as Occupied.
+const NON_FINAL_ORDER_STATUSES = new Set([
+  'PENDING', 'IN_PROGRESS', 'READY', 'AWAITING_PAYMENT', 'PARTIALLY_PAID', 'ON_HOLD', 'SERVED',
+]);
 
 export default function TablesPage() {
   const router = useRouter();
   const { branch } = useAuthStore();
   const [loading, setLoading] = useState(true);
-  const [tables, setTables] = useState<(TableType & { _status?: TableStatus; _session?: TableSession | null; _qr?: QRCode | null })[]>([]);
+  const [tables, setTables] = useState<(TableType & { _status?: TableStatus; _session?: TableSession | null; _qr?: QRCode | null; _openOrderCount?: number; _qrOpenOrderCount?: number })[]>([]);
   const [zones, setZones] = useState(DEFAULT_ZONES);
   const [zoneFilter, setZoneFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
@@ -71,66 +79,102 @@ export default function TablesPage() {
   const [delLoading, setDelLoading] = useState(false);
   const [regeneratingQrId, setRegeneratingQrId] = useState<string | null>(null);
   const [qrDownloadLoadingId, setQrDownloadLoadingId] = useState<string | null>(null);
+  const [orders, setOrders] = useState<any[]>([]);
 
   const fetchAll = async () => {
     setLoading(true);
     try {
-      const [tablesRes, sessionsRes, zonesRes, qrsRes]: any = await Promise.all([
+      const [tablesRes, sessionsRes, zonesRes, qrsRes, ordersRes]: any = await Promise.all([
         apiGet('/tables'),
-        apiGet('/table-sessions?status=OPEN,AWAITING_PAYMENT,PARTIALLY_PAID'),
-        apiGet('/tables/zones'),
-        apiGet('/qr-codes').catch(() => ({ data: [] })),
+        apiGet('/table-sessions?status=OPEN,AWAITING_PAYMENT,PARTIALLY_PAID').catch(() => []),
+        apiGet('/tables/zones').catch(() => []),
+        apiGet('/qr-codes').catch(() => []),
+        // Pull live orders too so derived Occupancy counts *any* open order
+        // regardless of source (POS, QR-scan, phone, website) — this is the
+        // critical rule that ensures a customer scanning T4's QR instantly
+        // shows T4 as Occupied on the Admin tables page too (same as POS).
+        apiGet('/orders?limit=300').catch(() => []),
       ]);
 
-      const rawTables = Array.isArray(tablesRes) ? tablesRes : (tablesRes?.data ?? []);
-      const sessions = Array.isArray(sessionsRes) ? sessionsRes : (sessionsRes?.data ?? sessionsRes ?? []);
-      const qrs = Array.isArray(qrsRes) ? qrsRes : (qrsRes?.data ?? qrsRes ?? []);
+      const rawTables = unwrapList(tablesRes);
+      const sessions = unwrapList(sessionsRes);
+      const qrs = unwrapList(qrsRes);
+      const rawOrders = unwrapList(ordersRes);
 
       const activeSessionByTableId = new Map<string, any>();
-      (sessions as any[]).forEach((s) => {
-        const tid = String(s.tableId || '');
-        if (!tid) return;
+      for (const s of sessions) {
+        const tid = sid((s as any).tableId);
+        if (!tid) continue;
         if (!activeSessionByTableId.has(tid)) activeSessionByTableId.set(tid, s);
-      });
+      }
 
       const defaultQrByTableId = new Map<string, any>();
-      (qrs as any[]).forEach((q) => {
-        const tid = String(q.tableId || '');
-        if (!tid) return;
-        const isActive = q.isActive === true;
-        const isDefault = q.isDefault === true || q.isDefault === undefined;
-        if (!isActive) return;
+      for (const q of qrs) {
+        const tid = sid((q as any).tableId);
+        if (!tid) continue;
+        const isActive = (q as any).isActive === true;
+        const isDefault = (q as any).isDefault === true || (q as any).isDefault === undefined;
+        if (!isActive) continue;
         if (!defaultQrByTableId.has(tid) || isDefault) defaultQrByTableId.set(tid, q);
-      });
-      const activeTableIds = new Set(
-        (sessions as any[])
-          .map((s) => String(s.tableId || ''))
-          .filter(Boolean)
-          .filter(Boolean)
-      );
+      }
 
-      const nextZones = Array.isArray(zonesRes) ? zonesRes : (zonesRes?.data ?? []);
+      // Aggregate open orders per table (String-keyed to avoid ObjectId collisions
+      // between Mongoose docs and the normalised ids we store in React state).
+      const openOrdersByTableId = new Map<string, { total: number; qrOpen: number; last: any }>();
+      for (const o of rawOrders) {
+        const tid = sid((o as any).tableId);
+        if (!tid) continue;
+        const status = String((o as any).status || '').toUpperCase();
+        const source = String((o as any).source || '').toUpperCase();
+        const isOpen = NON_FINAL_ORDER_STATUSES.has(status);
+        const entry = openOrdersByTableId.get(tid) || { total: 0, qrOpen: 0, last: null as any };
+        if (isOpen) {
+          entry.total += 1;
+          if (source === 'QR') entry.qrOpen += 1;
+        }
+        const ts = (o as any).updatedAt || (o as any).createdAt || 0;
+        const entryTs = entry.last?.updatedAt || entry.last?.createdAt || 0;
+        if (ts > entryTs || !entry.last) entry.last = o;
+        openOrdersByTableId.set(tid, entry);
+      }
+
+      const nextZones = unwrapList(zonesRes);
       if (nextZones.length > 0) {
-        setZones([{ value: '', label: 'All Zones' }, ...nextZones.map((z: string) => ({ value: z, label: z }))]);
+        setZones([
+          { value: '', label: 'All Zones' },
+          ...Array.from(new Set(['Main Hall', ...nextZones.map((z: any) => String(z))])).map((z) => ({ value: z, label: z })),
+        ]);
       } else {
         setZones(DEFAULT_ZONES);
       }
 
+      setOrders(rawOrders);
+
       setTables(
         rawTables.map((t: any) => {
-          const id = String(t.id || t._id || '');
+          const id = sid(t.id ?? t._id);
+          const hasSession = activeSessionByTableId.has(id);
+          const open = openOrdersByTableId.get(id);
+          const derivedOccupied = hasSession || (open?.total ?? 0) > 0;
+          const rawStatus = String(t.status || '').toUpperCase();
+          let derived: TableStatus = 'AVAILABLE';
+          if (rawStatus === 'RESERVED') derived = 'RESERVED';
+          else if (derivedOccupied) derived = 'OCCUPIED';
           return {
             ...t,
             id,
-            _status: activeTableIds.has(id) ? 'OCCUPIED' : 'AVAILABLE',
+            _status: derived,
             _session: activeSessionByTableId.get(id) ?? null,
             _qr: defaultQrByTableId.get(id) ?? null,
+            _openOrderCount: open?.total ?? 0,
+            _qrOpenOrderCount: open?.qrOpen ?? 0,
           };
         })
       );
     } catch (err: any) {
       toast(err.message, { variant: 'error' });
       setTables([]);
+      setOrders([]);
     } finally {
       setLoading(false);
     }
@@ -154,7 +198,7 @@ export default function TablesPage() {
   const filtered = tables.filter((t) => {
     if (zoneFilter && t.zone !== zoneFilter) return false;
     if (statusFilter !== 'ALL' && (t as any)._status !== statusFilter) return false;
-    if (search && !t.name.toLowerCase().includes(search.toLowerCase())) return false;
+    if (search && !String(t.name).toLowerCase().includes(String(search).toLowerCase())) return false;
     if (!t.isActive) return false;
     return true;
   });
@@ -166,19 +210,28 @@ export default function TablesPage() {
     dirty: tables.filter((t) => (t as any)._status === 'DIRTY' && t.isActive).length,
   };
 
+  // Hard cap: never allow more than 7 active tables per user requirement.
+  const activeTableCount = counts.total;
+  const atCap = activeTableCount >= TABLE_COUNT_CAP;
+
   const openCreate = () => {
+    if (atCap) {
+      toast(`Maximum of ${TABLE_COUNT_CAP} tables allowed (T1–T7)`, { variant: 'warning' });
+      return;
+    }
     setEditing(false);
-    setForm({ ...EMPTY, name: `Table ${tables.length + 1}` });
+    const next = activeTableCount + 1;
+    setForm({ ...EMPTY, name: `T${next}`, zone: 'Main Hall' });
     setDrawerOpen(true);
   };
 
   const openEdit = (t: TableType) => {
     setEditing(true);
     setForm({
-      id: String((t as any).id || (t as any)._id || ''),
+      id: sid((t as any).id ?? (t as any)._id),
       name: t.name,
       capacity: t.capacity,
-      zone: t.zone || 'Main Floor',
+      zone: t.zone || 'Main Hall',
       floor: t.floor || '1',
       isActive: t.isActive,
     });
@@ -191,9 +244,14 @@ export default function TablesPage() {
     setSaving(true);
     try {
       if (editing && form.id) {
-        await apiPatch(`/tables/${form.id}`, form);
+        await apiPatch(`/tables/${encodeURIComponent(form.id)}`, form);
         toast('Table updated', { variant: 'success' });
       } else {
+        if (atCap) {
+          toast(`Cannot create more than ${TABLE_COUNT_CAP} tables`, { variant: 'warning' });
+          setSaving(false);
+          return;
+        }
         await apiPost('/tables', form);
         toast('Table created', { variant: 'success' });
       }
@@ -210,7 +268,7 @@ export default function TablesPage() {
     if (!del) return;
     setDelLoading(true);
     try {
-      await apiDelete(`/tables/${encodeURIComponent(String((del as any).id || (del as any)._id || ''))}`);
+      await apiDelete(`/tables/${encodeURIComponent(sid((del as any).id ?? (del as any)._id))}`);
       toast('Deleted', { variant: 'success' });
       setDel(null);
       fetchAll();
@@ -222,7 +280,7 @@ export default function TablesPage() {
   };
 
   const grouped = filtered.reduce((acc: Record<string, typeof filtered>, t) => {
-    const z = t.zone || 'Unassigned';
+    const z = t.zone || 'Main Hall';
     if (!acc[z]) acc[z] = [];
     acc[z].push(t);
     return acc;
@@ -230,7 +288,7 @@ export default function TablesPage() {
 
   const selected = useMemo(() => {
     if (!selectedId) return null;
-    return tables.find((t) => String(t.id) === String(selectedId)) ?? null;
+    return tables.find((t) => sidEq(t.id, selectedId)) ?? null;
   }, [selectedId, tables]);
 
   const sessionTone = (status?: TableSessionStatus | string | null) => {
@@ -256,9 +314,11 @@ export default function TablesPage() {
   const handleDownloadQr = async (tableId: string) => {
     setQrDownloadLoadingId(tableId);
     try {
-      const res: any = await apiGet(`/qr-codes/pdf?tableIds=${encodeURIComponent(tableId)}`);
-      const packs = res?.data?.qrPacks ?? res?.qrPacks ?? [];
-      const pack = Array.isArray(packs) ? packs[0] : null;
+      // Use all=true for the global 7-table sheet; single-table uses tableIds=..
+      const params = new URLSearchParams({ tableIds: tableId });
+      const res: any = await apiGet(`/qr-codes/pdf?${params.toString()}`);
+      const qrPacks = res?.qrPacks ?? res?.data?.qrPacks ?? [];
+      const pack = Array.isArray(qrPacks) ? qrPacks[0] : null;
       const url = pack?.downloadUrl ? String(pack.downloadUrl) : '';
       if (!url) {
         toast('QR not available', { variant: 'warning' });

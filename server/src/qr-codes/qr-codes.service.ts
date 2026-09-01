@@ -121,10 +121,19 @@ export class QrCodesService {
     const branchId = ctx.branchId;
     if (!branchId) throw new BadRequestException('Branch context required');
 
-    const publicUrl =
+    // Resolve the public Website surface URL that gets encoded into every
+    // printable QR code. Customers scan the sticker → land here →
+    // GET /public/qr/:token takes over. Priority:
+    //   (1) PUBLIC_QR_BASE_URL — operator explicitly sets it (Render env override)
+    //   (2) WEBSITE_URL env + /t suffix (explicit Website surface env)
+    //   (3) APP_URL env + /t suffix (legacy generic app env)
+    //   (4) Production confirmed www.prolifictables.com/t (NEVER localhost in prod!)
+    const websiteUrl =
       process.env.PUBLIC_QR_BASE_URL ||
-      process.env.APP_URL ||
-      'http://localhost:3000/t';
+      (process.env.WEBSITE_URL ? `${process.env.WEBSITE_URL.replace(/\/+$/, '')}/t` : undefined) ||
+      (process.env.APP_URL ? `${process.env.APP_URL.replace(/\/+$/, '')}/t` : undefined) ||
+      'https://www.prolifictables.com/t';
+    const publicUrl = websiteUrl;
 
     let tableQuery: Record<string, unknown> = { branchId, isActive: true };
     if (!opts.all && opts.tableIds && opts.tableIds.length > 0) {
