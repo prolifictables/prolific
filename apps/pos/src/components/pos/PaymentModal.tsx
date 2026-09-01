@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useCartStore } from '../../lib/cart-store';
 import { useAuthStore } from '../../lib/auth-store';
 import { formatCentsToNgn, padZero } from '../../lib/ui-helpers';
+import { resolveApiBase } from '../../lib/remote-auth';
 
 type PaymentMethod = 'CASH' | 'PHYSICAL_POS' | 'BANK_TRANSFER' | 'SPLIT_BILL' | 'ONLINE';
 
@@ -371,25 +372,34 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           local_entity_version: 1,
         });
 
-        if (!window.electronAPI?.sync?.requestNow && accessToken && branch?.id && typeof window !== 'undefined') {
+        if (typeof window !== 'undefined') {
           try {
-            const apiBase =
-              (typeof import.meta !== 'undefined' &&
-                (import.meta as any).env &&
-                ((import.meta as any).env.VITE_API_BASE_URL ||
-                  (import.meta as any).env.VITE_API_URL ||
-                  (import.meta as any).env.VITE_PUBLIC_API_URL ||
-                  (import.meta as any).env.API_BASE_URL)) ||
-              'http://localhost:4000/api/v1';
+            // Professional 4-tier API base resolution so the POS browser
+            // mode always posts to the Render production API on prod
+            // hostnames — never silently falls to localhost:4000.
+            const apiBaseRaw = resolveApiBase?.()
+              ?? (typeof import.meta !== 'undefined'
+                && (import.meta as any).env
+                && ((import.meta as any).env.VITE_API_BASE_URL
+                  || (import.meta as any).env.VITE_API_URL
+                  || (import.meta as any).env.VITE_PUBLIC_API_URL
+                  || (import.meta as any).env.API_BASE_URL))
+              ?? 'http://localhost:4000/api/v1';
+            const apiBase = String(apiBaseRaw).replace(/\/+$/, '');
+
             const stored = localStorage.getItem('pos_device_id');
             const deviceId = stored || (crypto.randomUUID ? crypto.randomUUID() : `browser_${Date.now()}`);
             if (!stored) localStorage.setItem('pos_device_id', deviceId);
-            const res = await fetch(`${String(apiBase).replace(/\/+$/, '')}/sync/batch`, {
+
+            const endpoint = accessToken ? '/sync/batch' : '/public/pos-sync-batch';
+            const headers: Record<string, string> = {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            };
+            if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+            const res = await fetch(`${apiBase}${endpoint}`, {
               method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${accessToken}`,
-              },
+              headers,
               body: JSON.stringify({
                 deviceId,
                 commands: [

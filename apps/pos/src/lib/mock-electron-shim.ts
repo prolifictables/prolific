@@ -2169,12 +2169,18 @@ export function installMockElectronAPI() {
       // avoids accumulating duplicate intervals.
     } else {
       (window as any).__mockSyncInstalled = true;
+      // Professional 4-tier API base resolution — parity with
+      // resolvePublicApiBase() used everywhere else in this shim. Critically
+      // ensures the browser POS pushes orders/payments and pulls recent
+      // external orders to the REAL Render production API, never localhost.
+      //
+      // Prioritisation (same chain as remote-menu shim / auth shim):
+      //   1. localStorage prolific_api_base (ops override)
+      //   2. VITE_* / NEXT_PUBLIC_*_API_BASE_URL build-time vars
+      //   3. Production hostname → prolific-api.onrender.com/api/v1
+      //   4. Dev-only localhost:4000 fallback
       const env: any = (window as any).process?.env ?? {};
-      const DEFAULT_API =
-        (env.VITE_API_BASE_URL as string) ||
-        (env.NEXT_PUBLIC_API_BASE_URL as string) ||
-        'http://localhost:4000/api/v1';
-      const API_BASE = DEFAULT_API.replace(/\/$/, '');
+      const API_BASE = resolvePublicApiBase().replace(/\/$/, '');
       const BRANCH_ID =
         (env.VITE_BRANCH_ID as string) ||
         (env.NEXT_PUBLIC_BRANCH_ID as string) ||
