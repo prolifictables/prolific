@@ -2,11 +2,9 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
-  Logger,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import * as S from '@prolific/shared-types';
 import { QRCode } from './schemas/qr-code.schema';
 import { Table } from '../tables/schemas/table.schema';
 import type { AuthContext } from '../common/decorators/current-user.decorator';
@@ -45,8 +43,6 @@ export interface ListQrsFilters {
 
 @Injectable()
 export class QrCodesService {
-  private readonly logger = new Logger(QrCodesService.name);
-
   constructor(
     @InjectModel(QRCode.name)
     private readonly qrCodeModel: Model<QRCode>,

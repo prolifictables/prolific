@@ -43,6 +43,22 @@ const DEFAULT_ZONES = [
   { value: 'Main Hall', label: 'Main Hall' },
 ];
 
+// Canonical 7-table plan — one source of truth shared between server seed
+// (seed.service.ts createTablesWithQr), POS shim SEEDED_TABLES, and Admin.
+// Sort / filter keys are derived from this so T1..T7 always render in the
+// same order on every surface regardless of the order Mongo returns them.
+const SEVEN_TABLE_PLAN: Array<{ name: string; capacity: number; zone: string }> = [
+  { name: 'T1', capacity: 2, zone: 'Main Hall' },
+  { name: 'T2', capacity: 2, zone: 'Main Hall' },
+  { name: 'T3', capacity: 4, zone: 'Main Hall' },
+  { name: 'T4', capacity: 4, zone: 'Main Hall' },
+  { name: 'T5', capacity: 4, zone: 'Main Hall' },
+  { name: 'T6', capacity: 6, zone: 'Main Hall' },
+  { name: 'T7', capacity: 6, zone: 'Main Hall' },
+];
+const CANONICAL_TABLE_NAMES = new Set(SEVEN_TABLE_PLAN.map((p) => p.name));
+const CANONICAL_ORDER = new Map(SEVEN_TABLE_PLAN.map((p, i) => [p.name, i]));
+
 interface FormState {
   id?: string;
   name: string;
@@ -79,7 +95,6 @@ export default function TablesPage() {
   const [delLoading, setDelLoading] = useState(false);
   const [regeneratingQrId, setRegeneratingQrId] = useState<string | null>(null);
   const [qrDownloadLoadingId, setQrDownloadLoadingId] = useState<string | null>(null);
-  const [orders, setOrders] = useState<any[]>([]);
 
   const fetchAll = async () => {
     setLoading(true);
@@ -148,33 +163,43 @@ export default function TablesPage() {
         setZones(DEFAULT_ZONES);
       }
 
-      setOrders(rawOrders);
-
       setTables(
-        rawTables.map((t: any) => {
-          const id = sid(t.id ?? t._id);
-          const hasSession = activeSessionByTableId.has(id);
-          const open = openOrdersByTableId.get(id);
-          const derivedOccupied = hasSession || (open?.total ?? 0) > 0;
-          const rawStatus = String(t.status || '').toUpperCase();
-          let derived: TableStatus = 'AVAILABLE';
-          if (rawStatus === 'RESERVED') derived = 'RESERVED';
-          else if (derivedOccupied) derived = 'OCCUPIED';
-          return {
-            ...t,
-            id,
-            _status: derived,
-            _session: activeSessionByTableId.get(id) ?? null,
-            _qr: defaultQrByTableId.get(id) ?? null,
-            _openOrderCount: open?.total ?? 0,
-            _qrOpenOrderCount: open?.qrOpen ?? 0,
-          };
-        })
+        rawTables
+          // Keep only the exactly-7 canonical T1..T7 names. Any extras
+          // (T8..T10 from old seeds) are excluded from rendering even if
+          // they still have isActive=true pending the next server seed run
+          // that soft-deactivates them.
+          .filter((t: any) => CANONICAL_TABLE_NAMES.has(String(t.name || '')))
+          .map((t: any) => {
+            const id = sid(t.id ?? t._id);
+            const hasSession = activeSessionByTableId.has(id);
+            const open = openOrdersByTableId.get(id);
+            const derivedOccupied = hasSession || (open?.total ?? 0) > 0;
+            const rawStatus = String(t.status || '').toUpperCase();
+            let derived: TableStatus = 'AVAILABLE';
+            if (rawStatus === 'RESERVED') derived = 'RESERVED';
+            else if (derivedOccupied) derived = 'OCCUPIED';
+            return {
+              ...t,
+              id,
+              _status: derived,
+              _session: activeSessionByTableId.get(id) ?? null,
+              _qr: defaultQrByTableId.get(id) ?? null,
+              _openOrderCount: open?.total ?? 0,
+              _qrOpenOrderCount: open?.qrOpen ?? 0,
+            };
+          })
+          // Sort in T1→T7 order so floor plan is identical between Admin
+          // and POS regardless of Mongo insertion order.
+          .sort((a: any, b: any) => {
+            const ai = CANONICAL_ORDER.get(String(a.name || '')) ?? 99;
+            const bi = CANONICAL_ORDER.get(String(b.name || '')) ?? 99;
+            return ai - bi;
+          })
       );
     } catch (err: any) {
       toast(err.message, { variant: 'error' });
       setTables([]);
-      setOrders([]);
     } finally {
       setLoading(false);
     }
@@ -220,8 +245,16 @@ export default function TablesPage() {
       return;
     }
     setEditing(false);
-    const next = activeTableCount + 1;
-    setForm({ ...EMPTY, name: `T${next}`, zone: 'Main Hall' });
+    const nextIdx = activeTableCount;
+    // Always use the plan entry's capacity + Main Hall so the Admin floor
+    // plan stays byte-identical to the POS SEEDED_TABLES floor plan.
+    const plan = SEVEN_TABLE_PLAN[Math.min(nextIdx, SEVEN_TABLE_PLAN.length - 1)];
+    setForm({
+      ...EMPTY,
+      name: plan.name,
+      capacity: plan.capacity,
+      zone: plan.zone,
+    });
     setDrawerOpen(true);
   };
 

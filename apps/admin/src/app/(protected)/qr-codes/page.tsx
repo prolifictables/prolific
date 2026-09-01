@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { Card, CardHeader, CardTitle } from '@/components/ui/Card';
+import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Input';
@@ -23,6 +23,21 @@ const ZONES = [
   { value: '', label: 'All Zones' },
   { value: 'Main Hall', label: 'Main Hall' },
 ];
+
+// Canonical 7-table plan mirroring server seed / POS SEEDED_TABLES. Keep this
+// in lock-step with seed.service.ts createTablesWithQr SEVEN_TABLE_PLAN and
+// the Admin Tables page copy above — render order + name filter key off it.
+const SEVEN_TABLE_PLAN: Array<{ name: string; capacity: number; zone: string }> = [
+  { name: 'T1', capacity: 2, zone: 'Main Hall' },
+  { name: 'T2', capacity: 2, zone: 'Main Hall' },
+  { name: 'T3', capacity: 4, zone: 'Main Hall' },
+  { name: 'T4', capacity: 4, zone: 'Main Hall' },
+  { name: 'T5', capacity: 4, zone: 'Main Hall' },
+  { name: 'T6', capacity: 6, zone: 'Main Hall' },
+  { name: 'T7', capacity: 6, zone: 'Main Hall' },
+];
+const CANONICAL_TABLE_NAMES = new Set(SEVEN_TABLE_PLAN.map((p) => p.name));
+const CANONICAL_ORDER = new Map(SEVEN_TABLE_PLAN.map((p, i) => [p.name, i]));
 
 export default function QRCodesPage() {
   const { branch } = useAuthStore();
@@ -50,28 +65,47 @@ export default function QRCodesPage() {
       ]);
 
       const tablesRaw = unwrapList<TableType>(tablesRes);
-      // String-normalize ids immediately so joins below are never subject to
-      // Mongoose ObjectId vs string mismatch (the same bug that bit CategoryRail).
-      const normalizedTables: TableType[] = tablesRaw.map((t: any) => ({
-        ...t,
-        id: sid(t.id ?? t._id),
-      }));
+      // String-normalize ids + restrict to the 7 canonical T1..T7 names so
+      // the list stays aligned with POS SEEDED_TABLES regardless of stale
+      // extras in Mongo (extras get soft-deactivated on next seed run).
+      const normalizedTables: TableType[] = tablesRaw
+        .filter((t: any) => CANONICAL_TABLE_NAMES.has(String(t.name || '')))
+        .map((t: any) => ({
+          ...t,
+          id: sid(t.id ?? t._id),
+        }))
+        .sort((a: any, b: any) => {
+          const ai = CANONICAL_ORDER.get(String(a.name || '')) ?? 99;
+          const bi = CANONICAL_ORDER.get(String(b.name || '')) ?? 99;
+          return ai - bi;
+        });
       setTables(normalizedTables);
       const byId = new Map<string, TableType>();
       for (const t of normalizedTables) byId.set(t.id, t);
 
       const rawQrs = unwrapList<QRCode>(qrRes);
       setCodes(
-        rawQrs.map((q: any) => {
-          const qid = sid(q.id ?? q._id ?? q.qrCodeId ?? q.token);
-          const tid = sid(q.tableId);
-          return {
-            ...q,
-            id: qid,
-            tableId: tid,
-            table: tid ? byId.get(tid) : undefined,
-          };
-        })
+        rawQrs
+          .map((q: any) => {
+            const qid = sid(q.id ?? q._id ?? q.qrCodeId ?? q.token);
+            const tid = sid(q.tableId);
+            return {
+              ...q,
+              id: qid,
+              tableId: tid,
+              table: tid ? byId.get(tid) : undefined,
+            };
+          })
+          // Drop any QRs that point at non-canonical tables (e.g. T8+ from
+          // old seeds) so we render exactly 7 rows matching POS floor.
+          .filter((q: any) => q.table && CANONICAL_TABLE_NAMES.has(String((q.table as any).name || '')))
+          // Sort rows T1→T7 so the table column is visually identical to
+          // the Admin tables grid and the POS floor plan order.
+          .sort((a: any, b: any) => {
+            const ai = CANONICAL_ORDER.get(String((a.table as any)?.name || '')) ?? 99;
+            const bi = CANONICAL_ORDER.get(String((b.table as any)?.name || '')) ?? 99;
+            return ai - bi;
+          })
       );
     } catch (err: any) {
       toast(err.message, { variant: 'error' });
