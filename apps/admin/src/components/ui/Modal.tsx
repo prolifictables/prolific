@@ -11,6 +11,7 @@ export interface ModalProps {
   description?: string;
   size?: 'sm' | 'md' | 'lg' | 'xl';
   className?: string;
+  footer?: React.ReactNode;
 }
 
 const sizeClasses = {
@@ -28,6 +29,7 @@ export function Modal({
   description,
   size = 'md',
   className,
+  footer,
 }: ModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
 
@@ -83,6 +85,11 @@ export function Modal({
           </div>
         )}
         <div className="p-6">{children}</div>
+        {footer && (
+          <div className="px-6 py-4 border-t border-slate-100 bg-slate-50/50 rounded-b-2xl">
+            {footer}
+          </div>
+        )}
       </div>
     </div>
   );

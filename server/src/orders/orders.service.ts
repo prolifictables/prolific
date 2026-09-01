@@ -53,6 +53,12 @@ export interface CreateOrderInput {
   tableSessionId?: string;
   qrCodeId?: string;
   customerId?: string;
+  // Optional denormalized customer snapshots (written by QR/Website/Phone).
+  // Persisted directly onto the order so they survive customer edits and
+  // the Admin search/lookup pipeline works without requiring customer joins.
+  customerName?: string;
+  customerPhone?: string;
+  customerEmail?: string;
   employeeId?: string;
   shiftId?: string;
   items: OrderItemInput[];
@@ -270,6 +276,13 @@ export class OrdersService {
       tableSessionId: input.tableSessionId,
       qrCodeId: input.qrCodeId,
       customerId: input.customerId,
+      // Denormalized snapshots: prefer explicit caller-provided values.
+      // POS callers typically leave these empty and rely on customerId join;
+      // QR / Website / Phone flows write them directly so the Admin orders
+      // page search + table display (customer name/phone/email) is instant.
+      customerName: input.customerName,
+      customerPhone: input.customerPhone,
+      customerEmail: input.customerEmail,
       employeeId: input.employeeId ?? ctx.employeeId ?? undefined,
       shiftId: resolvedShiftId,
       subtotalCents,
@@ -447,18 +460,48 @@ export class OrdersService {
       throw new BadRequestException('Branch context required');
     }
 
-    const limit = Math.min(filters.limit ?? 50, 100);
+    // Raised cap: Admin KPI dashboard needs a large enough window to
+    // compute today's revenue / unpaid Web+QR balance without pagination.
+    const limit = Math.min(filters.limit ?? 50, 500);
 
     const query: Record<string, unknown> = { branchId };
-    if (filters.status) query.status = filters.status;
+
+    // Multi-status CSV support — Admin status tabs aggregate several enums
+    // into one view (e.g. "New" = RECEIVED + PENDING). Single values still
+    // work via the equality branch.
+    if (filters.status) {
+      const raw = String(filters.status);
+      const parts = raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      query.status = parts.length > 1 ? { $in: parts } : parts[0];
+    }
     if (filters.tableId) query.tableId = filters.tableId;
-    if (filters.source) query.source = filters.source;
+
+    // Multi-source CSV support (future proofing — single value already works)
+    if (filters.source) {
+      const raw = String(filters.source);
+      const parts = raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      query.source = parts.length > 1 ? { $in: parts } : parts[0];
+    }
+
     if (filters.search) {
       const s = filters.search.trim();
       if (s) {
+        const caseInsensitive = { $regex: s, $options: 'i' };
         query.$or = [
-          { orderNumber: { $regex: s, $options: 'i' } },
-          { notes: { $regex: s, $options: 'i' } },
+          { orderNumber: caseInsensitive },
+          { notes: caseInsensitive },
+          // Items — match individual menu item names that appear on the order
+          { 'items.menuItemName': caseInsensitive },
+          // Customer info stored denormalised on the order (if written by QR/Web)
+          { customerName: caseInsensitive },
+          { customerPhone: caseInsensitive },
+          { customerEmail: caseInsensitive },
         ];
       }
     }
@@ -565,8 +608,9 @@ export class OrdersService {
             : null;
         return this.toSharedOrder(doc, {
           tableName: doc.tableId ? tableNameById.get(String(doc.tableId)) : undefined,
-          customerName: customer ? String(customer.fullName || customer.name || '') : undefined,
-          customerPhone: customer ? String(customer.phone || '') : undefined,
+          customerName: customer ? String(customer.fullName || customer.name || doc.customerName || '') : doc.customerName ? String(doc.customerName) : undefined,
+          customerPhone: customer ? String(customer.phone || doc.customerPhone || '') : doc.customerPhone ? String(doc.customerPhone) : undefined,
+          customerEmail: customer ? String(customer.email || doc.customerEmail || '') : doc.customerEmail ? String(doc.customerEmail) : undefined,
           employeeName: employeeName || undefined,
         });
       }),
@@ -607,8 +651,9 @@ export class OrdersService {
       : null;
     return this.toSharedOrder(doc, {
       tableName: table ? String((table as any).name || '') : undefined,
-      customerName: customer ? String((customer as any).fullName || (customer as any).name || '') : undefined,
-      customerPhone: customer ? String((customer as any).phone || '') : undefined,
+      customerName: customer ? String((customer as any).fullName || (customer as any).name || doc.customerName || '') : doc.customerName ? String(doc.customerName) : undefined,
+      customerPhone: customer ? String((customer as any).phone || doc.customerPhone || '') : doc.customerPhone ? String(doc.customerPhone) : undefined,
+      customerEmail: customer ? String((customer as any).email || doc.customerEmail || '') : doc.customerEmail ? String(doc.customerEmail) : undefined,
       employeeName: employeeName || undefined,
     }) as any;
   }
@@ -1537,7 +1582,7 @@ export class OrdersService {
 
   private toSharedOrder(
     doc: any,
-    enrich: { tableName?: string; customerName?: string; customerPhone?: string; employeeName?: string } = {}
+    enrich: { tableName?: string; customerName?: string; customerPhone?: string; customerEmail?: string; employeeName?: string } = {}
   ): S.Order {
     const createdAt = doc.createdAt instanceof Date ? doc.createdAt : new Date(doc.createdAt);
     const updatedAt = doc.updatedAt instanceof Date ? doc.updatedAt : new Date(doc.updatedAt);
@@ -1607,6 +1652,7 @@ export class OrdersService {
       customerId: doc.customerId ? String(doc.customerId) : undefined,
       customerName: enrich.customerName || undefined,
       customerPhone: enrich.customerPhone || undefined,
+      customerEmail: enrich.customerEmail || undefined,
       tableId: doc.tableId ? String(doc.tableId) : undefined,
       tableSessionId: doc.tableSessionId ? String(doc.tableSessionId) : undefined,
       tableName: enrich.tableName || undefined,

@@ -118,8 +118,6 @@ export class Order
       | 'paidAmount'
       | 'balanceDue'
       | 'tipAmount'
-      | 'customerName'
-      | 'customerPhone'
       | 'tableName'
       | 'deviceId'
       | 'items'
@@ -179,6 +177,17 @@ export class Order
 
   @Prop({ type: String })
   customerId?: string;
+
+  // Denormalized customer snapshots — written by QR / Website / Phone flows
+  // so the Admin orders page can search & display them without customer joins.
+  @Prop({ type: String })
+  customerName?: string;
+
+  @Prop({ type: String })
+  customerPhone?: string;
+
+  @Prop({ type: String })
+  customerEmail?: string;
 
   @Prop({ type: String })
   customerSessionId?: string;

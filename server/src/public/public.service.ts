@@ -720,6 +720,11 @@ export class PublicService {
       tableSessionId: session._id.toString(),
       qrCodeId: resolved.qr.token,
       customerId,
+      // Denormalized customer snapshots so the Admin orders page search +
+      // row-level display show name/phone/email immediately without a join.
+      customerName: input.displayName ?? input.customerInfo?.name ?? undefined,
+      customerPhone: input.customerInfo?.phone ?? undefined,
+      customerEmail: input.customerInfo?.email ?? undefined,
       items: mappedItems,
       notes: input.displayName ? `Customer: ${input.displayName}` : undefined,
       status: requestedStatus,
@@ -960,6 +965,11 @@ export class PublicService {
       type: input.orderType as S.OrderType,
       source: 'WEBSITE',
       customerId,
+      // Denormalized customer snapshots so the Admin orders page search +
+      // row-level display show name/phone/email immediately without a join.
+      customerName: input.displayName ?? input.customerInfo?.name ?? undefined,
+      customerPhone: input.customerInfo?.phone ?? undefined,
+      customerEmail: input.customerInfo?.email ?? undefined,
       items: mappedItems,
       notes: input.displayName ? `Customer: ${input.displayName}` : undefined,
       status: requestedStatus,

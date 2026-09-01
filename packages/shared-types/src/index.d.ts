@@ -325,6 +325,7 @@ export interface Order {
     customerId?: ID;
     customerName?: string;
     customerPhone?: string;
+    customerEmail?: string;
     tableId?: ID;
     tableSessionId?: ID;
     tableName?: string;
