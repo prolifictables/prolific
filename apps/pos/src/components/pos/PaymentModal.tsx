@@ -474,6 +474,13 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       } catch (e) {
         console.warn('[pay] print receipt error', e);
       }
+      // Auto-print kitchen ticket so the bar/kitchen gets notified of the new PAID
+      // order immediately. Best-effort: never blocks the cashier flow.
+      try {
+        await window.electronAPI?.print?.kitchenTicket?.(realOrderId);
+      } catch (ktErr) {
+        console.warn('[pay] print kitchen ticket error (non-fatal):', ktErr);
+      }
 
       setTimeout(
         () =>

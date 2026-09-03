@@ -295,144 +295,147 @@ export default function LoginScreen() {
     setPinError(null);
     setPinErrorUnreachable(false);
     try {
-      const device = await window.electronAPI?.getDeviceId?.();
-      const deviceId = device?.deviceId;
-
       // =====================================================================
-      // PHASE 0 — INSTANT OFFLINE-FIRST (<50ms). QUICK-SERVICE POS PRIORITY.
+      // PHASE 0 — ABSOLUTE OFFLINE PRIORITY (<50ms, NO NETWORK, NO AWAIT of
+      // any network-dependent IPC on the critical path).
       // =====================================================================
-      // For a cashier POS terminal, speed matters more than "confirming the
-      // server is alive right now" on every login. Render free tier cold
-      // starts take 25-45 seconds. That is UNACCEPTABLE latency when a line
-      // of customers is waiting at the counter while the cashier types their
-      // PIN.
+      // User explicitly confirmed: "POS will be used MOSTLY without internet,
+      // offline login should be priority." So we MUST NOT touch ANYTHING that
+      // could wait on network or disk boot during the critical pin-submit →
+      // cashier-screen window. Specifically:
+      //   • findByPin(pin) — pure local SQLite + bcrypt. No network.
+      //   • setOfflinePinLogin() — zustand persist writes to localStorage,
+      //     its window.electronAPI.db.meta.setLastAuth IPC runs in background
+      //     with .catch() (auth-store never awaits it).
+      //   • getDeviceId() — moved to AFTER fast-path navigation, resolved
+      //     lazily only if the background network warm actually fires. On
+      //     terminals with cached employees, this IPC never blocks login.
+      //   • Background warm: wrapped in setTimeout(..., 0) so React finishes
+      //     navigation paint before any promise microtasks run. Smooth UX.
       //
-      // Professional behaviour change:
-      //   1. FIRST query cached SQLite / shim-mirror employees for this PIN.
-      //      (upsertWithPin was called on the LAST successful online login,
-      //      so bcrypt pin-hash for every known employee is already stored
-      //      locally.)
-      //   2. ON HIT (<50ms): setOfflinePinLogin + navigate('/pos') NOW. The
-      //      cashier starts taking orders immediately.
-      //   3. IN PARALLEL NON-BLOCKING fire a background promise that does all
-      //      the slow stuff: pinLogin() network call + Render cold wake +
-      //      fetchPosBootstrap + menu refresh with stale-branch fallback +
-      //      syncQueue requestNow. If/when the network succeeds, it promotes
-      //      the session from OFFLINE_PIN → ONLINE in-place (no reload, no
-      //      user interaction, nothing visible to the cashier).
-      //   4. ON MISS (first login ever on this terminal, no cached employee
-      //      for this pin locally): fall through to the LEGACY online-first
-      //      flow — wait for the 45s Render wake budget, pin-login via server,
-      //      then cache employee for future INSTANT logins. A miss here is
-      //      acceptable since it happens only once per employee per terminal.
+      // Only reach the "slow" network path if findByPin returns null (the
+      // employee has NEVER logged in on this specific terminal, or the
+      // SQLite cache was destroyed — a rare event).
       // =====================================================================
       let foundFastPath: any = null;
       try {
-        foundFastPath = await window.electronAPI?.db?.employees?.findByPin?.('', pin);
+        // Window contract (preload cashier.ts L65): findByPin(PIN, branchId?) —
+        // PIN is FIRST argument, branchId optional second. Do NOT pass '' as a
+        // placeholder for branchId — cashier.ts treats the first arg as PIN,
+        // and main-process wrap + SQL repo fall back to cross-branch global
+        // lookup when branchId is undefined / empty. This matches the "quick
+        // service POS" priority: instant pin lookup against every cached
+        // employee on this terminal regardless of which branch they belong
+        // to (many single-branch installations anyway, Admin UI has 1 default
+        // branch for all staff today).
+        foundFastPath = await window.electronAPI?.db?.employees?.findByPin?.(pin);
       } catch {
         foundFastPath = null;
       }
 
       if (foundFastPath && (foundFastPath.id || foundFastPath._id)) {
-        // (1) Normalize shape and write to offline auth store.
+        // (1) Normalize and write to offline auth store. zustand persists to
+        // localStorage via JSON middleware so the session survives page
+        // reload independently of the SQLite meta.setLastAuth IPC inside
+        // setOfflinePinLogin (which is fire-and-forget via .catch()).
         const { offlineEmployee, offlineBranch } = buildOfflineSession(foundFastPath);
         authActions.setOfflinePinLogin(offlineEmployee, offlineBranch, pin);
         setResolvedBranch(offlineBranch);
 
-        // (2) Background non-blocking warm (fire-and-forget). If/When this
-        // succeeds: promote session to ONLINE, refresh employee snapshot
-        // (upsertWithPin + applySnapshot), refresh menu snapshot, kick the
-        // sync queue reader. The cashier has already left LoginScreen (we
-        // called navigate below) so nothing here blocks the UI. If it fails:
-        // totally fine, the cashier is still taking orders offline and
-        // MenuGrid 8s polling will pick up menu+promote+sync on its next
-        // cycle once the server wakes.
-        void (async () => {
-          try {
-            // (a) Network pin-login with its own independent timeout.
-            const res: any = await pinLogin({ pin, deviceId });
-            const employee = res?.employee || null;
-            const user = res?.user || null;
-            const restaurant = res?.restaurant || null;
-            const branch = res?.branch || null;
-            const accessToken = res?.accessToken;
-            const refreshToken = res?.refreshToken;
-            const expiresIn = res?.expiresIn;
-            if (employee?.id && user?.id && branch?.id && restaurant?.id && accessToken) {
-              const employeeRecord = {
-                id: employee.id,
-                userId: user.id,
-                firstName: user.firstName,
-                lastName: user.lastName,
-                email: user.email,
-                phone: user.phone,
-                role: employee.role,
-                branchId: employee.branchId,
-                restaurantId: employee.restaurantId,
-              };
-              // (b) Keep SQLite employee cache fresh so *next* offline login
-              //     sees any pin resets / role changes from Admin portal.
-              try {
-                await window.electronAPI?.db?.employees?.upsertWithPin?.(employeeRecord, pin);
-              } catch { /* ignore — current offline snapshot still valid */ }
-              // (c) Promote the running session from OFFLINE_PIN → ONLINE.
-              authActions.promoteOnlineLogin({
-                employee: employeeRecord,
-                restaurant,
-                branch: { ...branch, restaurant },
-                accessToken,
-                refreshToken,
-                expiresIn,
-                deviceId,
-              });
-              // (d) Bootstrap snapshots (tables / full employee list) and
-              //     persist latest menu.
-              try {
-                const bootstrap = await fetchPosBootstrap({ accessToken });
-                try { await window.electronAPI?.db?.employees?.applySnapshot?.(bootstrap.employees); } catch { /* ignore */ }
-                try { await window.electronAPI?.db?.tables?.applySnapshot?.(bootstrap.tables); } catch { /* ignore */ }
-              } catch { /* ignore */ }
-              try {
-                const { fallbackBranch } = await refreshAndPersistMenuSnapshot(String(branch.id), restaurant);
-                if (fallbackBranch) authActions.patchBranch(fallbackBranch);
-              } catch { /* ignore — MenuGrid 8s poll will retry */ }
-              try { await window.electronAPI?.sync?.requestNow?.(); } catch { /* ignore */ }
-            }
-          } catch (backgroundErr: any) {
-            // Background network errors are silent to the cashier on the
-            // INSTANT fast-path because they already have a working offline
-            // session. If SERVER_UNREACHABLE (Render still cold) we simply
-            // leave them in OFFLINE_PIN mode and MenuGrid's 8-second poll +
-            // QueueReader's cycle will retry server operations automatically
-            // until Render wakes up. No need to spam the user with warnings
-            // for things that resolve themselves.
-            const bgMsg = String((backgroundErr as any)?.message || String(backgroundErr));
-            if (hasUnreachableMarker(bgMsg)) {
-              console.info('[login:bg-warm] Render still cold; leaving session OFFLINE. MenuGrid will auto-promote when server responds.');
-              return;
-            }
-            // If it was a real 401 "Incorrect PIN" from the server BUT the
-            // local SQLite verified it — that just means the Admin reset the
-            // PIN in MongoDB after the employee was last cached locally. We
-            // STILL allow them to take orders offline (POS should not halt
-            // service on account of a stale reset that hasn't synced yet)
-            // but log a visible warn in devtools so manager can debug if
-            // needed.
-            console.warn('[login:bg-warm] online verify failed, offline session retained:', bgMsg);
-          }
-        })();
+        // (2) Schedule OPTIONAL network warm ONE TICK AFTER React finishes
+        // navigation so no promise microtasks, IPC, or network contend for
+        // the cashier screen paint. All "slow" work (deviceId fetch, Render
+        // cold wake, bootstrap roster, menu persist, sync kick) runs here.
+        const pinForWarm = pin;
+        setTimeout(() => {
+          void (async () => {
+            // Lazily fetch deviceId ONLY if background warm actually runs.
+            // This avoids the IPC on 2nd+ logins where fast-path hits.
+            let warmDeviceId: string | undefined;
+            try {
+              const dev = await window.electronAPI?.getDeviceId?.();
+              warmDeviceId = dev?.deviceId;
+            } catch { /* keep undefined — optional on server side */ }
 
-        // (3) NAVIGATE NOW — zero wait for network.
+            try {
+              const res: any = await pinLogin({ pin: pinForWarm, deviceId: warmDeviceId });
+              const employee = res?.employee || null;
+              const user = res?.user || null;
+              const restaurant = res?.restaurant || null;
+              const branch = res?.branch || null;
+              const accessToken = res?.accessToken;
+              const refreshToken = res?.refreshToken;
+              const expiresIn = res?.expiresIn;
+              if (employee?.id && user?.id && branch?.id && restaurant?.id && accessToken) {
+                const employeeRecord = {
+                  id: employee.id,
+                  userId: user.id,
+                  firstName: user.firstName,
+                  lastName: user.lastName,
+                  email: user.email,
+                  phone: user.phone,
+                  role: employee.role,
+                  branchId: employee.branchId,
+                  restaurantId: employee.restaurantId,
+                };
+                // Keep local pin cache fresh for NEXT offline login.
+                try {
+                  await window.electronAPI?.db?.employees?.upsertWithPin?.(employeeRecord, pinForWarm);
+                } catch { /* offline session still valid even if cache write fails */ }
+                // Promote silently in-place. No reload.
+                authActions.promoteOnlineLogin({
+                  employee: employeeRecord,
+                  restaurant,
+                  branch: { ...branch, restaurant },
+                  accessToken,
+                  refreshToken,
+                  expiresIn,
+                  deviceId: warmDeviceId,
+                });
+                // Persist roster / tables / menu for next offline boot.
+                try {
+                  const bootstrap = await fetchPosBootstrap({ accessToken });
+                  try { await window.electronAPI?.db?.employees?.applySnapshot?.(bootstrap.employees); } catch { /* ignore */ }
+                  try { await window.electronAPI?.db?.tables?.applySnapshot?.(bootstrap.tables); } catch { /* ignore */ }
+                } catch { /* ignore — MenuGrid 8s polls will catch up */ }
+                try {
+                  const { fallbackBranch } = await refreshAndPersistMenuSnapshot(String(branch.id), restaurant);
+                  if (fallbackBranch) authActions.patchBranch(fallbackBranch);
+                } catch { /* ignore */ }
+                try { await window.electronAPI?.sync?.requestNow?.(); } catch { /* ignore — QueueReader cycles every 1.5s */ }
+              }
+            } catch (backgroundErr: any) {
+              // On primary-offline deployment this branch fires most often.
+              // Keep COMPLETELY silent — no warning chips, no popups. Cashier
+              // is already taking orders on the OFFLINE_PIN session they got
+              // in <50ms. Console only for the manager debugging later.
+              const bgMsg = String((backgroundErr as any)?.message || String(backgroundErr));
+              if (hasUnreachableMarker(bgMsg)) {
+                console.info('[login:bg-warm] Server offline / cold. Session retained OFFLINE. Queue/MenuGrid auto-retry.');
+                return;
+              }
+              // Explicit 4xx from server: Admin rotated PIN on server but it
+              // hasn't synced locally yet. Continue offline (priority 1),
+              // warn once in devtools.
+              console.warn('[login:bg-warm] Online verify rejected PIN, offline session retained per primary-offline policy:', bgMsg);
+            }
+          })();
+        }, 0);
+
+        // (3) NAVIGATE. Absolutely NO awaits before this line on fast-path.
         setPinSubmitting(false);
         navigate('/pos', { replace: true });
         return;
       }
 
       // =====================================================================
-      // FALLBACK PATH — LOCAL CACHE MISS (first-time login on this terminal,
-      // no employee cached for this PIN yet). We have no choice but to hit
-      // the network. Keeps original Priority A/B/C error classification.
+      // FALLBACK PATH — LOCAL CACHE MISS. Only reachable when this employee
+      // has NEVER logged in on this terminal before (OR the local DB was
+      // wiped). Slow 45s Render wake budget is acceptable ONCE here.
       // =====================================================================
+      const device = await window.electronAPI?.getDeviceId?.();
+      const deviceId = device?.deviceId;
+
       try {
         const res: any = await pinLogin({ pin, deviceId });
         const employee = res?.employee || null;
@@ -516,7 +519,7 @@ export default function LoginScreen() {
       // missed (otherwise we'd have returned in Phase 0). Final last-ditch
       // attempt to fall to offline shim/SQLite once more — if still null →
       // Incorrect PIN rose chip.
-      const found: any = await window.electronAPI?.db?.employees?.findByPin?.('', pin);
+      const found: any = await window.electronAPI?.db?.employees?.findByPin?.(pin);
       if (!found) {
         throw new Error('Incorrect PIN. Please try again or ask your manager for assistance.');
       }

@@ -58,12 +58,38 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
   ipcMain.handle(
     'db:employees:findByPin',
     wrap('db:employees:findByPin', (branchId: unknown, pin: unknown) => {
-      const branch =
-        typeof branchId === 'string' && branchId && pin !== undefined
-          ? branchId
-          : getActiveBranchId(repos);
-      const resolvedPin = pin !== undefined ? pin : branchId;
-      return repos.employees.findByPin(String(branch ?? ''), String(resolvedPin ?? ''));
+      // ——— Defensive argument normalisation ———
+      // The preload cashier exposes findByPin(PIN, branchId?) — PIN first.
+      // The mock shim exposes findByPin(pinOrBranchId, pin?) with either order.
+      // So on this main-process side we MUST accept both conventions and
+      // disambiguate by content: if ONLY one arg is set and it looks like a
+      // 4–6 digit PIN, treat it as pin=... with cross-branch lookup.
+      const isPinLike = (v: unknown) =>
+        typeof v === 'string' && /^\d{4,6}$/.test(v);
+      let actualPin: string | undefined;
+      let actualBranch: string | undefined;
+      if (pin !== undefined && isPinLike(pin)) {
+        actualPin = String(pin);
+        actualBranch =
+          typeof branchId === 'string' && branchId ? branchId : undefined;
+      } else if (pin === undefined && isPinLike(branchId)) {
+        // Single-arg PIN mode: caller passed PIN-only via first positional
+        // (or preload only forwarded PIN because branchId was undefined).
+        // Cross-branch global search.
+        actualPin = String(branchId);
+        actualBranch = undefined;
+      } else if (typeof branchId === 'string' && typeof pin === 'string') {
+        // Fallback: both strings, neither PIN-like — accept as-is (defensive).
+        actualBranch = branchId || undefined;
+        actualPin = pin || undefined;
+      }
+      if (!actualPin) return null;
+
+      // Resolve branch filter. Prefer: (1) explicit branch from caller, (2)
+      // active-branch from meta.getLastAuth, (3) empty '' = cross-branch SQL.
+      let resolvedBranch = actualBranch ?? getActiveBranchId(repos);
+      // If still empty — cross-branch global lookup in SQL.
+      return repos.employees.findByPin(String(resolvedBranch ?? ''), actualPin);
     })
   );
 
@@ -84,26 +110,102 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
       const list = Array.isArray(employees) ? employees : [];
       const branchId = getActiveBranchId(repos);
       const restaurantId = getActiveRestaurantId(repos);
+      const isBcryptHash = (s: unknown) =>
+        typeof s === 'string' && /^\$2[abxy]?\$/.test(s);
+
+      // Pre-read existing pin_hashes for every employee id we're about to
+      // overwrite. This prevents the "every login is slow even after first"
+      // bug that happened because:
+      //   1. upsertWithPin stores bcrypt(pin) → pin_hash = "$2a$10$..."
+      //   2. 100ms later applySnapshot(bootstrap.employees) runs and writes
+      //      pin_hash = NULL (no pinHash field from server) → SQL filter
+      //      `WHERE pin_hash IS NOT NULL` drops the employee from findByPin
+      //      candidates on the NEXT login → always fast-path miss → slow
+      //      45s Render wake on every login.
+      const ids = list
+        .map((e: any) => String(e?.id || e?._id || ''))
+        .filter((x: string) => !!x);
+      const existingPinHash = new Map<string, string>();
+      if (ids.length > 0) {
+        const placeholders = ids.map(() => '?').join(',');
+        try {
+          // NOTE: repos.employees.db is a raw PosDatabase handle exposed via
+          // a direct property — we cast out of the generic instead of using
+          // all<T>() to keep tsc happy on an untyped intermediate reference.
+          const rows = (repos.employees as any).db.all(
+            `SELECT id, pin_hash FROM employees WHERE id IN (${placeholders}) AND pin_hash IS NOT NULL`,
+            ...ids
+          ) as Array<{ id: string; pin_hash: string }> | undefined;
+          for (const r of rows || []) {
+            if (r?.id && r.pin_hash && isBcryptHash(r.pin_hash)) {
+              existingPinHash.set(String(r.id), String(r.pin_hash));
+            }
+          }
+        } catch {
+          /* ignore — not fatal if we can't read prior; upsertMany defaults below */
+        }
+      }
+
       repos.employees.upsertMany(
         list
-          .map((e: any) => ({
-            id: String(e.id || e._id || ''),
-            user_id: e.userId ? String(e.userId) : null,
-            restaurant_id: e.restaurantId ? String(e.restaurantId) : restaurantId || null,
-            branch_id: e.branchId ? String(e.branchId) : branchId || null,
-            first_name: e.firstName != null ? String(e.firstName) : e.first_name != null ? String(e.first_name) : null,
-            last_name: e.lastName != null ? String(e.lastName) : e.last_name != null ? String(e.last_name) : null,
-            email: e.email != null ? String(e.email) : null,
-            phone: e.phone != null ? String(e.phone) : null,
-            role: String(e.role || 'CASHIER'),
-            position_title: e.positionTitle || e.position_title || null,
-            employee_number: e.employeeNumber || e.employee_number || null,
-            pin_hash: e.pinHash != null ? String(e.pinHash) : e.pin_hash != null ? String(e.pin_hash) : e.pin != null ? String(e.pin) : null,
-            is_active: e.isActive === false ? 0 : 1,
-            joined_at: toEpochMillis(e.joinedAt || e.joined_at) ?? null,
-            created_at: toEpochMillis(e.createdAt || e.created_at) ?? Date.now(),
-            updated_at: toEpochMillis(e.updatedAt || e.updated_at) ?? Date.now(),
-          }))
+          .map((e: any) => {
+            const id = String(e.id || e._id || '');
+            // Resolve pin_hash preserving precedence (from highest to lowest):
+            //   1. Prior row's bcrypt pin_hash (if we stored one from a real
+            //      cashier login upsertWithPin on this terminal in the past).
+            //      Admin server response almost NEVER carries a bcrypt
+            //      pin_hash over REST (security), so this preserves the only
+            //      real local credential we have.
+            //   2. e.pinHash / e.pin_hash from the incoming payload, BUT
+            //      ONLY if it is a structurally valid bcrypt hash. Otherwise
+            //      it's probably a plaintext leak (server accident) and we
+            //      hash it to avoid storing raw or — on null — falling
+            //      through to (3).
+            //   3. e.pin plaintext from payload → bcrypt-hash for storage
+            //      (same semantics as upsertWithPin), so employee rosters
+            //      with inline demo pins also get offline-verifiable.
+            //   4. Nothing → set to NULL / undefined so SQL's
+            //      `pin_hash IS NOT NULL` filter skips rows that genuinely
+            //      have no local pin (we never saw them login).
+            let finalPinHash: string | null | undefined;
+            const prior = id ? existingPinHash.get(id) : undefined;
+            if (prior && isBcryptHash(prior)) {
+              finalPinHash = prior;
+            } else {
+              const rawServerPinHash =
+                e.pinHash != null ? String(e.pinHash) :
+                e.pin_hash != null ? String(e.pin_hash) : undefined;
+              if (rawServerPinHash && isBcryptHash(rawServerPinHash)) {
+                finalPinHash = rawServerPinHash;
+              } else if (typeof e.pin === 'string' && e.pin.length >= 4) {
+                finalPinHash = bcrypt.hashSync(e.pin, 10);
+              } else if (rawServerPinHash) {
+                // Fallback: non-bcrypt-looking string from server that is
+                // still set — hash it anyway so it's store-compatible.
+                finalPinHash = bcrypt.hashSync(rawServerPinHash, 10);
+              } else {
+                finalPinHash = null; // no pin info available; SQL filter will skip
+              }
+            }
+            return {
+              id,
+              user_id: e.userId ? String(e.userId) : null,
+              restaurant_id: e.restaurantId ? String(e.restaurantId) : restaurantId || null,
+              branch_id: e.branchId ? String(e.branchId) : branchId || null,
+              first_name: e.firstName != null ? String(e.firstName) : e.first_name != null ? String(e.first_name) : null,
+              last_name: e.lastName != null ? String(e.lastName) : e.last_name != null ? String(e.last_name) : null,
+              email: e.email != null ? String(e.email) : null,
+              phone: e.phone != null ? String(e.phone) : null,
+              role: String(e.role || 'CASHIER'),
+              position_title: e.positionTitle || e.position_title || null,
+              employee_number: e.employeeNumber || e.employee_number || null,
+              pin_hash: finalPinHash,
+              is_active: e.isActive === false ? 0 : 1,
+              joined_at: toEpochMillis(e.joinedAt || e.joined_at) ?? null,
+              created_at: toEpochMillis(e.createdAt || e.created_at) ?? Date.now(),
+              updated_at: toEpochMillis(e.updatedAt || e.updated_at) ?? Date.now(),
+            };
+          })
           .filter((r: any) => r.id)
       );
       return true;

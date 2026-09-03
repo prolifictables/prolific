@@ -958,6 +958,14 @@ export default function CashierScreenLayout() {
       } catch (printErr) {
         console.warn('[pos] mark-paid receipt print error (non-fatal):', printErr);
       }
+      // Auto-print kitchen ticket for newly paid QR/web orders so the kitchen
+      // picks up paid items immediately. Fire-and-forget; printer failures are
+      // logged only.
+      try {
+        await window.electronAPI?.print?.kitchenTicket?.(oid);
+      } catch (ktErr) {
+        console.warn('[pos] mark-paid kitchen ticket print error (non-fatal):', ktErr);
+      }
 
       // If order is now fully paid and still in an active status, auto-advance
       // to DELIVERED so the kitchen flow converges. Skip if already past.

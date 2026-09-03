@@ -245,6 +245,14 @@ export default function CartPanel() {
           local_entity_version: 1,
         });
       }
+      // Auto-print kitchen ticket for held orders so the kitchen starts
+      // prepping immediately without waiting for the cashier to come back
+      // and pay. Fire-and-forget; printer errors log only (never block UX).
+      try {
+        await window.electronAPI?.print?.kitchenTicket?.(orderId);
+      } catch (ktErr) {
+        console.warn('[cart] hold-order kitchen ticket print error (non-fatal):', ktErr);
+      }
       cartActions.clear();
       orderNumberRef.current = '';
       setNoteDraft('');
