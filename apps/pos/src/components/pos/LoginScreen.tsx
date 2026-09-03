@@ -194,6 +194,97 @@ export default function LoginScreen() {
     setPinErrorUnreachable(false);
   };
 
+  // Builds a normalized employee object + stub-restaurant + offline-branch
+  // shape identical to what setOfflinePinLogin()/setOnlineLogin() expect.
+  // Shared between the INSTANT offline-first fast-path (<50ms SQLite pin
+  // verify) AND the historical online-first SLOW fallback so both produce
+  // identical session state.
+  const buildOfflineSession = (found: any) => {
+    const offlineEmployee = {
+      id: found.id,
+      userId: found.userId || found.user_id,
+      restaurantId: found.restaurantId || found.restaurant_id,
+      branchId: found.branchId || found.branch_id,
+      role: found.role,
+      positionTitle: found.positionTitle || found.position_title,
+      employeeNumber: found.employeeNumber || found.employee_number,
+      firstName: found.firstName || found.first_name,
+      lastName: found.lastName || found.last_name,
+      email: found.email,
+      phone: found.phone,
+    };
+    const stubRestaurant = {
+      id: offlineEmployee.restaurantId || 'rest-prolific-01',
+      name: 'Prolific Tables',
+      currency: 'NGN',
+      country: 'NG',
+    };
+    const offlineBranchRaw =
+      (offlineEmployee.branchId &&
+        onlineBranches.find((b) => b.id === offlineEmployee.branchId)) ||
+      resolvedBranch ||
+      onlineBranches[0] ||
+      null;
+    const offlineBranch = offlineBranchRaw
+      ? {
+          ...offlineBranchRaw,
+          restaurant: offlineBranchRaw.restaurant || stubRestaurant,
+        }
+      : {
+          id: offlineEmployee.branchId || 'br-main-01',
+          name: 'Port Harcourt',
+          restaurant: stubRestaurant,
+        };
+    return { offlineEmployee, offlineBranch, stubRestaurant };
+  };
+
+  // Fetches menu (with stale-branch fallback) and writes to BOTH persistence
+  // layers: browser-shim localStorage mirror AND Electron SQLite. Same logic
+  // is used regardless of whether login was instant-offline-then-promoted or
+  // online-first, guaranteeing the "last saved online menu = next-offline-
+  // boot menu" invariant.
+  const refreshAndPersistMenuSnapshot = async (
+    preferredBranchId: string,
+    restaurant: any
+  ) => {
+    const saved = { categories: [], items: [], modifiers: [] } as {
+      categories: any[]; items: any[]; modifiers: any[];
+    };
+    let firstError: unknown = null;
+    try {
+      const menu = await fetchPublicMenu(String(preferredBranchId), undefined);
+      saved.categories = menu.categories || [];
+      saved.items = menu.items || [];
+      saved.modifiers = menu.modifiers || [];
+    } catch (err) {
+      firstError = err;
+    }
+    let fallbackBranch: any = null;
+    if ((saved.categories.length === 0 && saved.items.length === 0) || firstError) {
+      try {
+        const branches = await listPublicBranches();
+        const fallback =
+          branches.find((b: any) => b.isDefault === true) ||
+          branches.find((b: any) => b.isActive !== false) ||
+          branches[0];
+        if (fallback?.id && String(fallback.id) !== String(preferredBranchId)) {
+          const menu2 = await fetchPublicMenu(String(fallback.id), undefined);
+          saved.categories = menu2.categories || [];
+          saved.items = menu2.items || [];
+          saved.modifiers = menu2.modifiers || [];
+          fallbackBranch = { ...fallback, restaurant };
+        }
+      } catch {
+        if (firstError) console.warn('[login] menu fallback failed', firstError);
+      }
+    }
+    if (saved.categories.length > 0 || saved.items.length > 0) {
+      applyRemoteMenuSnapshot(saved);
+      try { await window.electronAPI?.db?.menu?.applySnapshot?.(saved); } catch { /* shim warmed */ }
+    }
+    return { snapshot: saved, fallbackBranch };
+  };
+
   const submitPin = async () => {
     if (pin.length < 4) {
       setPinErrorUnreachable(false);
@@ -207,10 +298,141 @@ export default function LoginScreen() {
       const device = await window.electronAPI?.getDeviceId?.();
       const deviceId = device?.deviceId;
 
-      // Branch selection has been removed from the login flow:
-      // online PIN login now accepts an OPTIONAL branchId and resolves the
-      // correct branch from the employee record server-side. This lets the
-      // cashier go straight from PIN entry → POS without a picker.
+      // =====================================================================
+      // PHASE 0 — INSTANT OFFLINE-FIRST (<50ms). QUICK-SERVICE POS PRIORITY.
+      // =====================================================================
+      // For a cashier POS terminal, speed matters more than "confirming the
+      // server is alive right now" on every login. Render free tier cold
+      // starts take 25-45 seconds. That is UNACCEPTABLE latency when a line
+      // of customers is waiting at the counter while the cashier types their
+      // PIN.
+      //
+      // Professional behaviour change:
+      //   1. FIRST query cached SQLite / shim-mirror employees for this PIN.
+      //      (upsertWithPin was called on the LAST successful online login,
+      //      so bcrypt pin-hash for every known employee is already stored
+      //      locally.)
+      //   2. ON HIT (<50ms): setOfflinePinLogin + navigate('/pos') NOW. The
+      //      cashier starts taking orders immediately.
+      //   3. IN PARALLEL NON-BLOCKING fire a background promise that does all
+      //      the slow stuff: pinLogin() network call + Render cold wake +
+      //      fetchPosBootstrap + menu refresh with stale-branch fallback +
+      //      syncQueue requestNow. If/when the network succeeds, it promotes
+      //      the session from OFFLINE_PIN → ONLINE in-place (no reload, no
+      //      user interaction, nothing visible to the cashier).
+      //   4. ON MISS (first login ever on this terminal, no cached employee
+      //      for this pin locally): fall through to the LEGACY online-first
+      //      flow — wait for the 45s Render wake budget, pin-login via server,
+      //      then cache employee for future INSTANT logins. A miss here is
+      //      acceptable since it happens only once per employee per terminal.
+      // =====================================================================
+      let foundFastPath: any = null;
+      try {
+        foundFastPath = await window.electronAPI?.db?.employees?.findByPin?.('', pin);
+      } catch {
+        foundFastPath = null;
+      }
+
+      if (foundFastPath && (foundFastPath.id || foundFastPath._id)) {
+        // (1) Normalize shape and write to offline auth store.
+        const { offlineEmployee, offlineBranch } = buildOfflineSession(foundFastPath);
+        authActions.setOfflinePinLogin(offlineEmployee, offlineBranch, pin);
+        setResolvedBranch(offlineBranch);
+
+        // (2) Background non-blocking warm (fire-and-forget). If/When this
+        // succeeds: promote session to ONLINE, refresh employee snapshot
+        // (upsertWithPin + applySnapshot), refresh menu snapshot, kick the
+        // sync queue reader. The cashier has already left LoginScreen (we
+        // called navigate below) so nothing here blocks the UI. If it fails:
+        // totally fine, the cashier is still taking orders offline and
+        // MenuGrid 8s polling will pick up menu+promote+sync on its next
+        // cycle once the server wakes.
+        void (async () => {
+          try {
+            // (a) Network pin-login with its own independent timeout.
+            const res: any = await pinLogin({ pin, deviceId });
+            const employee = res?.employee || null;
+            const user = res?.user || null;
+            const restaurant = res?.restaurant || null;
+            const branch = res?.branch || null;
+            const accessToken = res?.accessToken;
+            const refreshToken = res?.refreshToken;
+            const expiresIn = res?.expiresIn;
+            if (employee?.id && user?.id && branch?.id && restaurant?.id && accessToken) {
+              const employeeRecord = {
+                id: employee.id,
+                userId: user.id,
+                firstName: user.firstName,
+                lastName: user.lastName,
+                email: user.email,
+                phone: user.phone,
+                role: employee.role,
+                branchId: employee.branchId,
+                restaurantId: employee.restaurantId,
+              };
+              // (b) Keep SQLite employee cache fresh so *next* offline login
+              //     sees any pin resets / role changes from Admin portal.
+              try {
+                await window.electronAPI?.db?.employees?.upsertWithPin?.(employeeRecord, pin);
+              } catch { /* ignore — current offline snapshot still valid */ }
+              // (c) Promote the running session from OFFLINE_PIN → ONLINE.
+              authActions.promoteOnlineLogin({
+                employee: employeeRecord,
+                restaurant,
+                branch: { ...branch, restaurant },
+                accessToken,
+                refreshToken,
+                expiresIn,
+                deviceId,
+              });
+              // (d) Bootstrap snapshots (tables / full employee list) and
+              //     persist latest menu.
+              try {
+                const bootstrap = await fetchPosBootstrap({ accessToken });
+                try { await window.electronAPI?.db?.employees?.applySnapshot?.(bootstrap.employees); } catch { /* ignore */ }
+                try { await window.electronAPI?.db?.tables?.applySnapshot?.(bootstrap.tables); } catch { /* ignore */ }
+              } catch { /* ignore */ }
+              try {
+                const { fallbackBranch } = await refreshAndPersistMenuSnapshot(String(branch.id), restaurant);
+                if (fallbackBranch) authActions.patchBranch(fallbackBranch);
+              } catch { /* ignore — MenuGrid 8s poll will retry */ }
+              try { await window.electronAPI?.sync?.requestNow?.(); } catch { /* ignore */ }
+            }
+          } catch (backgroundErr: any) {
+            // Background network errors are silent to the cashier on the
+            // INSTANT fast-path because they already have a working offline
+            // session. If SERVER_UNREACHABLE (Render still cold) we simply
+            // leave them in OFFLINE_PIN mode and MenuGrid's 8-second poll +
+            // QueueReader's cycle will retry server operations automatically
+            // until Render wakes up. No need to spam the user with warnings
+            // for things that resolve themselves.
+            const bgMsg = String((backgroundErr as any)?.message || String(backgroundErr));
+            if (hasUnreachableMarker(bgMsg)) {
+              console.info('[login:bg-warm] Render still cold; leaving session OFFLINE. MenuGrid will auto-promote when server responds.');
+              return;
+            }
+            // If it was a real 401 "Incorrect PIN" from the server BUT the
+            // local SQLite verified it — that just means the Admin reset the
+            // PIN in MongoDB after the employee was last cached locally. We
+            // STILL allow them to take orders offline (POS should not halt
+            // service on account of a stale reset that hasn't synced yet)
+            // but log a visible warn in devtools so manager can debug if
+            // needed.
+            console.warn('[login:bg-warm] online verify failed, offline session retained:', bgMsg);
+          }
+        })();
+
+        // (3) NAVIGATE NOW — zero wait for network.
+        setPinSubmitting(false);
+        navigate('/pos', { replace: true });
+        return;
+      }
+
+      // =====================================================================
+      // FALLBACK PATH — LOCAL CACHE MISS (first-time login on this terminal,
+      // no employee cached for this PIN yet). We have no choice but to hit
+      // the network. Keeps original Priority A/B/C error classification.
+      // =====================================================================
       try {
         const res: any = await pinLogin({ pin, deviceId });
         const employee = res?.employee || null;
@@ -258,67 +480,14 @@ export default function LoginScreen() {
             await window.electronAPI?.db?.tables?.applySnapshot?.(bootstrap.tables);
           } catch {
           }
-
           try {
-            // Try first with the branch returned by PIN login (canonical).
-            // If that branch has no menu on server (stale id / migrated tenant),
-            // fall back to the first default public branch from /public/branches —
-            // which matches the admin menu live on the server (Port Harcourt HQ
-            // has isDefault: true) — so cashiers see all menu items instantly
-            // even on older seeded-tenant installs before first full sync.
-            const saved = { categories: [], items: [], modifiers: [] } as {
-              categories: any[]; items: any[]; modifiers: any[];
-            };
-            let firstError: unknown = null;
-            try {
-              const menu = await fetchPublicMenu(String(branch.id), undefined);
-              saved.categories = menu.categories || [];
-              saved.items = menu.items || [];
-              saved.modifiers = menu.modifiers || [];
-            } catch (err) {
-              firstError = err;
-            }
-            if ((saved.categories.length === 0 && saved.items.length === 0) || firstError) {
-              // Look up default public branch and retry once.
-              try {
-                const branches = await listPublicBranches();
-                const fallback =
-                  branches.find((b: any) => b.isDefault === true) ||
-                  branches.find((b: any) => b.isActive !== false) ||
-                  branches[0];
-                if (fallback?.id && String(fallback.id) !== String(branch.id)) {
-                  const menu2 = await fetchPublicMenu(String(fallback.id), undefined);
-                  saved.categories = menu2.categories || [];
-                  saved.items = menu2.items || [];
-                  saved.modifiers = menu2.modifiers || [];
-                  // If we fell back to a different branch, persist that branch
-                  // in resolvedBranch state as well so downstream MenuGrid reads
-                  // the branch that actually yielded menu data — no 8s reload
-                  // with the original stale id.
-                  setResolvedBranch({ ...fallback, restaurant });
-                  authActions.patchBranch({ ...fallback, restaurant });
-                }
-              } catch {
-                if (firstError) {
-                  // bubble up — only log; don't fail login itself.
-                  console.warn('[login] menu fallback failed', firstError);
-                }
-              }
-            }
-            // Always write to BOTH cache layers (shim mirror + SQLite) so the
-            // menu snapshot survives page refresh + full network loss (shim
-            // mirror to localStorage) AND pure Electron reads (SQLite). This
-            // is the "last menu saved while online = menu shown when offline"
-            // guarantee the operator requested.
-            if (saved.categories.length > 0 || saved.items.length > 0) {
-              applyRemoteMenuSnapshot(saved);
-              try {
-                await window.electronAPI?.db?.menu?.applySnapshot?.(saved);
-              } catch { /* shim path already warmed */ }
+            const { fallbackBranch } = await refreshAndPersistMenuSnapshot(String(branch.id), restaurant);
+            if (fallbackBranch) {
+              setResolvedBranch(fallbackBranch);
+              authActions.patchBranch(fallbackBranch);
             }
           } catch {
           }
-
           try {
             await window.electronAPI?.sync?.requestNow?.();
           } catch {
@@ -328,27 +497,9 @@ export default function LoginScreen() {
         navigate('/pos', { replace: true });
         return;
       } catch (err: any) {
-        // --- Defensive guard (v1 + v4 marker extension):
-        //
-        // Priority A: SERVER_UNREACHABLE marker — transport-level error.
-        //   • NEVER fall to offline shim (SEEDED_EMPLOYEES has no admin-reset
-        //     pins anyway so shim fallback always wrongly returns Incorrect PIN).
-        //   • Show AMBER warning chip, NOT rose.
-        //   • DO NOT auto-clear PIN digits (user typed correct PIN, it's not
-        //     their fault the server is down).
-        //   • Rethrow as a specially-marked error to the outer catch.
-        //
-        // Priority B: Explicit Invalid PIN / 401 / 4xx.
-        //   • Real credential mismatch → show ROSE Incorrect PIN chip, clear PIN.
-        //   • Never fall to offline shim (SEEDED_EMPLOYEES never knows admin
-        //     pins anyway, shim would return null too).
-        //
-        // Priority C: Anything else (network failure, CORS, 5xx, parse errors,
-        //            missing fields) — fall through to offline shim ONLY if
-        //            we can't identify the error class above.
         const msg = String(err?.message || String(err));
         if (hasUnreachableMarker(msg)) {
-          throw err; // propagate SERVER_UNREACHABLE to outer catch verbatim
+          throw err;
         }
         const isInvalidPinResponse =
           /invalid pin/i.test(msg) ||
@@ -356,90 +507,31 @@ export default function LoginScreen() {
           /http 4\d\d/i.test(msg) ||
           /pin must be/i.test(msg);
         if (isInvalidPinResponse) {
-          // Explicit credential rejection from backend: raise so UI sets
-          // pinError and NEVER touches offline shim (which only knows demo).
           throw new Error(err?.message || 'Incorrect PIN.');
         }
-        // Otherwise fall through to offline mock shim / local SQLite fallback
-        // when there was no real credential answer.
       }
 
-      // --- Offline fallback (SEEDED_EMPLOYEES + local SQLite). ONLY reaches
-      // here when Priority A and B were NOT detected above.
-      // NOTE: On production hostnames (pos.prolifictables.com) the mock shim
-      // itself ALSO throws SERVER_UNREACHABLE on network/5xx failures so this
-      // line still propagates unreachable → outer catch → amber chip, no
-      // Incorrect PIN fallthrough. On localhost it falls normally to SEEDED.
+      // Only reached when online-first fallback threw an UNCLASSIFIED error
+      // (not unreachable, not invalid PIN) AND the fast-path findByPin also
+      // missed (otherwise we'd have returned in Phase 0). Final last-ditch
+      // attempt to fall to offline shim/SQLite once more — if still null →
+      // Incorrect PIN rose chip.
       const found: any = await window.electronAPI?.db?.employees?.findByPin?.('', pin);
       if (!found) {
-        // On localhost this is a real miss. On production we should never get
-        // here (shim throws unreachable first), but belt+suspenders just in case.
         throw new Error('Incorrect PIN. Please try again or ask your manager for assistance.');
       }
-      const offlineEmployee = {
-        id: found.id,
-        userId: found.userId || found.user_id,
-        restaurantId: found.restaurantId || found.restaurant_id,
-        branchId: found.branchId || found.branch_id,
-        role: found.role,
-        positionTitle: found.positionTitle || found.position_title,
-        employeeNumber: found.employeeNumber || found.employee_number,
-        firstName: found.firstName || found.first_name,
-        lastName: found.lastName || found.last_name,
-        email: found.email,
-        phone: found.phone,
-      };
-      // Build a stub restaurant object so ShiftModal's restaurant.id guard
-      // passes even when the online branch list and resolved network call
-      // returned empty (the common browser-dev + mock shim case). auth-store
-      // reads restaurant from branch.restaurant (line 76 auth-store.ts).
-      const stubRestaurant = {
-        id: offlineEmployee.restaurantId || 'rest-prolific-01',
-        name: 'Prolific Tables',
-        currency: 'NGN',
-        country: 'NG',
-      };
-      const offlineBranchRaw =
-        (offlineEmployee.branchId &&
-          onlineBranches.find((b) => b.id === offlineEmployee.branchId)) ||
-        resolvedBranch ||
-        onlineBranches[0] ||
-        null;
-      // Ensure the branch we hand to auth-store ALWAYS has a non-null
-      // .restaurant sub-object so ShiftModal OPEN check (restaurant.id)
-      // and CashierScreenLayout header never see null restaurant.
-      const offlineBranch = offlineBranchRaw
-        ? {
-            ...offlineBranchRaw,
-            restaurant: offlineBranchRaw.restaurant || stubRestaurant,
-          }
-        : {
-            id: offlineEmployee.branchId || 'br-main-01',
-            name: 'Port Harcourt',
-            restaurant: stubRestaurant,
-          };
+      const { offlineEmployee, offlineBranch } = buildOfflineSession(found);
       authActions.setOfflinePinLogin(offlineEmployee, offlineBranch, pin);
       navigate('/pos', { replace: true });
     } catch (e: any) {
-      // --- Professional classification of errors in the FINAL catch block.
-      // Two distinct user-facing error classes, with different chip colors +
-      // different PIN-clear behaviour. This ensures the cashier is never
-      // misdirected to retype their PIN 10x when the server is actually down.
       const finalMsg = String(e?.message || String(e));
       if (hasUnreachableMarker(finalMsg)) {
-        // AMBER warning: backend unreachable. User's PIN is PROBABLY correct.
-        // Do NOT auto-clear the PIN (they should only re-type if they think
-        // they made a typo).
         setPinErrorUnreachable(true);
         setPinError(
           humanUnreachableChip(finalMsg) ||
             '⚠️ Server unreachable. Wait 60 seconds, then try again, or contact your manager if the problem continues.'
         );
-        // PIN digits INTENTIONALLY preserved. No setPin('').
       } else {
-        // ROSE error: real credential mismatch (or shim returned null, etc.)
-        // This IS a pin-typed-wrong problem → show Incorrect PIN chip, clear
-        // PIN digits so the cashier can type it again cleanly.
         setPinErrorUnreachable(false);
         setPinError(
           finalMsg || 'Incorrect PIN. Please try again or ask your manager for assistance.'
