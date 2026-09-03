@@ -557,16 +557,18 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
       const txn = repos.db.transaction(() => {
         const current = repos.orders.getById(orderId);
         if (!current) throw new Error(`order ${orderId} not found`);
-        const totalCents = Number(
-          current.total_cents ??
-            (typeof (current as any).totalAmount === 'number' ? (current as any).totalAmount * 100 : 0) ??
-            0
-        );
-        const priorPaid = Number(
-          current.paid_amount_cents ??
-            (typeof (current as any).paidAmount === 'number' ? (current as any).paidAmount * 100 : 0) ??
-            0
-        );
+       const totalCents = Number(
+  current.total_cents ??
+    (typeof (current as any).totalAmount === 'number'
+      ? (current as any).totalAmount * 100
+      : 0)
+);
+       const priorPaid = Number(
+  current.paid_amount_cents ??
+    (typeof (current as any).paidAmount === 'number'
+      ? (current as any).paidAmount * 100
+      : 0)
+);
         const incremental = p.paidAmountCents != null ? Number(p.paidAmountCents) : Math.max(0, totalCents - priorPaid);
         const newTotalPaid = priorPaid + incremental;
         const balanceDueCents = Math.max(0, totalCents - newTotalPaid);

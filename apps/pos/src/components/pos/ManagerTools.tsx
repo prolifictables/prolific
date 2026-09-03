@@ -35,7 +35,13 @@ interface ManagerToolsProps {
   restaurantId?: string;
   branchId?: string;
   employeeRole?: string;
-  connectionStatus: 'ONLINE' | 'OFFLINE' | 'CHECKING' | 'WAKING';
+ connectionStatus:
+  | 'ONLINE'
+  | 'OFFLINE'
+  | 'CHECKING'
+  | 'WAKING'
+  | 'SYNCHRONIZING'
+  | 'SYNC_ERROR';
   onMenuChanged: () => Promise<void> | void;
 }
 

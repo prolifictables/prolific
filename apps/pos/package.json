@@ -6,34 +6,34 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && electron-builder",
-  "build:web": "vite build",
-  "typecheck": "tsc --noEmit",
+    "build:web": "vite build",
+    "typecheck": "tsc --noEmit",
     "lint": "echo \"No lint configured\"",
     "preview": "vite preview",
     "clean": "rm -rf dist dist-electron release"
   },
   "dependencies": {
+    "better-sqlite3": "^9.2.2",
+    "clsx": "^2.0.0",
+    "electron-store": "^8.1.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.21.0",
+    "socket.io-client": "^4.7.4",
+    "tailwind-merge": "^2.2.0",
+    "zustand": "^4.4.7"
+  },
+  "devDependencies": {
     "@prolific/shared-types": "*",
     "@prolific/ui": "*",
     "@prolific/utils": "*",
     "@prolific/validation": "*",
-    "better-sqlite3": "^9.2.2",
-    "electron-store": "^8.1.0",
-    "socket.io-client": "^4.7.4",
-    "zustand": "^4.4.7",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "react-router-dom": "^6.21.0",
-    "clsx": "^2.0.0",
-    "tailwind-merge": "^2.2.0"
-  },
-  "devDependencies": {
     "@types/better-sqlite3": "^7.6.8",
     "@types/react": "^18.2.43",
     "@types/react-dom": "^18.2.17",
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.16",
-    "electron": "^28.1.0",
+    "electron": "28.1.0",
     "electron-builder": "^24.9.1",
     "postcss": "^8.4.32",
     "tailwindcss": "^3.4.0",
@@ -60,28 +60,35 @@
       "output": "release"
     },
     "mac": {
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "category": "public.app-category.business"
     },
     "win": {
-      "target": ["nsis"],
-      "nsis": {
-        "perMachine": true,
-        "oneClick": false,
-        "allowToChangeInstallationDirectory": true,
-        "deleteAppDataOnUninstall": false,
-        "differentialPackage": false,
-        "runAfterFinish": true,
-        "installerIcon": "build/icon.ico",
-        "uninstallerIcon": "build/icon.ico",
-        "installerHeaderIcon": "build/icon.ico",
-        "createDesktopShortcut": true,
-        "createStartMenuShortcut": true,
-        "shortcutName": "Prolific POS"
-      }
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "perMachine": true,
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "differentialPackage": false,
+      "runAfterFinish": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Prolific POS"
     },
     "linux": {
-      "target": ["AppImage"]
+      "target": [
+        "AppImage"
+      ]
     }
   }
 }
