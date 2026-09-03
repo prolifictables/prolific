@@ -153,6 +153,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
         invokeDb('db:payments:listByOrderId', orderId),
       listByShiftId: (shiftId: string) =>
         invokeDb('db:payments:listByShiftId', shiftId),
+      getShiftTotals: (shiftId: string) =>
+        invokeDb('db:payments:getShiftTotals', shiftId),
     },
 
     shifts: {

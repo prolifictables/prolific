@@ -154,11 +154,23 @@ declare global {
           create: (payment: unknown) => Promise<unknown>;
           listByOrderId: (orderId: string) => Promise<unknown>;
           listByShiftId: (shiftId: string) => Promise<unknown>;
+          getShiftTotals: (shiftId: string) => Promise<{
+            cash: number; card: number; other: number; total: number; tip: number;
+            counts: { cash: number; card: number; other: number; total: number };
+            perMethod: Array<{ method: string; amount: number; tip: number; count: number }>;
+            orders: {
+              paidOrderCount: number; voidedOrderCount: number; refundedOrderCount: number;
+              paidItemQty: number;
+              subtotalCents: number; discountCents: number; taxCents: number; totalPaidCents: number;
+            };
+            payouts: { totalPayoutCents: number; payoutCount: number };
+            cashAdjustments: { totalPaidInCents: number; totalPaidOutCents: number; count: number };
+          }>;
         };
         shifts: {
           open: (data: unknown) => Promise<unknown>;
           close: (data: unknown) => Promise<unknown>;
-          getOpen: (filter?: { employeeId?: string; branchId?: string; restaurantId?: string }) => Promise<unknown>;
+          getOpen: (filter?: { deviceId?: string; employeeId?: string; branchId?: string; restaurantId?: string }) => Promise<unknown>;
           listByEmployee: (employeeId: string) => Promise<unknown>;
           listByDate: (date: unknown) => Promise<unknown>;
         };

@@ -537,29 +537,64 @@ export default function CashierScreenLayout() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Restore the active OPEN shift scoped to the current employee + branch.
-  // Runs once as soon as we have auth identifiers, OR whenever they change
-  // (e.g. the same cashier logs out then back in on the same terminal, or a
-  // different cashier takes over — the latter correctly returns no match and
-  // forces a fresh Open Shift flow).
+  // Restore the active OPEN shift for this TERMINAL / device.
+  // Runs once as soon as we have auth identifiers, OR whenever they change.
+  //
+  // IMPORTANT: The user's explicit policy is terminal-level shift lifecycle:
+  //   * First login on a fresh terminal → prompt "Open New Shift" modal.
+  //   * Modal NEVER re-appears on subsequent logins (same or different
+  //     cashier) on the SAME terminal until the current open shift is
+  //     explicitly closed via the Close Shift reconciliation modal.
+  //
+  // Therefore we restore the OPEN shift by DEVICE_ID (terminal unique id)
+  // NOT by (employee, branch, restaurant) filter. If Employee B logs into a
+  // terminal where Employee A already opened a shift today, Employee B
+  // inherits the existing open shift — accountability is per-terminal, and
+  // Employee B can still close the shift with their manager PIN if variance
+  // exceeds the threshold.
   useEffect(() => {
     const eid = employee?.id;
     const bid = branch?.id;
     const rid = restaurant?.id;
     // Only attempt a restore once we have both an employee and a branch id.
+    // (Device ID lookup happens inside the async body via getDeviceId() so we
+    // don't block the critical render path on yet another pre-auth wait.)
     if (!eid || !bid) return;
     let active = true;
     (async () => {
       try {
-        // Pass the scoping filter so mock shim and Electron both use the
-        // same (employee, branch, restaurant) boundary — prevents a
-        // different cashier on the same terminal from inheriting someone
-        // else's open shift, and ensures restore works after refresh/logout.
-        const open: any = await window.electronAPI?.db?.shifts?.getOpen?.({
-          employeeId: eid,
-          branchId: bid,
-          restaurantId: rid,
-        });
+        // Resolve device ID (terminal unique id). Same getDeviceId used by
+        // shifts.open() payload so the device_id stored in SQLite matches
+        // exactly what we restore with. Fail open: if getDeviceId() throws,
+        // fall back to the legacy per-employee filter so user can still work.
+        let deviceId: string | null = null;
+        try {
+          const deviceRes: any = await window.electronAPI?.getDeviceId?.();
+          if (typeof deviceRes === 'string' && deviceRes) deviceId = deviceRes;
+          else if (deviceRes && typeof deviceRes === 'object' && deviceRes.deviceId) deviceId = String(deviceRes.deviceId);
+        } catch { /* ignore */ }
+
+        let open: any = null;
+        // PRIMARY path: terminal/device-level open shift (user policy).
+        if (deviceId) {
+          open = await window.electronAPI?.db?.shifts?.getOpen?.(
+            // Single filter object: ipc-db-bridge.ts L800-848 resolves either
+            // positional (deviceId, employeeId?) OR single filter object.
+            { deviceId } as any
+          );
+        }
+        // FALLBACK: if deviceId returned no match (very rare — first login on
+        // a terminal that already had shifts but with a stale device id),
+        // fall back to the per-(employee, branch, restaurant) scoped lookup
+        // so a returning cashier still gets their shift restored instead of
+        // being forced to open a brand new one.
+        if (!open || !(open.id || open.shiftId)) {
+          open = await window.electronAPI?.db?.shifts?.getOpen?.({
+            employeeId: eid,
+            branchId: bid,
+            restaurantId: rid,
+          });
+        }
         if (!active) return;
         if (open && (open.id || open.shiftId)) {
           // Normalize property names — Electron/SQLite uses snake_case

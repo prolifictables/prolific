@@ -771,6 +771,13 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
   );
 
   ipcMain.handle(
+    'db:payments:getShiftTotals',
+    wrap('db:payments:getShiftTotals', (shiftId: unknown) => {
+      return repos.payments.getShiftTotals(String(shiftId ?? ''));
+    })
+  );
+
+  ipcMain.handle(
     'db:shifts:open',
     wrap('db:shifts:open', (data: unknown) => {
       return repos.shifts.open(data as { id: string } & Record<string, unknown>);
@@ -804,23 +811,26 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
 
       // The renderer may pass either:
       //   1. Legacy positional args: (deviceId, employeeId)
-      //   2. A single filter object:  ({ employeeId, branchId, restaurantId })
+      //   2. A single filter object:  ({ deviceId?, employeeId?, branchId?, restaurantId? })
       // Detect case #2 and unwrap the ids so the downstream scoped lookup
       // continues to work regardless of calling convention.
       const isFilterObject =
         deviceId !== null &&
         typeof deviceId === 'object' &&
         !Array.isArray(deviceId) &&
-        ('employeeId' in deviceId || 'branchId' in deviceId || 'restaurantId' in deviceId);
-      const filter: { employeeId?: unknown; branchId?: unknown; restaurantId?: unknown } =
+        ('employeeId' in deviceId || 'branchId' in deviceId || 'restaurantId' in deviceId || 'deviceId' in deviceId);
+      const filter: { deviceId?: unknown; employeeId?: unknown; branchId?: unknown; restaurantId?: unknown } =
         isFilterObject ? (deviceId as any) : {};
 
+      const filterDeviceId = typeof filter.deviceId === 'string' && filter.deviceId ? filter.deviceId : '';
       const inferredDeviceId =
-        !isFilterObject && typeof deviceId === 'string' && deviceId
-          ? deviceId
-          : auth?.deviceId
-            ? String(auth.deviceId)
-            : '';
+        filterDeviceId
+          ? filterDeviceId
+          : !isFilterObject && typeof deviceId === 'string' && deviceId
+            ? deviceId
+            : auth?.deviceId
+              ? String(auth.deviceId)
+              : '';
 
       // Prefer explicit ids from the caller (filter object or positional arg)
       // over meta's last-auth snapshot. This ensures shift scoping is correct

@@ -2181,6 +2181,138 @@ export function installMockElectronAPI() {
         // Used by ShiftModal close reconciliation to sum takings for the shift
         listByShiftId: async (shiftId: string) =>
           mockPayments.filter((p) => p.shiftId === shiftId),
+        // Computed end-of-shift reconciliation totals. Mirrors the SQL
+        // aggregation performed by the repository's getShiftTotals — same
+        // shape so ShiftModal close mode renders identically in browser shim
+        // dev mode vs packaged Electron.
+        getShiftTotals: async (shiftId: string) => {
+          await delay(10);
+          const pays = mockPayments.filter((p) =>
+            (p.shiftId === shiftId) &&
+            (p.status === 'PAID' || p.status === undefined)
+          );
+          let cash = 0, card = 0, other = 0, tip = 0;
+          let cashCount = 0, cardCount = 0, otherCount = 0;
+          const perMethod = new Map<string, { method: string; amount: number; tip: number; count: number }>();
+          for (const p of pays) {
+            const amt =
+              typeof p.amount_cents === 'number' ? p.amount_cents :
+              typeof p.amountCents === 'number' ? p.amountCents :
+              Math.round((Number(p.amount || 0)) * 100);
+            const tipCents =
+              typeof p.tip_cents === 'number' ? p.tip_cents :
+              typeof p.tipCents === 'number' ? p.tipCents :
+              Math.round((Number(p.tip || 0)) * 100);
+            const method = (p.method || 'OTHER').toUpperCase();
+            tip += tipCents;
+            const bucket = perMethod.get(method) || { method, amount: 0, tip: 0, count: 0 };
+            bucket.amount += amt;
+            bucket.tip += tipCents;
+            bucket.count += 1;
+            perMethod.set(method, bucket);
+            if (method === 'CASH') { cash += amt; cashCount++; }
+            else if (method.includes('CARD') || method === 'PAYSTACK' || method === 'FLUTTERWAVE' || method === 'POS') {
+              card += amt; cardCount++;
+            }
+            else { other += amt; otherCount++; }
+          }
+          // Order statistics for the shift (all orders linked to this shift,
+          // regardless of payment state — the SQL query does the same so
+          // voids/refunds are counted properly).
+          const shiftOrders = mockOrders.filter((o: any) =>
+            o.shiftId === shiftId || String(o.shift_id || '') === String(shiftId)
+          );
+          let paidOrderCount = 0, voidedOrderCount = 0, refundedOrderCount = 0;
+          let paidItemQty = 0, subtotalCents = 0, discountCents = 0, taxCents = 0, totalPaidCents = 0;
+          for (const o of shiftOrders) {
+            const status = (o.status || '').toUpperCase();
+            const payStatus = (o.payment_status || o.paymentStatus || '').toUpperCase();
+            if (payStatus === 'PAID') paidOrderCount++;
+            if (status === 'VOID') voidedOrderCount++;
+            if (status === 'REFUNDED') refundedOrderCount++;
+            const itemQty =
+              typeof o.item_qty === 'number' ? o.item_qty :
+              typeof o.itemQty === 'number' ? o.itemQty :
+              Number(o.quantity || 0);
+            paidItemQty += itemQty;
+            const st =
+              typeof o.subtotal_cents === 'number' ? o.subtotal_cents :
+              typeof o.subtotalCents === 'number' ? o.subtotalCents :
+              Math.round(Number(o.subtotal || 0) * 100);
+            const disc =
+              typeof o.discount_cents === 'number' ? o.discount_cents :
+              typeof o.discountCents === 'number' ? o.discountCents :
+              Math.round(Number(o.discount || 0) * 100);
+            const tx =
+              typeof o.tax_cents === 'number' ? o.tax_cents :
+              typeof o.taxCents === 'number' ? o.taxCents :
+              Math.round(Number(o.tax || 0) * 100);
+            const tot =
+              typeof o.total_cents === 'number' ? o.total_cents :
+              typeof o.totalCents === 'number' ? o.totalCents :
+              Math.round(Number(o.total || 0) * 100);
+            subtotalCents += st;
+            discountCents += disc;
+            taxCents += tx;
+            totalPaidCents += tot;
+          }
+          // Payouts (petty cash withdrawals) — in the shim they live as
+          // direction=PAID_OUT cash adjustments.
+          let totalPayoutCents = 0, payoutCount = 0;
+          let totalPaidInAdj = 0, totalPaidOutAdj = 0, cashAdjCount = 0;
+          for (const a of mockCashAdjustments) {
+            if (a.shiftId !== shiftId) continue;
+            const amt =
+              typeof a.amount_cents === 'number' ? a.amount_cents :
+              typeof a.amountCents === 'number' ? a.amountCents :
+              Math.round(Number(a.amount || 0) * 100);
+            cashAdjCount++;
+            const dir = (a.direction || a.type || '').toUpperCase();
+            if (dir === 'PAID_OUT') { totalPaidOutAdj += amt; }
+            else if (dir === 'PAID_IN') { totalPaidInAdj += amt; }
+          }
+          // In the SQL schema, distinct payouts table holds withdrawals; in
+          // the shim we've historically used PAID_OUT cash adjustments.
+          // Surface them as payouts too (non-destructive overlap is fine).
+          totalPayoutCents = totalPaidOutAdj;
+          payoutCount = mockCashAdjustments.filter((a) =>
+            a.shiftId === shiftId &&
+            ((a.direction || a.type || '').toUpperCase() === 'PAID_OUT')
+          ).length;
+          return {
+            cash,
+            card,
+            other,
+            total: cash + card + other,
+            tip,
+            counts: {
+              cash: cashCount,
+              card: cardCount,
+              other: otherCount,
+              total: cashCount + cardCount + otherCount,
+            },
+            perMethod: Array.from(perMethod.values()),
+            orders: {
+              paidOrderCount,
+              voidedOrderCount,
+              refundedOrderCount,
+              paidItemQty,
+              subtotalCents,
+              discountCents,
+              taxCents,
+              totalPaidCents,
+            },
+            payouts: {
+              totalPayoutCents,
+              payoutCount,
+            },
+            cashAdjustments: {
+              totalPaidInCents: totalPaidInAdj,
+              totalPaidOutCents: totalPaidOutAdj,
+              count: cashAdjCount,
+            },
+          };
+        },
       },
 
       // Cash drawer adjustments (pay-ins, pay-outs, petty cash) referenced by
@@ -2219,10 +2351,14 @@ export function installMockElectronAPI() {
         // globally stored open shift doesn't match, null is returned so the
         // cashier is forced to open a new shift (prevents cross-employee /
         // cross-branch shift takeovers without explicit reconciliation).
-        getOpen: async (filter?: { employeeId?: string; branchId?: string; restaurantId?: string }) => {
+        //
+        // Terminal-level override (user policy): if filter includes `deviceId` (per
+        // shift open-shift restore on same device), employee/branch filters are skipped
+        // explicitly passed through the SAME device-level comparisons take precedence.
+        getOpen: async (filter?: { deviceId?: string; employeeId?: string; branchId?: string; restaurantId?: string }) => {
           await delay(10);
-          // Refresh in-memory copy from storage so multi-tab scenarios and
-          // page refreshes all see the latest authoritative open shift.
+          // Refresh in-memory copy from storage so multi-tab scenarios and page
+          // refreshes all see the latest authoritative open shift.
           const persisted = loadMockOpenShiftFromStorage();
           if (persisted) mockOpenShift = persisted;
           const open = mockOpenShift;
@@ -2230,13 +2366,25 @@ export function installMockElectronAPI() {
           // A shift can also carry status — ignore anything that isn't OPEN.
           if (open.status && open.status !== 'OPEN') return null;
           // The ShiftModal payload stores ids under snake_case keys
-          // (employee_id, branch_id, restaurant_id) — the filter uses
+          // (employee_id, branch_id, restaurant_id, device_id) — the filter uses
           // camelCase. Normalize both sides before comparing so the scoping
           // check works reliably (this is critical for restore-after-refresh
           // and logout→login flows).
           const shiftEmployeeId = open.employeeId || open.employee_id;
           const shiftBranchId = open.branchId || open.branch_id;
           const shiftRestaurantId = open.restaurantId || open.restaurant_id;
+          const shiftDeviceId = open.deviceId || open.device_id;
+          // If filter provides a deviceId, use it as the primary match
+          // (terminal-level per user policy).
+          if (filter?.deviceId) {
+            // Device id match wins — a shift may lack device_id (legacy shim rows).
+            // Treat a match either by string equality OR if shift has no id at all.
+            if (shiftDeviceId && shiftDeviceId !== filter.deviceId) return null;
+            // Device id match: ignore employee/branch filter — inherit the
+            // open shift regardless of who originally opened it (same
+            // terminal).
+            return open;
+          }
           if (filter?.employeeId && shiftEmployeeId && shiftEmployeeId !== filter.employeeId) return null;
           if (filter?.branchId && shiftBranchId && shiftBranchId !== filter.branchId) return null;
           if (filter?.restaurantId && shiftRestaurantId && shiftRestaurantId !== filter.restaurantId) return null;
@@ -2244,7 +2392,30 @@ export function installMockElectronAPI() {
         },
         open: async (payload: any) => {
           await delay(15);
-          mockOpenShift = { id: `sh-${Date.now()}`, openedAt: Date.now(), ...payload };
+          // Idempotency guard: mirror the Electron SQLite partial UNIQUE
+          // index idx_shifts_device_open ON shifts(device_id) WHERE status =
+          // 'OPEN'. In browser mode the "device id" key is the localStorage
+          // open-shift singleton. If there is already an OPEN shift, reuse it
+          // — never clobber or throw a visible error (equivalent to SQLite
+          // "Unique constraint failed: shifts.device_id" in packaged mode).
+          const persisted = loadMockOpenShiftFromStorage();
+          if (persisted) mockOpenShift = persisted;
+          if (mockOpenShift && (!mockOpenShift.status || mockOpenShift.status === 'OPEN')) {
+            const cur = { ...mockOpenShift };
+            // If the prior open shift has a zero/missing opening balance but
+            // the new payload carries one, upgrade the balance (handles
+            // "ghost shift skeleton with no opening_cash_cents").
+            const newOpening = Number(payload?.opening_cash_cents ?? payload?.openingCashCents ?? 0);
+            const curOpening = Number(cur.opening_cash_cents ?? cur.openingCashCents ?? 0);
+            if (newOpening > 0 && !curOpening) {
+              cur.opening_cash_cents = newOpening;
+              cur.openingCashCents = newOpening;
+              mockOpenShift = cur;
+              saveMockOpenShiftToStorage(cur);
+            }
+            return cur;
+          }
+          mockOpenShift = { id: `sh-${Date.now()}`, openedAt: Date.now(), status: 'OPEN', ...payload };
           // Persist so browser refresh / logout+login keeps using the same
           // shift — the "Open New Shift" modal must not reappear until the
           // cashier explicitly ends the shift.
