@@ -16,6 +16,7 @@
     "better-sqlite3": "^9.2.2",
     "clsx": "^2.0.0",
     "electron-store": "^8.1.0",
+    "electron-updater": "^6.8.9",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.21.0",
@@ -45,6 +46,14 @@
   "build": {
     "appId": "com.prolific.pos",
     "productName": "Prolific POS",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "prolifictables",
+        "repo": "prolific",
+        "releaseType": "release"
+      }
+    ],
     "asar": true,
     "files": [
       "dist/**/*",

@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import Store from 'electron-store';
+import electronUpdater from 'electron-updater';
 import { WindowManager } from './window-manager';
 import { registerSecurityHandlers } from './security';
 import { SyncEngine } from './sync';
@@ -821,7 +822,49 @@ function getHttpBaseUrl(): string {
   return 'http://localhost:4000/api/v1';
 }
 
+function setupAutoUpdater(): void {
+  if (!app.isPackaged) {
+    console.log('[updater] Skipping update check in development mode');
+    return;
+  }
+
+  const { autoUpdater } = electronUpdater;
+
+  autoUpdater.logger = console;
+
+  autoUpdater.on('checking-for-update', () => {
+    console.log('[updater] Checking for updates...');
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    console.log(`[updater] Update available: ${info.version}`);
+  });
+
+  autoUpdater.on('update-not-available', (info) => {
+    console.log(`[updater] No update available. Current/latest: ${info.version}`);
+  });
+
+  autoUpdater.on('error', (error) => {
+    console.error('[updater] Update error:', error);
+  });
+
+  autoUpdater.on('download-progress', (progress) => {
+    console.log(
+      `[updater] Download progress: ${Math.round(progress.percent)}%`
+    );
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    console.log(`[updater] Update downloaded: ${info.version}`);
+  });
+
+  void autoUpdater.checkForUpdatesAndNotify().catch((error) => {
+    console.error('[updater] Failed to check for updates:', error);
+  });
+}
+
 app.on('ready', async () => {
+  setupAutoUpdater();
   const { deviceId } = ensureDeviceId();
 
   const session = (await import('electron')).session.defaultSession;
