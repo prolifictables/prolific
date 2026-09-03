@@ -390,19 +390,70 @@ export async function pinLogin(opts: {
   if (opts.branchId) payload.branchId = opts.branchId;
   if (opts.deviceId !== undefined) payload.deviceId = opts.deviceId;
 
-  // User is actively waiting → SHORT timeouts.
-  // SERVER_UNREACHABLE errors thrown by guardedFetch propagate unchanged.
-  let res: Response = await guardedFetch(
-    () =>
-      fetch(`${API_BASE}/auth/pin/login`, {
-        method: 'POST',
+  // Belt-and-suspenders fallback for Electron packaged renderers.
+  // Chromium's fetch() from file:/// (packaged Electron POS) sends an
+  // `Origin: "null"` header and triggers an OPTIONS preflight for every
+  // POST with Content-Type: application/json. The Nest server CORS
+  // allowlist historically rejected "null" and "file://" origins with
+  // HTTP 404 "Cannot OPTIONS /api/v1/auth/pin/login" → Chromium surfaces
+  // that as a TypeError (no Response object, NO status code) →
+  // guardedFetch classified it as SERVER_UNREACHABLE even though the API
+  // was 100% alive (GET /health safelisted, no preflight).
+  //
+  // Strategy:
+  //   (1) ALWAYS try renderer fetch first — it works 100% on browser POS
+  //       (pos.prolifictables.com CORS already allowed) and on modern
+  //       Render deployments where `main.ts` has been upgraded to allow
+  //       "null" / "file://".
+  //   (2) ONLY if we get exactly that CORS-class network failure (no
+  //       Response at all, TypeError / network class name + we detected
+  //       packaged Electron heuristically) → fall back to main-process
+  //       IPC `auth:pin-login` which routes through Node's native http
+  //       stack (no CORS, no preflight, never fails on Origin check).
+  let res: Response;
+  try {
+    res = await guardedFetch(
+      () =>
+        fetch(`${API_BASE}/auth/pin/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: opts.signal,
+        }),
+      'reactive',
+      { timeoutMs: PIN_FLOW_SHORT_WAKE_MS, perAttemptMs: PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS }
+    );
+  } catch (fetchErr) {
+    const marked = String((fetchErr as any)?.message || '').includes(SERVER_UNREACHABLE_MARKER) ||
+      String((fetchErr as any)?.name || '') === 'TypeError';
+    const canUseIpc: boolean =
+      typeof (window as any).electronAPI?.authPinLogin === 'function';
+    if (!marked || !canUseIpc) {
+      throw fetchErr;
+    }
+    const result = await (window as any).electronAPI.authPinLogin({
+      pin: opts.pin,
+      branchId: opts.branchId,
+      deviceId: opts.deviceId,
+    });
+    if (!result || typeof result !== 'object' || !('status' in result)) {
+      throw new Error(`auth:pin-login IPC malformed response: ${String(result)}`);
+    }
+    // Fabricate a Response-shaped object so the downstream logic below can
+    // be shared between the fetch and IPC paths.
+    res = new Response(
+      typeof result.body === 'object' && result.body !== null
+        ? JSON.stringify(result.body)
+        : typeof result.body === 'string'
+          ? result.body
+          : '',
+      {
+        status: typeof result.status === 'number' && result.status > 0 ? result.status : 0,
+        statusText: String(result.statusText ?? ''),
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: opts.signal,
-      }),
-    'reactive',
-    { timeoutMs: PIN_FLOW_SHORT_WAKE_MS, perAttemptMs: PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS }
-  );
+      }
+    );
+  }
 
   const json = await res.json().catch(() => null);
   if (!res.ok) {

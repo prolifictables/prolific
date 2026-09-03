@@ -27,6 +27,15 @@ async function bootstrap() {
         ? (origin, cb) => {
             // (0) Missing Origin header (curl / SSR / internal microservice calls) → allow.
             if (!origin) return cb(null, true);
+            // (0.1) Electron packaged desktop apps load renderers from file:// and the
+            // Chromium sandbox sends Origin: "null" (per WHATWG URL spec § 3.1 opaque
+            // origins) OR on some older Windows builds sends "file://". Both are
+            // unguessable on the server, so Nest's suffix regex never matches → OPTIONS
+            // 404 → renderer fetch throws TypeError "Network error after wake" even
+            // though the Render API is up. We explicitly allow both here as a belt
+            // fix; the primary defense in the Electron POS client also falls back to
+            // main-process net.request which is not subject to browser CORS at all.
+            if (origin === 'null' || origin === 'file://') return cb(null, true);
             // (1) Explicit comma-separated operator allowlist wins.
             if (corsOriginEnv.includes(origin)) return cb(null, true);
             // (2) Local developer hosts (belt+suspenders — localhost ports).

@@ -1255,6 +1255,44 @@ export function installMockElectronAPI() {
       return { status: navigator.onLine ? 'ONLINE' : 'OFFLINE', lastSuccessfulAt: Date.now() - 60000 };
     },
 
+    // CORS bypass for PIN login: the shim uses real renderer fetch since the
+    // browser shim runs on a real URL (no file://) so CORS always works. We
+    // still expose the signature for interface parity with the real Electron
+    // preload cashiers.ts, so code paths testing for
+    // window.electronAPI.authPinLogin() can unconditionally invoke it.
+    authPinLogin: async (payload: { pin: string; branchId?: string; deviceId?: string }) => {
+      const url = `${resolvePublicApiBase().replace(/\/+$/, '')}/auth/pin/login`;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8_000);
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload ?? {}),
+          signal: controller.signal,
+          cache: 'no-store' as RequestCache,
+        }).finally(() => clearTimeout(timeoutId));
+        let body: unknown = null;
+        try { body = await resp.json(); } catch { body = null; }
+        return {
+          url,
+          status: resp.status,
+          ok: resp.ok,
+          statusText: resp.statusText,
+          body,
+        };
+      } catch (err) {
+        const e = err as Error;
+        return {
+          url,
+          status: -1,
+          ok: false,
+          statusText: e?.name || 'Error',
+          body: { message: e?.message || String(err) },
+        };
+      }
+    },
+
     sync: {
       subscribeStatus: (_cb: any) => () => {},
       unsubscribeStatus: () => {},

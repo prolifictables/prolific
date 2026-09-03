@@ -34,6 +34,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   getConnectionStatus: () => ipcRenderer.invoke('sync:get-connection-status'),
 
+  // PIN login CORS bypass for packaged Electron.
+  // Renderer fetch from file:/// triggers an OPTIONS preflight with
+  // Origin: "null" (opaque) — the Nest CORS allowlist used to reject that
+  // preflight with HTTP 404 "Cannot OPTIONS /api/v1/auth/pin/login", which
+  // Chromium then surfaced as a TypeError with NO response → guardedFetch
+  // classified it as SERVER_UNREACHABLE. This IPC sends the POST through
+  // Node's native http stack (no CORS, no preflight) as an automatic
+  // belt-and-suspenders fallback.
+  authPinLogin: (payload: {
+    pin: string;
+    branchId?: string;
+    deviceId?: string;
+  }) => ipcRenderer.invoke('auth:pin-login', payload),
+
   db: {
     runMigrations: () => invokeDb('db:run-migrations'),
 

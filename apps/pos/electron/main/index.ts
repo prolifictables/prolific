@@ -18,6 +18,55 @@ import { SyncEngine } from './sync';
 import { createSingletonDb, createRepos, type ReposBundle, type PosDatabase } from './db';
 import { registerAllDbIpc } from './ipc-db-bridge';
 
+// === Defensive IPC registration guard =========================================
+// Electron's ipcMain.handle() THROWS when the same channel is registered a
+// second time (unlike ipcMain.on). The SyncEngine (sync/index.ts L202-L223)
+// internally registers 'sync:request-now' and 'sync:get-connection-status' via
+// SyncEngine.registerIpc(). Any manual re-registering of those channels in
+// this file causes Electron to throw → the app.on('ready') try/catch fires
+// dialog.showErrorBox('Prolific POS failed to initialize local DB', stack).
+//
+// We wrap ipcMain.handle() here so duplicates are safely skipped (logged but
+// never throw), preventing future regression of the exact launch crash the
+// user encountered in the 0.1.8 pre-build.
+const _registeredHandleChannels = new Set<string>();
+const _registeredOnceChannels = new Set<string>();
+
+function safeHandle<T extends Parameters<typeof ipcMain.handle>>(
+  channel: T[0],
+  handler: T[1],
+): void {
+  if (_registeredHandleChannels.has(String(channel))) {
+    // Already registered — keep the existing handler and skip.
+    console.warn(`[ipc] skip duplicate handle for channel: ${String(channel)}`);
+    return;
+  }
+  try {
+    (ipcMain.handle as any)(channel, handler);
+    _registeredHandleChannels.add(String(channel));
+  } catch (err) {
+    // Electron 20+ can still throw internally (race, test harness, etc).
+    console.error(`[ipc] failed to register handle ${String(channel)}:`, (err as Error).message);
+  }
+}
+
+function safeOn<T extends Parameters<typeof ipcMain.on>>(
+  channel: T[0],
+  listener: T[1],
+): void {
+  const key = String(channel) + '::ONCE';
+  if (_registeredOnceChannels.has(key)) {
+    console.warn(`[ipc] skip duplicate on for channel: ${String(channel)}`);
+    return;
+  }
+  try {
+    (ipcMain.on as any)(channel, listener);
+    _registeredOnceChannels.add(key);
+  } catch (err) {
+    console.error(`[ipc] failed to register on ${String(channel)}:`, (err as Error).message);
+  }
+}
+
 const isDev = !app.isPackaged;
 const isProd = app.isPackaged;
 
@@ -151,18 +200,18 @@ app.on('web-contents-created', (_event, contents) => {
   });
 });
 
-ipcMain.handle('app:restart', () => {
+safeHandle('app:restart', () => {
   app.relaunch();
   app.exit(0);
 });
 
-ipcMain.handle('app:get-versions', () => ({
+safeHandle('app:get-versions', () => ({
   node: process.versions.node,
   chrome: process.versions.chrome,
   electron: process.versions.electron,
 }));
 
-ipcMain.handle('window:customer-show', () => {
+safeHandle('window:customer-show', () => {
   // Use the WindowManager helper so always-on-top is only applied when a
   // real external display exists (avoids covering the cashier keypad on a
   // single monitor in dev mode).
@@ -181,7 +230,7 @@ ipcMain.handle('window:customer-show', () => {
   return true;
 });
 
-ipcMain.handle('window:customer-hide', () => {
+safeHandle('window:customer-hide', () => {
   if (customerWin && !customerWin.isDestroyed()) {
     customerWin.hide();
     ipcMain.emit('customer-window-state-changed', { visible: false });
@@ -190,21 +239,21 @@ ipcMain.handle('window:customer-hide', () => {
   return true;
 });
 
-ipcMain.handle('window:pos-fullscreen', () => {
+safeHandle('window:pos-fullscreen', () => {
   if (posWin && !posWin.isDestroyed()) {
     posWin.setFullScreen(true);
   }
   return true;
 });
 
-ipcMain.handle('window:pos-exit-fullscreen', () => {
+safeHandle('window:pos-exit-fullscreen', () => {
   if (posWin && !posWin.isDestroyed()) {
     posWin.setFullScreen(false);
   }
   return true;
 });
 
-ipcMain.handle('device:get-device-id', () => {
+safeHandle('device:get-device-id', () => {
   const { deviceId, deviceKey } = ensureDeviceId();
   return { deviceId, deviceKey };
 });
@@ -217,59 +266,80 @@ ipcMain.handle('device:get-device-id', () => {
 // this IPC call, the renderer always falls back to `localhost:4000` on
 // desktop installs → login fails with the exact SERVER_UNREACHABLE error the
 // user reported. Returned URL always has trailing slash stripped.
-ipcMain.handle('device:get-api-base-url', () => getHttpBaseUrl());
+safeHandle('device:get-api-base-url', () => getHttpBaseUrl());
 // Synchronous counterpart: used by renderer at module-load time so
 // resolveApiBase() can return a string synchronously (all downstream calls in
 // remote-auth.ts and mock-electron-shim.ts expect a string, not a Promise).
-ipcMain.on('device:get-api-base-url-sync', (event) => {
+safeOn('device:get-api-base-url-sync', (event) => {
   event.returnValue = getHttpBaseUrl();
 });
 
-ipcMain.handle('db:run-migrations', () => {
+safeHandle('db:run-migrations', () => {
   if (!posDb) return { success: false, migrations: 0, error: 'db not initialized' };
   const result = posDb.migrate();
   return { success: true, migrations: result.applied, from: result.from, to: result.to };
 });
 
-// Returns the current sync-connection status from the main-process sync engine
-// (if present), otherwise falls back to a heuristic that pings the resolved
-// getHttpBaseUrl() health endpoint once and reports ONLINE if 2xx, else
-// OFFLINE. Preload cashiers.ts exposes this as
-// window.electronAPI.getConnectionStatus(), and LoginScreen uses it to render
-// the top-right connection pill. Without this handler, real packaged Electron
-// desktop builds throw on invoke → the LoginScreen L140 catch swallows it →
-// pill stays OFFLINE forever even though the API is reachable, which means
-// cashiers can't visually distinguish "genuinely offline" from "handler
-// missing".
-ipcMain.handle('sync:get-connection-status', async () => {
-  // If a real sync engine is running, prefer its status (higher accuracy).
-  if (typeof (syncEngine as any)?.getStatus === 'function') {
-    try {
-      const engineStatus = await (syncEngine as any).getStatus();
-      if (engineStatus && typeof engineStatus === 'object' && engineStatus.status) {
-        return engineStatus;
-      }
-    } catch { /* fall through to heuristic */ }
-  }
-  // Heuristic: single health GET with short timeout. Matches the main-process
-  // getHttpBaseUrl so the pill reports the SAME host the sync daemon will use
-  // (not whatever the renderer resolved independently — both must match now).
-  try {
-    const healthUrl = getHttpBaseUrl().replace(/\/+$/, '') + '/health';
+// CORS-BYPASS for Electron packaged renderers.
+// Electron renderers load over `file:///` and Chromium sends Origin: "null"
+// (opaque) or "file://". On older Render deployments where the server CORS
+// allowlist may lag behind the client, the OPTIONS preflight is rejected
+// with 404 "Cannot OPTIONS /api/v1/auth/pin/login" → renderer fetch throws
+// TypeError (network error, NO response object) → guardedFetch maps that to
+// SERVER_UNREACHABLE "after wake" even though the API is live.
+//
+// This helper routes the PIN login POST through main-process Node.js
+// `fetch` (which is NOT bound to Chromium's browser CORS spec and NEVER
+// sends an opaque origin nor triggers an OPTIONS preflight). It always
+// returns a structured { status, ok, body } shape so the renderer can
+// treat success/failure exactly like a normal Response.
+safeHandle(
+  'auth:pin-login',
+  async (
+    _event,
+    payload: { pin: string; branchId?: string; deviceId?: string },
+  ) => {
+    const url = `${getHttpBaseUrl().replace(/\/+$/, '')}/auth/pin/login`;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-    const resp = await fetch(healthUrl, {
-      method: 'GET',
-      signal: controller.signal,
-      cache: 'no-store' as RequestCache,
-    }).finally(() => clearTimeout(timeoutId));
-    const status = resp.ok ? 'ONLINE' : 'SYNC_ERROR';
-    const failedCount = resp.ok ? 0 : 1;
-    return { status, pendingCount: 0, failedCount, lastSuccessfulAt: resp.ok ? Date.now() : undefined };
-  } catch {
-    return { status: 'OFFLINE', pendingCount: 0, failedCount: 1, lastSuccessfulAt: undefined };
+    // Match guardedFetch's per-attempt PIN budget (8 seconds) so renderers
+    // see the same timeout behavior regardless of which path runs.
+    const timeoutId = setTimeout(() => controller.abort(), 8_000);
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': `ProlificPOS-ElectronMain/${app.getVersion()}`,
+        },
+        body: JSON.stringify(payload ?? {}),
+        signal: controller.signal,
+        cache: 'no-store' as RequestCache,
+      }).finally(() => clearTimeout(timeoutId));
+      let body: unknown = null;
+      try {
+        body = await resp.json();
+      } catch {
+        body = null;
+      }
+      return {
+        url,
+        status: resp.status,
+        ok: resp.ok,
+        statusText: resp.statusText,
+        body,
+      };
+    } catch (err) {
+      const e = err as Error;
+      return {
+        url,
+        status: -1,
+        ok: false,
+        statusText: e?.name || 'Error',
+        body: { message: e?.message || String(err) },
+      };
+    }
   }
-});
+);
 
 let printHandlersRegistered = false;
 function registerPrintHandlers(): void {
@@ -633,7 +703,7 @@ function registerPrintHandlers(): void {
   });
 }
 
-ipcMain.handle('customer:show-idle', () => {
+safeHandle('customer:show-idle', () => {
   if (customerWin && !customerWin.isDestroyed()) {
     customerWin.webContents.send('customer:state-changed', { screen: 'idle' });
   }
@@ -739,7 +809,7 @@ function toCustomerOrderPreview(input: any): any | null {
   return null;
 }
 
-ipcMain.handle('customer:show-order', (_e, orderPreview) => {
+safeHandle('customer:show-order', (_e, orderPreview) => {
   if (customerWin && !customerWin.isDestroyed()) {
     customerWin.webContents.send('customer:state-changed', {
       screen: 'order',
@@ -749,7 +819,7 @@ ipcMain.handle('customer:show-order', (_e, orderPreview) => {
   return { sent: true };
 });
 
-ipcMain.handle('customer:show-paid', (_e, order) => {
+safeHandle('customer:show-paid', (_e, order) => {
   if (customerWin && !customerWin.isDestroyed()) {
     customerWin.webContents.send('customer:state-changed', {
       screen: 'thankyou',
@@ -759,7 +829,7 @@ ipcMain.handle('customer:show-paid', (_e, order) => {
   return { sent: true };
 });
 
-ipcMain.handle('customer:get-branding', () => ({
+safeHandle('customer:get-branding', () => ({
   name: 'Prolific POS',
   tagline: 'Thanks for dining with us',
   logoUrl: '',
@@ -768,11 +838,11 @@ ipcMain.handle('customer:get-branding', () => ({
   branchName: '',
 }));
 
-ipcMain.handle('shift:open', (_e, data) => ({ success: true, shift: data }));
-ipcMain.handle('shift:close', (_e, data) => ({ success: true, shift: data }));
-ipcMain.handle('shift:get-open', () => ({ success: true, result: null }));
+safeHandle('shift:open', (_e, data) => ({ success: true, shift: data }));
+safeHandle('shift:close', (_e, data) => ({ success: true, shift: data }));
+safeHandle('shift:get-open', () => ({ success: true, result: null }));
 
-ipcMain.on('second-display-added', () => {
+safeOn('second-display-added', () => {
   if (WindowManager.instance) {
     WindowManager.instance.moveCustomerToExternalIfDetected();
   }
