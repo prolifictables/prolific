@@ -6,7 +6,19 @@
   html,
   body,
   #root {
+    /* Professional hardening for Electron packaged desktop + browser POS.
+        On packaged Electron file:// loads, html/body/#root are NOT given an
+        implicit width/height by the browser shell before JS mounts. If ONLY
+        height:100% is set, the root collapses to CONTENT WIDTH (~100px on
+        screens with a tiny 100×100 logo or text painting first) → all flex
+        children shrink-wrap to the same narrow strip → "scattered UI" where
+        everything runs down the left 5% and 95% of the screen is empty. */
+    width: 100vw;
     height: 100%;
+    min-width: 100vw;
+    min-height: 100dvh;
+    max-width: 100vw;
+    max-height: 100dvh;
     margin: 0;
     padding: 0;
     background-color: #050506;
@@ -15,13 +27,20 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     user-select: none;
+    box-sizing: border-box;
   }
 
+  html,
   body {
+    /* Prevent any body-level scroll-bounce on Electron desktop cashier
+       terminals — only inner scrollable regions (cart menu, history) should
+       scroll. Position fixed also defends against any injected browser
+       chrome changing reported viewport height on resize. */
+    position: fixed;
+    inset: 0;
     overflow: hidden;
     overscroll-behavior: none;
     touch-action: manipulation;
-    position: relative;
   }
 
   body::before {
@@ -51,8 +70,22 @@
   }
 
   #root {
+    /* #root MUST be at least 100vw × 100dvh at mount time otherwise React
+       and Tailwind flex-1 calculations shrink-wrap and all layout collapses.
+       Explicit display: block + block-size (height) + inline-size (width) is
+       understood by even the most restrictive Chromium embedded contexts
+       (Electron webview, CEF, etc.) where percentage-based dimensions on
+       detached trees occasionally evaluate to 0 during a paint. */
     position: relative;
     z-index: 1;
+    display: block;
+    inline-size: 100vw;
+    block-size: 100dvh;
+    min-inline-size: 100vw;
+    min-block-size: 100dvh;
+    max-inline-size: 100vw;
+    max-block-size: 100dvh;
+    overflow: hidden;
   }
 
   button,

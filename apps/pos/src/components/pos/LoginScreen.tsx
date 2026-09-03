@@ -450,8 +450,10 @@ export default function LoginScreen() {
       {/* Bump 2-column layout from md (768px) to lg (1024px) so short-but-wide cashier terminals
           fall back to single-column layout (brand panel on top, auth card below). This avoids
           the brand + auth cards competing for the same tiny vertical slab on 768–1023px wide
-          displays with < 560px of viewport height, where the Sign In CTA previously overflowed. */}
-      <div className="relative z-10 w-full max-w-6xl grid lg:grid-cols-2 gap-5 p-5 items-stretch">
+          displays with < 560px of viewport height, where the Sign In CTA previously overflowed.
+          pb-20 ensures content never overlaps the absolutely-positioned footer layer below
+          (which sits at bottom=0, height ≈ 52px) on short 600px-tall cashier terminals. */}
+      <div className="relative z-10 w-full max-w-6xl grid lg:grid-cols-2 gap-5 p-5 pb-20 items-stretch">
         {/* Left brand / hero panel — compact on short terminals (< lg) since it stacks ABOVE the auth card.
             On >= lg terminals we keep the full side-by-side 2-column layout with feature tiles.
             On very SHORT terminals (< 700px high, typical compact cashier display) hide the brand
@@ -581,14 +583,22 @@ export default function LoginScreen() {
         </div>
       </div>
 
-      {/* Footer: version + vendor branding */}
-      <div className="relative z-10 w-full shrink-0 px-5 py-3 text-center">
-        <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white/5 ring-1 ring-inset ring-white/10 backdrop-blur-sm">
+      {/* FOOTER LAYER — ABSOLUTELY POSITIONED (non-flow).
+          Professional engineering rationale:
+            The previous 2 footer attempts broke layout because they were inserted
+            as FLOW SIBLINGS inside the outer flex, which changed the flex's
+            implicit size calculation (flex defaults to row → scattering, or
+            column → height push). By rendering position:absolute, this footer
+            does NOT participate in flex layout → CANNOT affect the working
+            brand/PIN grid → scattering is mathematically impossible.
+            pb-20 on the grid above guarantees no overlap on short displays. */}
+      <div className="absolute inset-x-0 bottom-0 z-20 pb-3 pt-2 px-4 text-center">
+        <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-slate-950/60 ring-1 ring-inset ring-white/10 backdrop-blur-md">
           <span className="text-[10px] uppercase tracking-[0.18em] font-black text-amber-400/80">
             POS Desktop
           </span>
           <span className="h-3 w-px bg-white/10" />
-          <span className="text-xs font-semibold text-ink-300">
+          <span className="text-xs font-semibold text-ink-300 whitespace-nowrap">
             {APP_FOOTER_COPYRIGHT}
           </span>
         </div>
