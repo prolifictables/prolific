@@ -20,4 +20,6 @@ dist-electron/
 .turbo/
 *.tsbuildinfo
 .dbg/
-
+# Track Prolific POS Windows application icon
+!apps/pos/build/
+!apps/pos/build/icon.ico
