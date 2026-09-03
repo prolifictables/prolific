@@ -3,15 +3,16 @@
   "version": "0.1.2",
   "private": true,
   "main": "dist-electron/main/index.js",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build && electron-builder",
-    "build:web": "vite build",
-    "typecheck": "tsc --noEmit",
-    "lint": "echo \"No lint configured\"",
-    "preview": "vite preview",
-    "clean": "rm -rf dist dist-electron release"
-  },
+"scripts": {
+  "dev": "vite",
+  "build": "tsc && vite build && electron-builder",
+  "build:prepare": "tsc && vite build",
+  "build:web": "vite build",
+  "typecheck": "tsc --noEmit",
+  "lint": "echo \"No lint configured\"",
+  "preview": "vite preview",
+  "clean": "rm -rf dist dist-electron release"
+},
   "dependencies": {
     "better-sqlite3": "^9.2.2",
     "clsx": "^2.0.0",
