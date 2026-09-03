@@ -1177,6 +1177,14 @@ export function installMockElectronAPI() {
   if (window.electronAPI) return; // already provided by real Electron preload
 
   const api: any = {
+    // Parity with real Electron preload cashiers.ts getApiBaseUrlSync/getApiBaseUrl:
+    // the renderer resolveApiBase in remote-auth.ts asks for these FIRST so
+    // browser mock-shim mode and real Electron packaged mode share an
+    // identical URL-resolution protocol. Resolve URL once, the result is
+    // deterministic for this page-load.
+    getApiBaseUrlSync: () => resolvePublicApiBase(),
+    getApiBaseUrl: async () => resolvePublicApiBase(),
+
     getConnectionStatus: async () => {
       await delay(20);
       return { status: navigator.onLine ? 'ONLINE' : 'OFFLINE', lastSuccessfulAt: Date.now() - 60000 };

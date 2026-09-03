@@ -208,6 +208,22 @@ ipcMain.handle('device:get-device-id', () => {
   return { deviceId, deviceKey };
 });
 
+// Resolves the canonical API base URL from the MAIN process (which has
+// perfect visibility into whether this is a packaged production build on
+// Windows/macOS/Linux or a dev build). The renderer cannot detect prod via
+// `window.location.hostname` because packaged apps load through
+// `file:///dist/index.html` or `app://` — no hostname information. Without
+// this IPC call, the renderer always falls back to `localhost:4000` on
+// desktop installs → login fails with the exact SERVER_UNREACHABLE error the
+// user reported. Returned URL always has trailing slash stripped.
+ipcMain.handle('device:get-api-base-url', () => getHttpBaseUrl());
+// Synchronous counterpart: used by renderer at module-load time so
+// resolveApiBase() can return a string synchronously (all downstream calls in
+// remote-auth.ts and mock-electron-shim.ts expect a string, not a Promise).
+ipcMain.on('device:get-api-base-url-sync', (event) => {
+  event.returnValue = getHttpBaseUrl();
+});
+
 ipcMain.handle('db:run-migrations', () => {
   if (!posDb) return { success: false, migrations: 0, error: 'db not initialized' };
   const result = posDb.migrate();
@@ -752,11 +768,57 @@ function broadcastSync(channel: string, payload: unknown): void {
   }
 }
 
+/**
+ * Professional 4-tier API base URL resolution.
+ *
+ * Must match the browser POS `resolvePublicApiBase()` chain EXACTLY so that
+ * the desktop Electron app and the browser Web POS always push/pull against
+ * the same backend surface. Earlier versions hardcoded a nonexistent
+ * `api.prolificpos.com` domain which silently dropped all Electron orders
+ * from the Admin portal because the sync daemon could never reach Render.
+ *
+ * Priority chain (same as browser shim, highest first):
+ *   1. Runtime override — `PROLIFIC_API_BASE` env var (ops/debug) OR an
+ *      `electron-store` setting under `api_base` (settable via future
+ *      advanced-settings panel or command-line flag).
+ *   2. Build-time env — `VITE_API_BASE_URL || API_BASE_URL ||
+ *      VITE_API_URL || NEXT_PUBLIC_API_BASE_URL` (matches browser env vars).
+ *   3. Prod hostname default — when packaged for production, always use the
+ *      canonical Render deployment URL: `https://prolific-api.onrender.com/api/v1`.
+ *   4. Dev fallback — `http://localhost:4000/api/v1` (local Nest server).
+ */
 function getHttpBaseUrl(): string {
-  const envUrl = process.env.VITE_API_BASE_URL || process.env.API_BASE_URL;
-  if (envUrl) return envUrl;
-  if (isDev) return 'http://localhost:4000/api/v1';
-  return 'https://api.prolificpos.com/api';
+  // (1) Runtime overrides — electron-store settings take the absolute
+  // highest precedence so ops teams can reroute packaged builds without
+  // recompiling or editing shell-env files.
+  const settingsOverride = store.get('api_base') as unknown;
+  if (typeof settingsOverride === 'string' && settingsOverride.trim()) {
+    return settingsOverride.replace(/\/+$/, '');
+  }
+  const envOverride = process.env.PROLIFIC_API_BASE;
+  if (envOverride && envOverride.trim()) {
+    return envOverride.replace(/\/+$/, '');
+  }
+
+  // (2) Build-time env (parity with browser — both `VITE_*` (vite) and
+  // `NEXT_PUBLIC_*` (next) are accepted for cross-surface compatibility.)
+  const envUrl =
+    process.env.VITE_API_BASE_URL ||
+    process.env.API_BASE_URL ||
+    process.env.VITE_API_URL ||
+    process.env.VITE_PUBLIC_API_URL ||
+    process.env.NEXT_PUBLIC_API_BASE_URL;
+  if (envUrl && envUrl.trim()) {
+    return envUrl.replace(/\/+$/, '');
+  }
+
+  // (3) Production packaged build → canonical Render URL.
+  // The old fallback `https://api.prolificpos.com/api` never existed and is
+  // replaced with the confirmed live production deployment.
+  if (!isDev) return 'https://prolific-api.onrender.com/api/v1';
+
+  // (4) Dev-only fallback → local Nest server.
+  return 'http://localhost:4000/api/v1';
 }
 
 app.on('ready', async () => {

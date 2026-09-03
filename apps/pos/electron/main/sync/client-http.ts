@@ -127,7 +127,15 @@ export class SyncHttpClient {
 
   async postBatch(commands: SyncCommand[]): Promise<SyncBatchResult> {
     const idemKey = this.buildIdempotencyKey(commands);
-    const url = `${this.apiBase}/sync/batch`;
+    // The JWT-guarded endpoint (`/sync/batch`) is the primary destination —
+    // works great once a POS user has authenticated via pin (accessToken set).
+    // When there is no valid JWT (401/403 from server), fall back to the same
+    // PUBLIC endpoint the browser POS uses (`/public/pos-sync-batch`) which
+    // accepts ORDER / PAYMENT CREATE operations without authentication. This
+    // ensures POS sales are never silently dropped on first-day deployments
+    // where the cashier hasn't yet completed a full JWT pin-login cycle.
+    const primaryUrl = `${this.apiBase}/sync/batch`;
+    const fallbackUrl = `${this.apiBase}/public/pos-sync-batch`;
     const auth = this.getAuth();
     const deviceId = auth.deviceId;
     if (!deviceId) {
@@ -143,45 +151,67 @@ export class SyncHttpClient {
       localEntityVersion: c.localEntityVersion,
     }));
 
-    const resp = await this.request<{ data?: any[]; results?: any[] }>(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Idempotency-Key': idemKey,
-        ...this.authHeaders(),
-      },
-      body: JSON.stringify({ deviceId, commands: serverCommands }),
-    });
+    const baseHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Idempotency-Key': idemKey,
+    };
+    const authHeaders = this.authHeaders();
+    const body = JSON.stringify({ deviceId, commands: serverCommands });
 
-    const data = (resp as any)?.data || (resp as any)?.results || [];
-    const opIdByIdem = new Map<string, string>();
-    commands.forEach((c) => opIdByIdem.set(c.idempotencyKey, c.opId));
+    const parseResponse = (resp: unknown): SyncBatchResult => {
+      const data = (resp as any)?.data || (resp as any)?.results || [];
+      const opIdByIdem = new Map<string, string>();
+      commands.forEach((c) => opIdByIdem.set(c.idempotencyKey, c.opId));
+      return {
+        results: (Array.isArray(data) ? data : []).map((r: any) => {
+          const opId = opIdByIdem.get(String(r.idempotencyKey || '')) || String(r.idempotencyKey || '');
+          const statusRaw = String(r.status || '').toUpperCase();
+          const status =
+            statusRaw === 'SUCCESS'
+              ? 'SUCCESS'
+              : statusRaw === 'CONFLICT'
+                ? 'CONFLICT'
+                : 'FAILED';
+          return {
+            opId,
+            status,
+            serverEntityVersion: r.serverEntityVersion,
+            errorMessage: r.errorMessage,
+            responseSnapshot: r.serverSnapshot ?? null,
+            conflictResolution:
+              r.conflictResolution === 'SERVER_WINS'
+                ? 'SERVER_WINS'
+                : r.conflictResolution === 'CLIENT_WINS'
+                  ? 'LOCAL_WINS'
+                  : 'MANUAL',
+          };
+        }),
+      } as SyncBatchResult;
+    };
 
-    return {
-      results: (Array.isArray(data) ? data : []).map((r: any) => {
-        const opId = opIdByIdem.get(String(r.idempotencyKey || '')) || String(r.idempotencyKey || '');
-        const statusRaw = String(r.status || '').toUpperCase();
-        const status =
-          statusRaw === 'SUCCESS'
-            ? 'SUCCESS'
-            : statusRaw === 'CONFLICT'
-              ? 'CONFLICT'
-              : 'FAILED';
-        return {
-          opId,
-          status,
-          serverEntityVersion: r.serverEntityVersion,
-          errorMessage: r.errorMessage,
-          responseSnapshot: r.serverSnapshot ?? null,
-          conflictResolution:
-            r.conflictResolution === 'SERVER_WINS'
-              ? 'SERVER_WINS'
-              : r.conflictResolution === 'CLIENT_WINS'
-                ? 'LOCAL_WINS'
-                : 'MANUAL',
-        };
-      }),
-    } as SyncBatchResult;
+    // (1) Try JWT-guarded /sync/batch first.
+    try {
+      const resp = await this.request<{ data?: any[]; results?: any[] }>(primaryUrl, {
+        method: 'POST',
+        headers: { ...baseHeaders, ...authHeaders },
+        body,
+      });
+      return parseResponse(resp);
+    } catch (primaryErr) {
+      const needsFallback =
+        primaryErr instanceof ApiError &&
+        (primaryErr.statusCode === 401 || primaryErr.statusCode === 403);
+      if (!needsFallback) throw primaryErr;
+
+      // (2) Auth failed / no JWT present → retry against the public endpoint
+      // without the Authorization header. This mirrors the browser POS path.
+      const resp = await this.request<{ data?: any[]; results?: any[] }>(fallbackUrl, {
+        method: 'POST',
+        headers: baseHeaders,
+        body,
+      });
+      return parseResponse(resp);
+    }
   }
 
   async pull(params: PullParams): Promise<PullResponse> {

@@ -20,6 +20,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   getDeviceId: () => ipcRenderer.invoke('device:get-device-id'),
 
+  // Critical for packaged desktop builds: the renderer's `file:///` URL has
+  // no hostname, so it cannot detect production via window.location. Ask the
+  // main process for the canonical resolved API base (always
+  // prolific-api.onrender.com on packaged prod) — otherwise login calls fall
+  // to localhost:4000 and the user sees SERVER_UNREACHABLE.
+  getApiBaseUrl: () => ipcRenderer.invoke('device:get-api-base-url'),
+
+  // Synchronous counterpart so the renderer module-level `const API_BASE =
+  // resolveApiBase();` call (runs at import time) can get the URL without
+  // async/await. Returns plain string, no Promise wrapping.
+  getApiBaseUrlSync: () => ipcRenderer.sendSync('device:get-api-base-url-sync'),
+
   getConnectionStatus: () => ipcRenderer.invoke('sync:get-connection-status'),
 
   db: {

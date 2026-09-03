@@ -119,6 +119,13 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         customer_name: customer?.firstName
           ? `${customer.firstName} ${customer.lastName || ''}`.trim()
           : null,
+        // Denormalized contact snapshots (matches OrdersRepository schema
+        // columns customer_phone + customer_email). Writes are identical to
+        // what we now push through the server CreateOrderInput pipeline for
+        // Website/QR orders, so Admin Orders page search shows phone/email
+        // pills at a glance regardless of order source channel.
+        customer_phone: customer?.phone ? String(customer.phone) : null,
+        customer_email: customer?.email ? String(customer.email) : null,
         employee_id: employee?.id ?? null,
         shift_id: shiftId,
         held_by: null,

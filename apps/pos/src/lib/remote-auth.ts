@@ -20,6 +20,31 @@ import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
  *      localhost / 127.0.0.1 / 0.0.0.0, i.e. `npm run dev` mode).
  */
 export function resolveApiBase(): string {
+  // (-1) HIGHEST PRIORITY — Electron desktop IPC (runs BEFORE all other
+  // tiers). On packaged Electron apps, `window.location` is a `file:///` URL
+  // with no hostname, so step (2) hostname detection never fires and we'd
+  // fall straight to step (3) localhost:4000 on any packaged Windows/macOS
+  // install — which is exactly the bug the user reported (exact error:
+  // "Network error contacting backend after wake"). Ask the main process
+  // synchronously via preload contextBridge; the main process uses the same
+  // 4-tier chain we fixed yesterday (store > env > env > Render slug or dev).
+  if (
+    typeof window !== 'undefined' &&
+    typeof (window as any).electronAPI?.getApiBaseUrlSync === 'function'
+  ) {
+    try {
+      const fromMain: unknown = (window as any).electronAPI.getApiBaseUrlSync();
+      if (typeof fromMain === 'string' && fromMain.trim().length > 3) {
+        const trimmed = fromMain.trim().replace(/\/+$/, '');
+        if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
+          return trimmed;
+        }
+        return `${trimmed}/api/v1`;
+      }
+    } catch {
+      // Preload IPC not ready / contextIsolation weirdness — fall through.
+    }
+  }
   // (0) HIGHEST PRIORITY — localStorage operator override.
   // Professional escape hatch: manager / DevOps can paste the exact real
   // backend base URL into the browser's localStorage on ANY terminal and
