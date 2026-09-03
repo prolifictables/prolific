@@ -341,6 +341,67 @@ safeHandle(
   }
 );
 
+// Generic renderer-accessible public HTTP GET.
+// Renderers packaged in Electron load from file:// — any POST or custom-header
+// GET (anything not safelisted) triggers an OPTIONS preflight with Origin:
+// "null" or "file://". On older Render builds before server CORS was patched
+// to allow opaque origins, the preflight 404 causes Chromium fetch() to throw
+// a TypeError with NO status code and NO Response — indistinguishable from a
+// network outage. This IPC bypasses Chromium's browser CORS entirely by
+// routing the GET through main-process Node fetch(), which has no Origin
+// header restriction at all. Callers pass the URL PATH + optional query
+// string (e.g. "/public/menu?branchId=XYZ"), and Node resolves it against
+// getHttpBaseUrl() (the same canonical URL used by the sync daemon and
+// getConnectionStatus). Returns { status, ok, headers, body (json), text }
+// so callers can drop in wherever fetch() was used.
+safeHandle(
+  'public:http-get',
+  async (_event, args: { path: string }) => {
+    const base = getHttpBaseUrl().replace(/\/+$/, '');
+    const rawPath = String(args?.path ?? '');
+    // Collapse slashes so the caller can pass "/public/menu" or
+    // "public/menu" without producing a double-slash URL.
+    const safePath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+    const url = `${base}${safePath}`;
+    const controller = new AbortController();
+    // Matches PIN budget: the caller (MenuGrid/LoginScreen) falls back to
+    // local mirrors on failure, so a fast short timeout is better than a
+    // hanging 30s TCP retry during Windows network blips.
+    const timeoutId = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: { 'User-Agent': `ProlificPOS-ElectronMain/${app.getVersion()}` },
+        signal: controller.signal,
+        cache: 'no-store' as RequestCache,
+      }).finally(() => clearTimeout(timeoutId));
+      const text = await resp.text().catch(() => '');
+      let body: unknown = null;
+      try {
+        if (text) body = JSON.parse(text);
+      } catch { body = null; }
+      return {
+        url,
+        status: resp.status,
+        ok: resp.ok,
+        statusText: resp.statusText,
+        body,
+        text,
+      };
+    } catch (err) {
+      const e = err as Error;
+      return {
+        url,
+        status: -1,
+        ok: false,
+        statusText: e?.name || 'Error',
+        text: e?.message || String(err),
+        body: { message: e?.message || String(err) },
+      };
+    }
+  }
+);
+
 let printHandlersRegistered = false;
 function registerPrintHandlers(): void {
   if (printHandlersRegistered) return;

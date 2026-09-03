@@ -48,6 +48,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     deviceId?: string;
   }) => ipcRenderer.invoke('auth:pin-login', payload),
 
+  // Generic public HTTP GET CORS bypass for packaged Electron.
+  // Any GET to /public/* (menu, branches, qr-resolve, etc.) that carries a
+  // non-safelisted header or runs after a 30s Render cold-start may trigger
+  // an OPTIONS preflight with the opaque file:// origin. Returns the same
+  // shape as authPinLogin ({status, ok, body (parsed json), text}) so the
+  // renderer can drop-in replace fetch() without parsing differences.
+  publicHttpGet: (path: string) =>
+    ipcRenderer.invoke('public:http-get', { path }),
+
   db: {
     runMigrations: () => invokeDb('db:run-migrations'),
 

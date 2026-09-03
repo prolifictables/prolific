@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router-dom';
 import { APP_FOOTER_COPYRIGHT } from '../../lib/app-meta';
 import { useAuthStore } from '../../lib/auth-store';
 import type { ConnectionPillState } from '../../lib/types';
-import { fetchPublicMenu } from '../../lib/remote-menu';
+import { fetchPublicMenu, listPublicBranches } from '../../lib/remote-menu';
 import {
   pinLogin,
   preWakeApi,
@@ -13,6 +13,7 @@ import {
 } from '../../lib/remote-auth';
 import { fetchPosBootstrap } from '../../lib/remote-pos';
 import { ApiWakeState, subscribeApiWake } from '../../lib/api-wake';
+import { applyRemoteMenuSnapshot } from '../../lib/mock-electron-shim';
 
 const PIN_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', '⌫'];
 
@@ -259,12 +260,62 @@ export default function LoginScreen() {
           }
 
           try {
-            const menu = await fetchPublicMenu(String(branch.id), undefined);
-            await window.electronAPI?.db?.menu?.applySnapshot?.({
-              categories: menu.categories,
-              items: menu.items,
-              modifiers: menu.modifiers,
-            });
+            // Try first with the branch returned by PIN login (canonical).
+            // If that branch has no menu on server (stale id / migrated tenant),
+            // fall back to the first default public branch from /public/branches —
+            // which matches the admin menu live on the server (Port Harcourt HQ
+            // has isDefault: true) — so cashiers see all menu items instantly
+            // even on older seeded-tenant installs before first full sync.
+            const saved = { categories: [], items: [], modifiers: [] } as {
+              categories: any[]; items: any[]; modifiers: any[];
+            };
+            let firstError: unknown = null;
+            try {
+              const menu = await fetchPublicMenu(String(branch.id), undefined);
+              saved.categories = menu.categories || [];
+              saved.items = menu.items || [];
+              saved.modifiers = menu.modifiers || [];
+            } catch (err) {
+              firstError = err;
+            }
+            if ((saved.categories.length === 0 && saved.items.length === 0) || firstError) {
+              // Look up default public branch and retry once.
+              try {
+                const branches = await listPublicBranches();
+                const fallback =
+                  branches.find((b: any) => b.isDefault === true) ||
+                  branches.find((b: any) => b.isActive !== false) ||
+                  branches[0];
+                if (fallback?.id && String(fallback.id) !== String(branch.id)) {
+                  const menu2 = await fetchPublicMenu(String(fallback.id), undefined);
+                  saved.categories = menu2.categories || [];
+                  saved.items = menu2.items || [];
+                  saved.modifiers = menu2.modifiers || [];
+                  // If we fell back to a different branch, persist that branch
+                  // in resolvedBranch state as well so downstream MenuGrid reads
+                  // the branch that actually yielded menu data — no 8s reload
+                  // with the original stale id.
+                  setResolvedBranch({ ...fallback, restaurant });
+                  authActions.patchBranch({ ...fallback, restaurant });
+                }
+              } catch {
+                if (firstError) {
+                  // bubble up — only log; don't fail login itself.
+                  console.warn('[login] menu fallback failed', firstError);
+                }
+              }
+            }
+            // Always write to BOTH cache layers (shim mirror + SQLite) so the
+            // menu snapshot survives page refresh + full network loss (shim
+            // mirror to localStorage) AND pure Electron reads (SQLite). This
+            // is the "last menu saved while online = menu shown when offline"
+            // guarantee the operator requested.
+            if (saved.categories.length > 0 || saved.items.length > 0) {
+              applyRemoteMenuSnapshot(saved);
+              try {
+                await window.electronAPI?.db?.menu?.applySnapshot?.(saved);
+              } catch { /* shim path already warmed */ }
+            }
           } catch {
           }
 

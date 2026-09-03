@@ -131,15 +131,58 @@ export type PublicMenuEnvelope = {
   defaultTax: { id: string; name: string; rate: number; isIncludedInPrice: boolean } | null;
 };
 
+// Helper wrapper: use native fetch FIRST (works on browser POS always, and on
+// Electron packaged if server CORS allowlist includes "null" / "file://").
+// If fetch throws a TRANSPORT/network-style error that Chromium produces when
+// the file:// CORS preflight is rejected (TypeError with no Response object,
+// or SERVER_UNREACHABLE marker coming from guardedFetch), fall back to the
+// main-process IPC `public:http-get` which routes through Node net stack —
+// no CORS, no OPTIONS preflight, always resolves to the canonical daemon URL.
+async function guardedFetchPublic(
+  doFetch: () => Promise<Response>,
+  pathForIpc: string
+): Promise<Response> {
+  try {
+    return await doFetch();
+  } catch (firstErr) {
+    const msg = String((firstErr as any)?.message || '');
+    const isNetworkStyle =
+      (firstErr as any)?.name === 'TypeError' ||
+      msg.includes('NetworkError') ||
+      msg.includes('Failed to fetch') ||
+      typeof msg !== 'string' ||
+      msg.length === 0;
+    const bypass:
+      | undefined
+      | ((p: string) => Promise<{ status: number; ok: boolean; text?: string; body?: unknown; statusText?: string }>) =
+      (window as any).electronAPI?.publicHttpGet;
+    if (!isNetworkStyle || typeof bypass !== 'function') {
+      throw firstErr;
+    }
+    const r = await bypass(pathForIpc);
+    return new Response(typeof r.text === 'string' ? r.text : '', {
+      status: typeof r.status === 'number' && r.status > 0 ? r.status : 0,
+      statusText: String(r.statusText ?? ''),
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+}
+
 export async function listPublicBranches(
   signal?: AbortSignal
 ): Promise<PublicBranch[]> {
-  const res = await guardedFetch(() =>
-    fetch(`${getApiBase()}/public/branches`, {
-      method: 'GET',
-      signal,
-      cache: 'no-store',
-    })
+  const path = '/public/branches';
+  const res = await guardedFetch(
+    () =>
+      guardedFetchPublic(
+        () =>
+          fetch(`${getApiBase()}${path}`, {
+            method: 'GET',
+            signal,
+            cache: 'no-store',
+          }),
+        path
+      )
   );
   const json = await res.json().catch(() => null);
   if (!res.ok) throw new Error(json?.error?.message || `HTTP ${res.status}`);
@@ -151,7 +194,18 @@ export async function resolveDefaultBranchId(
 ): Promise<string | null> {
   // 1) explicit env override
   if (DEFAULT_BRANCH_OVERRIDE) return DEFAULT_BRANCH_OVERRIDE;
-  // 2) list from server → pick isDefault or first active
+  // 2) authenticated context: auth-store branch id (fastest, no network).
+  try {
+    if (typeof window !== 'undefined') {
+      const raw = (window as any).localStorage?.getItem?.('prolific-pos-auth');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const bid = parsed?.state?.branch?.id || parsed?.branch?.id;
+        if (typeof bid === 'string' && bid.length > 0) return bid;
+      }
+    }
+  } catch { /* fall through */ }
+  // 3) list from server → pick isDefault or first active
   try {
     const branches = await listPublicBranches(signal);
     if (branches.length === 0) return null;
@@ -170,13 +224,73 @@ export async function fetchPublicMenu(
   items: MenuItem[];
   modifiers: MenuModifier[];
 }> {
-  const res = await guardedFetch(() =>
-    fetch(`${getApiBase()}/public/menu?branchId=${encodeURIComponent(branchId)}`, {
-      method: 'GET',
-      signal,
-      cache: 'no-store',
-    })
-  );
+  const qs = `?branchId=${encodeURIComponent(branchId)}`;
+  const path = `/public/menu${qs}`;
+  let res: Response;
+  try {
+    res = await guardedFetch(
+      () =>
+        guardedFetchPublic(
+          () =>
+            fetch(`${getApiBase()}${path}`, {
+              method: 'GET',
+              signal,
+              cache: 'no-store',
+            }),
+          path
+        )
+    );
+  } catch (initialErr) {
+    // First attempt failed with the provided branchId. Behaviour: if this was
+    // a transport error OR a 404 (stale tenant branch id from an older seed
+    // that never got migrated after the Render postgres → Mongo snapshot
+    // restore, which leaves /public/menu returning 404 because the branch
+    // document doesn't exist), fall back once to listPublicBranches → pick
+    // first default/active branch → retry with that id, since listPublicBranches
+    // always returns the real server-owned branches (matches admin portal).
+    // This guarantees cashiers see menu items even after ops reset server
+    // tenants and don't update seeded employee branch ids.
+    const msg = String((initialErr as any)?.message || '');
+    const shouldFallback =
+      msg.includes('HTTP 404') ||
+      msg.includes('not found') ||
+      (initialErr as any)?.name === 'TypeError' ||
+      msg.includes('NetworkError') ||
+      msg.includes('Failed to fetch') ||
+      msg.includes('SERVER_UNREACHABLE');
+    if (!shouldFallback) throw initialErr;
+    let fallbackId: string | null = null;
+    try {
+      const branches = await listPublicBranches();
+      const fb =
+        branches.find((b) => b.isDefault === true) ||
+        branches.find((b) => b.isActive !== false) ||
+        branches[0];
+      fallbackId = fb?.id || null;
+    } catch { fallbackId = null; }
+    if (!fallbackId || fallbackId === branchId) throw initialErr;
+    const qs2 = `?branchId=${encodeURIComponent(fallbackId)}`;
+    const path2 = `/public/menu${qs2}`;
+    res = await guardedFetch(
+      () =>
+        guardedFetchPublic(
+          () =>
+            fetch(`${getApiBase()}${path2}`, {
+              method: 'GET',
+              signal,
+              cache: 'no-store',
+            }),
+          path2
+        )
+    );
+    // Mutate input branch id so callers that check their result against the
+    // original caller branchId will see the fallback and can persist it to
+    // state for 8s re-polls. This is safe because branchId is a string
+    // primitive (passed by value), so we instead expose the resolved id via
+    // a side-channel on the response envelope's branch.id below (callers use
+    // that branchIdFromEnvelope to FK link categories/items anyway).
+    void fallbackId;
+  }
   const json = await res.json().catch(() => null);
   if (!res.ok) throw new Error(json?.error?.message || `HTTP ${res.status}`);
   const envelope = (json?.data || json) as PublicMenuEnvelope;

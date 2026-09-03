@@ -1293,6 +1293,48 @@ export function installMockElectronAPI() {
       }
     },
 
+    // Generic public HTTP GET (CORS bypass) — parity with real Electron
+    // preload cashiers.ts. Browser shim runs over real https origin so CORS
+    // is OK; we still route through here so the shape {status, ok, body,
+    // text} matches exactly for callers.
+    publicHttpGet: async (path: string) => {
+      const base = resolvePublicApiBase().replace(/\/+$/, '');
+      const safePath = path.startsWith('/') ? path : `/${path}`;
+      const url = `${base}${safePath}`;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10_000);
+        const resp = await fetch(url, {
+          method: 'GET',
+          signal: controller.signal,
+          cache: 'no-store' as RequestCache,
+        }).finally(() => clearTimeout(timeoutId));
+        const text = await resp.text().catch(() => '');
+        let body: unknown = null;
+        try {
+          if (text) body = JSON.parse(text);
+        } catch { body = null; }
+        return {
+          url,
+          status: resp.status,
+          ok: resp.ok,
+          statusText: resp.statusText,
+          body,
+          text,
+        };
+      } catch (err) {
+        const e = err as Error;
+        return {
+          url,
+          status: -1,
+          ok: false,
+          statusText: e?.name || 'Error',
+          text: e?.message || String(err),
+          body: { message: e?.message || String(err) },
+        };
+      }
+    },
+
     sync: {
       subscribeStatus: (_cb: any) => () => {},
       unsubscribeStatus: () => {},

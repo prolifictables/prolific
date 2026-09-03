@@ -15,6 +15,7 @@ interface AuthState {
   actions: {
     setOnlineLogin: (payload: any) => void;
     setOfflinePinLogin: (employee: any, branch: any, pin?: string) => void;
+    patchBranch: (branch: any) => void;
     logout: () => void;
     clear: () => void;
   };
@@ -92,6 +93,13 @@ export const useAuthStore = create<AuthState>()(
               })
               .catch((e) => console.warn('[auth] persist lastAuth failed', e));
           }
+        },
+        // Patches the currently authenticated branch (e.g. after a post-login
+        // fallback to the default public branch that actually has menu data,
+        // when the tenant/employee's linked branch returned a 404 from
+        // /public/menu because the id was stale after Render migration).
+        patchBranch: (branch) => {
+          set({ branch: branch || null, restaurant: (branch && branch.restaurant) || null });
         },
         logout: () => {
           set({
