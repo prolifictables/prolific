@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import type { CustomerBranding, CustomerOrderPreview } from '../../vite-env';
+import { POWERED_BY_LABEL, APP_VERSION } from '../../lib/app-meta';
 
 interface Props {
   branding: CustomerBranding;
@@ -186,6 +187,18 @@ export default function ThankYouScreen({ branding, order, onAutoNavigate }: Prop
               style={{ width: `${((12 - countdown) / 12) * 100}%` }}
             />
           </div>
+        </div>
+      </div>
+
+      {/* Footer branding: vendor + version (visible even on the thank-you confetti screen) */}
+      <div className="absolute bottom-0 inset-x-0 z-20 px-10 py-4 border-t border-white/10 bg-gradient-to-t from-black/30 to-transparent backdrop-blur-sm flex items-center justify-between gap-3 text-sm">
+        <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/10 ring-1 ring-inset ring-white/15">
+          <span className="font-black text-emerald-200 tracking-[0.18em] uppercase text-xs">
+            Prolific POS v{APP_VERSION}
+          </span>
+        </div>
+        <div className="font-semibold text-white/90">
+          {POWERED_BY_LABEL}
         </div>
       </div>
     </div>

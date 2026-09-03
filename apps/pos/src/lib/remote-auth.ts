@@ -20,14 +20,22 @@ import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
  *      localhost / 127.0.0.1 / 0.0.0.0, i.e. `npm run dev` mode).
  */
 export function resolveApiBase(): string {
-  // (-1) HIGHEST PRIORITY — Electron desktop IPC (runs BEFORE all other
-  // tiers). On packaged Electron apps, `window.location` is a `file:///` URL
-  // with no hostname, so step (2) hostname detection never fires and we'd
-  // fall straight to step (3) localhost:4000 on any packaged Windows/macOS
-  // install — which is exactly the bug the user reported (exact error:
-  // "Network error contacting backend after wake"). Ask the main process
-  // synchronously via preload contextBridge; the main process uses the same
-  // 4-tier chain we fixed yesterday (store > env > env > Render slug or dev).
+  const REAL_PRODUCTION_API_BASE = 'https://prolific-api.onrender.com/api/v1';
+
+  // Helper: appends /api/v1 to a raw base URL if the user forgot it
+  const normalizeWithSuffix = (raw: string): string => {
+    const trimmed = raw.trim().replace(/\/+$/, '');
+    if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
+      return trimmed;
+    }
+    return `${trimmed}/api/v1`;
+  };
+
+  // (-1) HIGHEST PRIORITY — Electron desktop IPC (sync). On packaged Electron,
+  // window.location is `file:///dist/index.html` (NO hostname) so the
+  // hostname-based tier (2) never fires → localhost fallback → fail. Ask the
+  // main process synchronously via preload contextBridge which already runs
+  // the correct 4-tier chain.
   if (
     typeof window !== 'undefined' &&
     typeof (window as any).electronAPI?.getApiBaseUrlSync === 'function'
@@ -35,46 +43,70 @@ export function resolveApiBase(): string {
     try {
       const fromMain: unknown = (window as any).electronAPI.getApiBaseUrlSync();
       if (typeof fromMain === 'string' && fromMain.trim().length > 3) {
-        const trimmed = fromMain.trim().replace(/\/+$/, '');
-        if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
-          return trimmed;
-        }
-        return `${trimmed}/api/v1`;
+        return normalizeWithSuffix(fromMain);
       }
     } catch {
-      // Preload IPC not ready / contextIsolation weirdness — fall through.
+      // Preload contextBridge may not yet be ready if this module is imported
+      // before preload executes — fall through to the next belt+suspenders
+      // Electron detection tier (-0.5) so packaged Windows builds still
+      // resolve to prolific-api.onrender.com and never localhost.
     }
   }
-  // (0) HIGHEST PRIORITY — localStorage operator override.
-  // Professional escape hatch: manager / DevOps can paste the exact real
-  // backend base URL into the browser's localStorage on ANY terminal and
-  // bypass ALL build-env + runtime-guess logic. No code deploy needed.
-  //
-  // How to use (manager-only):
-  //   1. Open POS login screen
-  //   2. Press F12 → Application → Local Storage → pos.prolifictables.com
-  //   3. Add key = "prolific_api_base" with value like
-  //      "https://prolific-api.onrender.com" (omit or include /api/v1)
-  //   4. Cmd+Shift+R hard refresh. Done.
-  //
-  // This key is stored PER BROWSER / PER TERMINAL. If you ever move backends,
-  // just change the value and refresh. No build, no deploy, no env var.
+
+  // (-0.5) ELECTRON DESKTOP BELT + SUSPENDERS DETECTION.
+  // If this renderer is running inside a packaged Electron app (preload IPC
+  // getApiBaseUrlSync may not be callable yet because some bundled Electron
+  // builds inject the preload AFTER renderer scripts run due to asar timing,
+  // or contextBridge registration is async) — detect Electron by checking
+  // (a) window.electronAPI exists at all (any property), (b) navigator.userAgent
+  // contains "Electron", or (c) process.versions.electron via nodeIntegration.
+  // If ANY is true AND we are NOT on localhost hostname, assume production
+  // desktop packaged build → use REAL Render API. This ensures packaged
+  // Windows/macOS/Linux desktop apps NEVER call localhost:4000 regardless of
+  // module-import timing relative to preload.
+  if (typeof window !== 'undefined') {
+    let isElectronDesktop = false;
+    try {
+      if (typeof (window as any).electronAPI !== 'undefined' && (window as any).electronAPI !== null) {
+        isElectronDesktop = true;
+      } else if (typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string' && /Electron\//.test(navigator.userAgent)) {
+        isElectronDesktop = true;
+      } else if (
+        typeof (globalThis as any).process !== 'undefined' &&
+        typeof (globalThis as any).process?.versions?.electron === 'string'
+      ) {
+        isElectronDesktop = true;
+      }
+    } catch { /* ignore */ }
+    if (isElectronDesktop) {
+      // Now confirm we are NOT in an explicit dev environment:
+      // - hostname is empty/localhost (file:// loads → hostname "" empty).
+      // - no VITE dev env hints present (VITE_DEV_SERVER_URL or similar).
+      // If explicit VITE_* API URLs are present (tier 1), they override this.
+      const devHintPresent =
+        typeof import.meta !== 'undefined' &&
+        (import.meta as any).env?.DEV === true;
+      const localhostHostname =
+        typeof window.location?.hostname === 'string' &&
+        ['localhost', '127.0.0.1', '0.0.0.0', ''].includes(window.location.hostname.toLowerCase());
+      if (localhostHostname && !devHintPresent) {
+        // Packaged Electron: hostname empty, not VITE dev → production desktop
+        return REAL_PRODUCTION_API_BASE;
+      }
+    }
+  }
+
+  // (0) localStorage operator override (per-terminal escape hatch, no deploy needed).
   if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
     try {
       const override = window.localStorage.getItem('prolific_api_base');
       if (typeof override === 'string' && override.trim().length > 3) {
-        const trimmed = override.trim().replace(/\/+$/, '');
-        // Append /api/v1 suffix if the operator forgot it (saves 1 support ticket)
-        if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
-          return trimmed;
-        }
-        return `${trimmed}/api/v1`;
+        return normalizeWithSuffix(override);
       }
-    } catch {
-      // localStorage access denied (rare: Safari private mode, etc.) → ignore.
-    }
+    } catch { /* ignore */ }
   }
-  // (1) Vite build env override (still honored — never broken)
+
+  // (1) Vite build env override (still honored, never broken).
   if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
     const viteEnv = (import.meta as any).env;
     const explicit =
@@ -86,12 +118,6 @@ export function resolveApiBase(): string {
   }
 
   // (2) Production hostnames → REAL confirmed Render API slug.
-  // NOTE: User explicitly confirmed the API is hosted at
-  //       https://prolific-api.onrender.com. We use that onrender.com URL
-  //       for the production default. If the operator later wires up a custom
-  //       domain (api.prolifictables.com) they can simply set localStorage
-  //       `prolific_api_base` once per browser and it overrides this.
-  const REAL_PRODUCTION_API_BASE = 'https://prolific-api.onrender.com/api/v1';
   if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
     const hn = window.location.hostname.toLowerCase();
     const prod =

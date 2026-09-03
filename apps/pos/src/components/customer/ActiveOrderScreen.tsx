@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import type { CustomerBranding, CustomerOrderPreview } from '../../vite-env';
 import { formatCentsToNgn } from '../../lib/ui-helpers';
+import { POWERED_BY_LABEL, APP_VERSION } from '../../lib/app-meta';
 
 type PillarKey = 'RECEIVED' | 'ACCEPTED' | 'PREPARING' | 'READY' | 'SERVED';
 
@@ -348,13 +349,13 @@ export default function ActiveOrderScreen({ branding, order }: Props) {
             </span>
           </div>
         </div>
-        <div className="text-xl font-mono font-bold text-white/70 tabular-nums">
-          {now.toLocaleTimeString([], {
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false,
-          })}
+        <div className="text-right">
+          <div className="font-black text-white/90 tracking-wide text-xs sm:text-sm">
+            {POWERED_BY_LABEL}
+          </div>
+          <div className="text-xs text-navy-300/70 font-semibold mt-0.5 tabular-nums">
+            Prolific POS v{APP_VERSION}
+          </div>
         </div>
       </footer>
     </div>

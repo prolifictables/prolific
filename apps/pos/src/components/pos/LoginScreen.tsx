@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { APP_FOOTER_COPYRIGHT } from '../../lib/app-meta';
 import { useAuthStore } from '../../lib/auth-store';
 import type { ConnectionPillState } from '../../lib/types';
 import { fetchPublicMenu } from '../../lib/remote-menu';
@@ -577,6 +578,19 @@ export default function LoginScreen() {
               {pinSubmitting ? '🔐 Verifying PIN…' : '⚡ Sign In'}
             </button>
           </div>
+        </div>
+      </div>
+
+      {/* Footer: version + vendor branding */}
+      <div className="relative z-10 w-full shrink-0 px-5 py-3 text-center">
+        <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white/5 ring-1 ring-inset ring-white/10 backdrop-blur-sm">
+          <span className="text-[10px] uppercase tracking-[0.18em] font-black text-amber-400/80">
+            POS Desktop
+          </span>
+          <span className="h-3 w-px bg-white/10" />
+          <span className="text-xs font-semibold text-ink-300">
+            {APP_FOOTER_COPYRIGHT}
+          </span>
         </div>
       </div>
     </div>

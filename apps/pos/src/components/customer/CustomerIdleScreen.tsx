@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import type { CustomerBranding, CustomerPromo, CustomerSpecial } from '../../vite-env';
+import { POWERED_BY_LABEL, APP_VERSION } from '../../lib/app-meta';
 
 // Baked-in defaults used when the admin has not saved any customer-display
 // settings yet (or the branch fetch returned empty). Each admin edit saves
@@ -239,8 +240,13 @@ export default function CustomerIdleScreen({ branding, promos, specials }: Props
               </span>
             </div>
           </div>
-          <div className="text-navy-700/70 font-semibold text-sm">
-            Powering great experiences · Prolific POS
+          <div className="text-right">
+            <div className="font-black text-navy-900 text-sm tracking-wide">
+              {POWERED_BY_LABEL}
+            </div>
+            <div className="text-xs text-navy-700/60 font-semibold mt-0.5 tabular-nums">
+              Prolific POS v{APP_VERSION}
+            </div>
           </div>
         </footer>
       </div>

@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../../lib/auth-store';
 import { useCartStore } from '../../lib/cart-store';
+import { APP_FOOTER_COPYRIGHT } from '../../lib/app-meta';
 import { formatCentsToNgn } from '../../lib/ui-helpers';
 import type { ConnectionPillState, OpenShiftState } from '../../lib/types';
 import { pinLogin } from '../../lib/remote-auth';
@@ -1768,6 +1769,19 @@ export default function CashierScreenLayout() {
           </div>
         </div>
       )}
+
+      {/* Screen footer: POS version + vendor branding. Shrink-0 keeps it pinned */}
+      <footer className="shrink-0 px-4 sm:px-6 py-2 border-t border-white/5 bg-slate-950/50 backdrop-blur-sm flex items-center justify-between gap-2 text-[11px]">
+        <div className="flex items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/10 ring-1 ring-inset ring-amber-400/25">
+            <span className="h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.7)]" />
+            <span className="font-black uppercase tracking-[0.16em] text-amber-300/90">Prolific POS</span>
+          </span>
+        </div>
+        <div className="font-semibold text-ink-300 whitespace-nowrap overflow-hidden text-ellipsis">
+          {APP_FOOTER_COPYRIGHT}
+        </div>
+      </footer>
     </div>
   );
 }
