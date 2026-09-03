@@ -31,12 +31,59 @@ export function resolveApiBase(): string {
     return `${trimmed}/api/v1`;
   };
 
+  // Helper: detect if this renderer is running inside an Electron environment
+  // (any of: preload contextBridge injected, UA token, process.versions set).
+  const detectElectron = (): boolean => {
+    if (typeof window === 'undefined') return false;
+    try {
+      if (typeof (window as any).electronAPI !== 'undefined' && (window as any).electronAPI !== null) {
+        return true;
+      }
+      if (typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string' && /Electron\//.test(navigator.userAgent)) {
+        return true;
+      }
+      if (
+        typeof (globalThis as any).process !== 'undefined' &&
+        typeof (globalThis as any).process?.versions?.electron === 'string'
+      ) {
+        return true;
+      }
+    } catch { /* ignore */ }
+    return false;
+  };
+
+  // Helper: detect "packaged production desktop" environment — return true if
+  // Vite dev server is NOT running (vite-plugin-electron sets
+  // VITE_DEV_SERVER_URL only when running `vite dev` electron desktop, NOT on
+  // packaged production builds). Combined with Electron env detection, this
+  // is the most robust indicator of a packaged desktop install and avoids any
+  // hostname-based heuristics on file:// URLs (which yield ""/undefined).
+  const isPackagedElectronDesktop = (): boolean => {
+    if (!detectElectron()) return false;
+    // Packaged builds have NO VITE_DEV_SERVER_URL set.
+    // Vite minifies this at build time; we cast to any so tsc never complains.
+    const viteDevUrl =
+      (typeof import.meta !== 'undefined' && (import.meta as any).env)
+        ? ((import.meta as any).env.VITE_DEV_SERVER_URL as unknown)
+        : undefined;
+    if (typeof viteDevUrl === 'string' && viteDevUrl.length > 0) {
+      // VITE_DEV_SERVER_URL present → `npm run dev` electron desktop mode → dev.
+      return false;
+    }
+    // No VITE_DEV_SERVER_URL → packaged for production. Final belt check:
+    // empty/localhost hostname confirms file:// shell.
+    const hn = typeof window.location?.hostname === 'string'
+      ? window.location.hostname.toLowerCase()
+      : '';
+    return ['localhost', '127.0.0.1', '0.0.0.0', ''].includes(hn);
+  };
+
   // (-1) HIGHEST PRIORITY — Electron desktop IPC (sync). On packaged Electron,
   // window.location is `file:///dist/index.html` (NO hostname) so the
   // hostname-based tier (2) never fires → localhost fallback → fail. Ask the
   // main process synchronously via preload contextBridge which already runs
   // the correct 4-tier chain.
-  if (
+  if (detectElectron() &&
     typeof window !== 'undefined' &&
     typeof (window as any).electronAPI?.getApiBaseUrlSync === 'function'
   ) {
@@ -53,47 +100,16 @@ export function resolveApiBase(): string {
     }
   }
 
-  // (-0.5) ELECTRON DESKTOP BELT + SUSPENDERS DETECTION.
-  // If this renderer is running inside a packaged Electron app (preload IPC
-  // getApiBaseUrlSync may not be callable yet because some bundled Electron
-  // builds inject the preload AFTER renderer scripts run due to asar timing,
-  // or contextBridge registration is async) — detect Electron by checking
-  // (a) window.electronAPI exists at all (any property), (b) navigator.userAgent
-  // contains "Electron", or (c) process.versions.electron via nodeIntegration.
-  // If ANY is true AND we are NOT on localhost hostname, assume production
-  // desktop packaged build → use REAL Render API. This ensures packaged
-  // Windows/macOS/Linux desktop apps NEVER call localhost:4000 regardless of
-  // module-import timing relative to preload.
-  if (typeof window !== 'undefined') {
-    let isElectronDesktop = false;
-    try {
-      if (typeof (window as any).electronAPI !== 'undefined' && (window as any).electronAPI !== null) {
-        isElectronDesktop = true;
-      } else if (typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string' && /Electron\//.test(navigator.userAgent)) {
-        isElectronDesktop = true;
-      } else if (
-        typeof (globalThis as any).process !== 'undefined' &&
-        typeof (globalThis as any).process?.versions?.electron === 'string'
-      ) {
-        isElectronDesktop = true;
-      }
-    } catch { /* ignore */ }
-    if (isElectronDesktop) {
-      // Now confirm we are NOT in an explicit dev environment:
-      // - hostname is empty/localhost (file:// loads → hostname "" empty).
-      // - no VITE dev env hints present (VITE_DEV_SERVER_URL or similar).
-      // If explicit VITE_* API URLs are present (tier 1), they override this.
-      const devHintPresent =
-        typeof import.meta !== 'undefined' &&
-        (import.meta as any).env?.DEV === true;
-      const localhostHostname =
-        typeof window.location?.hostname === 'string' &&
-        ['localhost', '127.0.0.1', '0.0.0.0', ''].includes(window.location.hostname.toLowerCase());
-      if (localhostHostname && !devHintPresent) {
-        // Packaged Electron: hostname empty, not VITE dev → production desktop
-        return REAL_PRODUCTION_API_BASE;
-      }
-    }
+  // (-0.5) ELECTRON PACKAGED-PRODUCTION DETECTION.
+  // If detectElectron is true AND VITE_DEV_SERVER_URL is absent, this is a
+  // packaged desktop production build on Windows/macOS/Linux. In this case
+  // we short-circuit the ENTIRE chain and return the real Render production
+  // URL. This is the safest belt+suspenders: main-process IPC (-1) already
+  // returns this URL, but even if IPC fails for any reason on some user's
+  // machine, this tier guarantees we never fall to localhost and never run
+  // hostname-based detection.
+  if (isPackagedElectronDesktop()) {
+    return REAL_PRODUCTION_API_BASE;
   }
 
   // (0) localStorage operator override (per-terminal escape hatch, no deploy needed).
@@ -145,15 +161,20 @@ const API_BASE = resolveApiBase();
 //                 shows "🔐 Verifying PIN…" spinner; STILL NO full modal.
 //
 // PIN-login guardrails (professional-grade timeout + error classification):
-//   • PIN interactions (preWakeApi / pinLogin / changePin) wait a MAX of 30s
-//     total for cold-start wake. If the API is genuinely unreachable after
-//     30s we STOP waiting and throw a marked SERVER_UNREACHABLE error so the
-//     LoginScreen can render an AMBER "Server unreachable" warning chip —
-//     never the misleading rose-red "Incorrect PIN" for a network fault.
-//   • Every per-request HTTP timeout is 5s instead of 10s because the user is
-//     actively waiting on a response. Non-PIN flows keep the 120s/10s defaults.
-const PIN_FLOW_SHORT_WAKE_MS = 30_000;
-const PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS = 5_000;
+//   • PIN interactions (preWakeApi / pinLogin / changePin) wait a MAX of 45s
+//     total for cold-start wake (Render free tier often takes 25-40s on a
+//     first cold ping from the North America Oregon instance after idle).
+//     If the API is genuinely unreachable after 45s we STOP waiting and
+//     throw a marked SERVER_UNREACHABLE error so LoginScreen can render an
+//     AMBER "Server unreachable" warning chip — never the misleading rose-red
+//     "Incorrect PIN" for a network fault.
+//   • Every per-request HTTP timeout is 8s instead of 5s. A first-call fetch
+//     through guardedFetch used to have NO per-attempt AbortController at all
+//     (only wake-retries had one), so Render cold-start latency >15s OS-timeout
+//     on Windows TCP SYN retries threw unreachableErr even when the API was
+//     waking. 8s single-attempt cap = 5 wake retries possible in 45s.
+const PIN_FLOW_SHORT_WAKE_MS = 45_000;
+const PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS = 8_000;
 
 /**
  * Error message marker string. Prefix thrown errors with this token when the
@@ -171,10 +192,36 @@ export async function guardedFetch(
   wakeSource: WakeSource = 'reactive',
   opts: { timeoutMs?: number; perAttemptMs?: number } = {}
 ): Promise<Response> {
-  const { timeoutMs = 120_000 } = opts;
+  const { timeoutMs = 120_000, perAttemptMs = 10_000 } = opts;
+
+  // Per-attempt fetch wrapper: wraps any user-provided doFetch() with an
+  // explicit AbortController that fires after `perAttemptMs`. This ensures
+  // that EVERY single fetch attempt (not just wake-loop pings) has a hard
+  // timeout instead of waiting on OS-level TCP retries which can take 30-60s
+  // on Windows. The user's doFetch() can read opts.signal if it wants to,
+  // but we add a redundant outer timeout for calls that ignore it.
+  const withTimeout = async (): Promise<Response> => {
+    // If doFetch already supports signal, great. If not, the outer
+    // AbortController + Promise.race will still cancel the waiting period.
+    const controller = new AbortController();
+    const timerId = setTimeout(() => controller.abort(), perAttemptMs);
+    try {
+      return await Promise.race([
+        doFetch(),
+        new Promise<Response>((_resolve, reject) => {
+          controller.signal.addEventListener('abort', () => {
+            reject(new DOMException(`Per-attempt HTTP timeout (${perAttemptMs}ms)`, 'TimeoutError'));
+          });
+        }),
+      ]);
+    } finally {
+      clearTimeout(timerId);
+    }
+  };
+
   let res: Response;
   try {
-    res = await doFetch();
+    res = await withTimeout();
   } catch (err) {
     beginWake('Server waking up — one moment…', wakeSource);
     const wokeOk: boolean = await waitForApiWake(API_BASE, {
@@ -196,7 +243,7 @@ export async function guardedFetch(
       );
     }
     try {
-      return await doFetch();
+      return await withTimeout();
     } catch (fetchAfterWakeErr) {
       // Even after health ping woke, the real POST still failed (TCP reset,
       // CORS preflight, etc.) — classify same unreachable, not wrong PIN.
@@ -225,7 +272,10 @@ export async function guardedFetch(
       .catch(() => false);
     if (!wokeOk) throw unreachableErr(`Backend still waking after ${Math.round(timeoutMs / 1000)}s`);
     try {
-      return await doFetch();
+      // Same per-attempt timeout on post-wake retry: prevents OS-level TCP
+      // retry latency from stacking above the wake timeout and throwing the
+      // misleading "after wake" error when the API is actually alive now.
+      return await withTimeout();
     } catch {
       throw unreachableErr('Network error contacting backend after wake');
     }
