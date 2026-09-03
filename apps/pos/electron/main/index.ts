@@ -231,6 +231,46 @@ ipcMain.handle('db:run-migrations', () => {
   return { success: true, migrations: result.applied, from: result.from, to: result.to };
 });
 
+// Returns the current sync-connection status from the main-process sync engine
+// (if present), otherwise falls back to a heuristic that pings the resolved
+// getHttpBaseUrl() health endpoint once and reports ONLINE if 2xx, else
+// OFFLINE. Preload cashiers.ts exposes this as
+// window.electronAPI.getConnectionStatus(), and LoginScreen uses it to render
+// the top-right connection pill. Without this handler, real packaged Electron
+// desktop builds throw on invoke → the LoginScreen L140 catch swallows it →
+// pill stays OFFLINE forever even though the API is reachable, which means
+// cashiers can't visually distinguish "genuinely offline" from "handler
+// missing".
+ipcMain.handle('sync:get-connection-status', async () => {
+  // If a real sync engine is running, prefer its status (higher accuracy).
+  if (typeof (syncEngine as any)?.getStatus === 'function') {
+    try {
+      const engineStatus = await (syncEngine as any).getStatus();
+      if (engineStatus && typeof engineStatus === 'object' && engineStatus.status) {
+        return engineStatus;
+      }
+    } catch { /* fall through to heuristic */ }
+  }
+  // Heuristic: single health GET with short timeout. Matches the main-process
+  // getHttpBaseUrl so the pill reports the SAME host the sync daemon will use
+  // (not whatever the renderer resolved independently — both must match now).
+  try {
+    const healthUrl = getHttpBaseUrl().replace(/\/+$/, '') + '/health';
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(healthUrl, {
+      method: 'GET',
+      signal: controller.signal,
+      cache: 'no-store' as RequestCache,
+    }).finally(() => clearTimeout(timeoutId));
+    const status = resp.ok ? 'ONLINE' : 'SYNC_ERROR';
+    const failedCount = resp.ok ? 0 : 1;
+    return { status, pendingCount: 0, failedCount, lastSuccessfulAt: resp.ok ? Date.now() : undefined };
+  } catch {
+    return { status: 'OFFLINE', pendingCount: 0, failedCount: 1, lastSuccessfulAt: undefined };
+  }
+});
+
 let printHandlersRegistered = false;
 function registerPrintHandlers(): void {
   if (printHandlersRegistered) return;

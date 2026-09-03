@@ -149,10 +149,17 @@ function emitCustomerState(partial: Partial<CustomerStatePayload>): void {
 }
 
 // =========================================================================
-// Backend base URL resolution — professional grade 4-tier fallback chain
-// (mirrors resolveApiBase in remote-auth.ts exactly).
+// Backend base URL resolution — professional grade 6-tier fallback chain
+// (MUST mirror resolveApiBase in remote-auth.ts exactly so browser Web POS
+// and packaged Electron desktop resolve the same URL and a fix on one
+// surface is always applied to the other).
 //
 // Priority (highest wins):
+//   -1. Electron preload IPC sync: window.electronAPI.getApiBaseUrlSync()
+//       (only present on real packaged Electron, returns main-process URL).
+//   -0.5. Electron packaged-production heuristic: detectElectron() && NO
+//         VITE_DEV_SERVER_URL set → short-circuit to REAL Render prod URL,
+//         no hostname inspection needed (file:// yields empty hostname).
 //   0. localStorage operator override: key = "prolific_api_base"
 //   1. Vite / Next build-time env vars
 //   2. Runtime hostname: *.prolifictables.com / *.onrender.com
@@ -162,7 +169,66 @@ function emitCustomerState(partial: Partial<CustomerStatePayload>): void {
 // Used by shimGuardedFetch for every backend call in this shim.
 // =========================================================================
 function resolvePublicApiBase(): string {
-  // (0) localStorage operator override — highest priority.
+  const REAL_PRODUCTION_API_BASE = 'https://prolific-api.onrender.com/api/v1';
+
+  const detectElectron = (): boolean => {
+    if (typeof window === 'undefined') return false;
+    try {
+      if (typeof (window as any).electronAPI !== 'undefined' && (window as any).electronAPI !== null) {
+        return true;
+      }
+      if (typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string' && /Electron\//.test(navigator.userAgent)) {
+        return true;
+      }
+      if (
+        typeof (globalThis as any).process !== 'undefined' &&
+        typeof (globalThis as any).process?.versions?.electron === 'string'
+      ) {
+        return true;
+      }
+    } catch { /* ignore */ }
+    return false;
+  };
+
+  const isPackagedElectronDesktop = (): boolean => {
+    if (!detectElectron()) return false;
+    const viteDevUrl =
+      (typeof import.meta !== 'undefined' && (import.meta as any).env)
+        ? ((import.meta as any).env.VITE_DEV_SERVER_URL as unknown)
+        : undefined;
+    if (typeof viteDevUrl === 'string' && viteDevUrl.length > 0) {
+      // Vite dev server running → electron vite-dev mode, not packaged → dev.
+      return false;
+    }
+    const hn = typeof window.location?.hostname === 'string'
+      ? window.location.hostname.toLowerCase()
+      : '';
+    return ['localhost', '127.0.0.1', '0.0.0.0', ''].includes(hn);
+  };
+
+  // (-1) Highest priority: Electron preload IPC sync (real packaged desktop).
+  if (
+    typeof window !== 'undefined' &&
+    typeof (window as any).electronAPI?.getApiBaseUrlSync === 'function'
+  ) {
+    try {
+      const fromMain: unknown = (window as any).electronAPI.getApiBaseUrlSync();
+      if (typeof fromMain === 'string' && fromMain.trim().length > 3) {
+        const trimmed = fromMain.trim().replace(/\/+$/, '');
+        if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
+          return trimmed;
+        }
+        return `${trimmed}/api/v1`;
+      }
+    } catch { /* preload not ready → fall through */ }
+  }
+
+  // (-0.5) Belt + suspenders: Electron packaged production heuristic.
+  if (isPackagedElectronDesktop()) {
+    return REAL_PRODUCTION_API_BASE;
+  }
+
+  // (0) localStorage operator override — highest priority on browser.
   if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
     try {
       const override = window.localStorage.getItem('prolific_api_base');
@@ -195,7 +261,6 @@ function resolvePublicApiBase(): string {
   }
 
   // (2) Production hostnames → REAL confirmed Render API slug.
-  const REAL_PRODUCTION_API_BASE = 'https://prolific-api.onrender.com/api/v1';
   if (typeof window !== 'undefined' && typeof window.location?.hostname === 'string') {
     const hn = window.location.hostname.toLowerCase();
     const prod =

@@ -150,6 +150,76 @@ export function resolveApiBase(): string {
 
 const API_BASE = resolveApiBase();
 
+// Runtime debug hook: window.__PROLIFIC_DEBUG__ is a plain object the user can
+// inspect from Chrome DevTools (Web POS: F12; Electron desktop: Ctrl+Shift+I).
+// It exposes the ACTUAL resolved URL the login call is targetting (so they
+// can tell if the renderer is calling prolific-api.onrender.com vs
+// accidentally falling to http://localhost:4000) plus helper methods to
+// re-evaluate the URL and do a raw health ping. This lets us diagnose "still
+// not working" reports with hard evidence in 10 seconds of copy/paste rather
+// than making blind code changes.
+//
+// Example user workflow:
+//   1. Open the login screen
+//   2. Press Ctrl+Shift+I → Console tab
+//   3. Type `__PROLIFIC_DEBUG__` and press Enter
+//   4. Confirm `resolvedApiBase` starts with "https://prolific-api.onrender.com"
+//      (NOT "http://localhost:4000")
+//   5. Run `await __PROLIFIC_DEBUG__.healthPing()` to confirm 2xx on health.
+//   6. Run `await __PROLIFIC_DEBUG__.loginDryRun("1234")` to see actual error.
+if (typeof window !== 'undefined') {
+  type DebugT = {
+    resolvedApiBase: string;
+    reResolve: () => string;
+    healthPing: () => Promise<{ status: number; ok: boolean; url: string; body?: unknown }>;
+    loginDryRun: (pin: string, deviceId?: string) => Promise<{ url: string; status: number; ok: boolean; response: unknown; }>;
+  };
+  const debug: DebugT = {
+    resolvedApiBase: API_BASE,
+    reResolve: () => (debug.resolvedApiBase = resolveApiBase()),
+    healthPing: async () => {
+      const url = debug.resolvedApiBase.replace(/\/+$/, '') + '/health';
+      try {
+        const r = await fetch(url, { method: 'GET', cache: 'no-store' as RequestCache });
+        let body: unknown = null;
+        try { body = await r.json().catch(() => r.text()); } catch { /* ignore */ }
+        return { status: r.status, ok: r.ok, url, body };
+      } catch (e: any) {
+        return { status: -1, ok: false, url, body: { message: String(e?.message || e), name: e?.name } };
+      }
+    },
+    loginDryRun: async (pin, deviceId) => {
+      const url = `${debug.resolvedApiBase}/auth/pin/login`;
+      const payload: Record<string, unknown> = { pin };
+      if (deviceId) payload.deviceId = deviceId;
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        let resp: unknown = null;
+        try { resp = await r.json().catch(() => r.text()); } catch { /* ignore */ }
+        return { url, status: r.status, ok: r.ok, response: resp };
+      } catch (e: any) {
+        return { url, status: -1, ok: false, response: { message: String(e?.message || e), name: e?.name, stack: e?.stack } };
+      }
+    },
+  };
+  (window as any).__PROLIFIC_DEBUG__ = debug;
+}
+// TS global declaration so `window.__PROLIFIC_DEBUG__` doesn't flag as unknown:
+declare global {
+  interface Window {
+    __PROLIFIC_DEBUG__?: {
+      readonly resolvedApiBase: string;
+      reResolve(): string;
+      healthPing(): Promise<{ status: number; ok: boolean; url: string; body?: unknown }>;
+      loginDryRun(pin: string, deviceId?: string): Promise<{ url: string; status: number; ok: boolean; response: unknown }>;
+    };
+  }
+}
+
 // POS is always browser; SSR never runs.
 //
 // wakeSource controls overlay rendering (see api-wake.ts):
