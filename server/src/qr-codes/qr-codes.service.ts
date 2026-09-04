@@ -67,11 +67,20 @@ export class QrCodesService {
       throw new NotFoundException(`Table ${tableId} not found`);
     }
 
-    // Customer requirements #1 + #11: the DEFAULT (permanent) QR token for a
-    // physical table must NEVER change. Regenerate therefore creates an
-    // ADDITIONAL, non-default, "backup" QR code that points at the same table.
-    // This way operators can print extra stickers without invalidating the
-    // permanent stickers on the table.
+    // Permanent QR contract: once a table has ANY QR token (printed & taped
+    // onto the physical table), that token must NEVER be rotated, invalidated,
+    // or reassigned. Managers can only generate a token ONCE per new table.
+    // If you need to replace a sticker because it got damaged, open a support
+    // ticket / DB migration — never expose a UI path for accidental rotation.
+    const anyExisting = await this.qrCodeModel
+      .findOne({ tableId: table._id.toString(), branchId })
+      .exec();
+    if (anyExisting) {
+      throw new BadRequestException(
+        'This table already has a permanent QR code. Use the "Download QR" button to re-print the existing sticker.'
+      );
+    }
+
     const token = generateToken();
     const qrCode = await this.qrCodeModel.create({
       restaurantId,
@@ -79,7 +88,10 @@ export class QrCodesService {
       tableId,
       token,
       isActive: true,
-      isDefault: false, // explicitly NOT default — keep permanent default untouched
+      // First and only QR for this table → mark as the default, permanent
+      // token. Any future attempt to call /regenerate on this table will hit
+      // the anyExisting guard above and throw.
+      isDefault: true,
     });
 
     return qrCode;
@@ -133,12 +145,19 @@ export class QrCodesService {
     const qrPacks: QrPack[] = [];
     for (const table of tables) {
       let qrCode = await this.qrCodeModel
-        .findOne({ tableId: table._id.toString(), branchId, isActive: true, isDefault: true })
+        .findOne({ tableId: table._id.toString(), branchId, isActive: true })
+        // Prefer default QR when available; fall back to first active (legacy
+        // data where first create ended up with isDefault=false).
+        .sort({ isDefault: -1, createdAt: 1 })
         .exec();
 
       if (!qrCode) {
-        const regenerated = await this.regenerateQrForTable(ctx, table._id.toString());
-        qrCode = regenerated as unknown as typeof qrCode;
+        // Table has never had a QR → generate the one, permanent, default
+        // token for this brand-new table. This call throws if a QR somehow
+        // appears between the findOne and create (race-safe on tableId unique
+        // constraints at the DB layer).
+        const fresh = await this.regenerateQrForTable(ctx, table._id.toString());
+        qrCode = fresh as unknown as typeof qrCode;
       }
 
       if (!qrCode) continue;

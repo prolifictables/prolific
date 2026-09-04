@@ -1403,6 +1403,28 @@ export function installMockElectronAPI() {
     return { line1, line2: 'Thank you for your patronage', defaultFooter: 'Powered by Prolific POS' };
   };
 
+  // Mirrors Electron main index.ts renderPaperCutSpacer + PAPER_CUT_CSS so
+  // browser-mode (Vite dev / Web POS demo) prints cut to the EXACT same
+  // physical positions as packaged Electron.
+  const mockRenderPaperCutSpacer = (jobKind: 'receipt' | 'kitchen'): string => {
+    const feedLines = Array.from({ length: 12 }, () => `<div class="feed-line">&nbsp;</div>`).join('');
+    const tearBar = jobKind === 'receipt'
+      ? `<div class="tear-off"><span>CUT / TEAR HERE</span></div>`
+      : '';
+    return `
+      ${tearBar}
+      <div class="cut-spacer" role="separator" aria-hidden="true"></div>
+      <div class="feed-lines" aria-hidden="true">${feedLines}</div>
+    `;
+  };
+  const MOCK_PAPER_CUT_CSS = `
+    .tear-off { width: 100%; border-top: 1px dashed #000; border-bottom: 1px dashed #000; margin: 6mm 0 2mm 0; padding: 0.5mm 0; text-align: center; }
+    .tear-off span { font-family: 'Courier New', Courier, monospace; font-size: 9px; line-height: 1; letter-spacing: 0.2em; color: #000; opacity: 0.75; }
+    .cut-spacer { height: 32mm; width: 100%; visibility: hidden; overflow: hidden; }
+    .feed-lines .feed-line { width: 100%; height: 11px; line-height: 11px; visibility: hidden; font-size: 11px; }
+    .tear-off, .cut-spacer, .feed-lines, .feed-line { page-break-inside: avoid; break-inside: avoid; }
+  `;
+
   const mockBuildReceiptHtml = (
     order: any,
     items: any[],
@@ -1500,6 +1522,7 @@ export function installMockElectronAPI() {
       <div class="center small muted">Printed: ${escapeHtml(new Date(meta.printedAt).toLocaleString())}</div>
       <div class="center small bold">Thank you</div>
       <div class="center small muted">${escapeHtml(hdr.defaultFooter)}</div>
+      ${mockRenderPaperCutSpacer('receipt')}
     `;
 
     // Reuse the exact same thermal CSS as Electron main buildReceiptHtml so
@@ -1556,13 +1579,15 @@ export function installMockElectronAPI() {
         .line { border-top: 1px dashed #000; margin: 3mm 0; }
         .line.thin { border-top: 1px dotted #000; margin: 1.5mm 0; opacity: 0.8; }
 
+        ${MOCK_PAPER_CUT_CSS}
+
         @page { size: 80mm auto; margin: 0; }
         @media print {
           html, body { background: #fff !important; }
           body {
             width: 74mm; max-width: 74mm;
             margin: 0 auto !important;
-            padding: 3mm 3mm 3mm 3mm !important;
+            padding: 3mm 3mm 35mm 3mm !important;
             font-family: var(--font-stack) !important;
             font-size: var(--body-size) !important;
             line-height: var(--body-lh) !important;
@@ -1684,12 +1709,13 @@ export function installMockElectronAPI() {
         .note { font-style: italic; color: #111; }
         .small { font-size: var(--small-size); color: #222; opacity: 0.85; }
         @page { size: 80mm auto; margin: 0; }
+        ${MOCK_PAPER_CUT_CSS}
         @media print {
           html, body { background: #fff !important; }
           body {
             width: 74mm; max-width: 74mm;
             margin: 0 auto !important;
-            padding: 3mm 3mm 3mm 3mm !important;
+            padding: 3mm 3mm 35mm 3mm !important;
             font-family: var(--font-stack) !important;
             font-size: var(--body-size) !important;
             line-height: var(--body-lh) !important;
@@ -1723,13 +1749,15 @@ export function installMockElectronAPI() {
       ${rows.join('')}
       <div class="line"></div>
       <div class="center small">Printed ${escapeHtml(new Date(meta.printedAt).toLocaleTimeString())}</div>
+      ${mockRenderPaperCutSpacer('kitchen')}
     </body></html>`;
   };
 
   const mockPrintHtml = async (html: string): Promise<void> => {
     // Render into a clean iframe, then trigger native window.print() through
     // the iframe's content window. Clobber the same iframe slot each print so
-    // we don't leak iframes.
+    // we don't leak iframes. Uses srcdoc + Promise.race(onload, timeout) for
+    // cross-browser reliability regardless of whether onload fires reliably.
     if (typeof document === 'undefined' || typeof window === 'undefined') return;
     const iframeId = 'pos-shim-print-frame';
     let iframe: HTMLIFrameElement | null = document.getElementById(iframeId) as HTMLIFrameElement | null;
@@ -1748,28 +1776,49 @@ export function installMockElectronAPI() {
     }
     return new Promise<void>((resolve) => {
       if (!iframe) return resolve();
-      const done = () => {
+      let resolved = false;
+      const finalize = () => {
+        if (resolved) return;
+        resolved = true;
         try {
           const win = iframe?.contentWindow;
           if (win && typeof win.print === 'function') {
-            win.focus();
-            win.print();
+            try { win.print(); } catch { /* print blocked by browser / not ready */ }
           }
-        } catch { /* ignore print errors */ }
-        setTimeout(() => resolve(), 100);
+        } catch { /* ignore frame access errors */ }
+        // Give the native print dialog ~300ms to open before resolving so the
+        // user sees it pop up even in fast HMR / double-click scenarios.
+        setTimeout(() => resolve(), 350);
       };
+
       try {
-        iframe.onload = done;
-        const doc = iframe.contentWindow?.document;
-        if (doc) {
-          doc.open();
-          doc.write(html);
-          doc.close();
-        } else {
-          done();
+        // srcdoc is more reliable cross-browser than manual doc.open/write/close
+        // (some browsers suppress onload when the same iframe is re-written).
+        // We fall through to the timeout resolver even if onload never fires.
+        try {
+          iframe.srcdoc = html;
+        } catch {
+          // Legacy fallback for very old browsers without srcdoc support.
+          const doc = iframe.contentWindow?.document;
+          if (doc) {
+            doc.open();
+            doc.write(html);
+            doc.close();
+          }
         }
+
+        // Promise.race-equivalent: fire finalize as soon as either the iframe
+        // finishes loading OR 500ms elapses (whichever comes first). This
+        // ensures we never hang waiting for a suppressed onload event.
+        const timeoutId = setTimeout(() => finalize(), 500);
+        const prevOnload = iframe.onload;
+        iframe.onload = () => {
+          clearTimeout(timeoutId);
+          try { if (typeof prevOnload === 'function') (prevOnload as any).call(iframe); } catch { /* ignore */ }
+          finalize();
+        };
       } catch {
-        done();
+        finalize();
       }
     });
   };
@@ -2623,6 +2672,80 @@ export function installMockElectronAPI() {
         getShiftTotals: async (shiftId: string) => {
           await delay(10);
 
+          // First, resolve the SHIFT's open / close timestamps + branch id so
+          // we can include rows within the shift TIME WINDOW even if they
+          // don't have shift_id explicitly set (QR / website / Mark Paid
+          // later / sync pull worker rows — exactly the same rule applied in
+          // payments-shifts.repository.getShiftTotals).
+          //
+          // Browser shim only keeps a single open-shift singleton in
+          // localStorage (mockOpenShift). Closed shifts aren't persisted as
+          // a list — so if the passed shiftId matches mockOpenShift.id OR
+          // the shim's getOpen payload, we use that shift's metadata;
+          // otherwise fall back to opened_at=0, closed_at=now so all rows
+          // still reconcile.
+          const refreshShift = loadMockOpenShiftFromStorage();
+          if (refreshShift) mockOpenShift = refreshShift;
+          const shift = (() => {
+            if (mockOpenShift) {
+              const mockId =
+                mockOpenShift.id != null ? String(mockOpenShift.id) :
+                mockOpenShift.shiftId != null ? String(mockOpenShift.shiftId) :
+                null;
+              if (mockId && mockId === String(shiftId)) return mockOpenShift;
+            }
+            // Fallback: no persisted shift matches. Build a synthetic one
+            // that starts at epoch (so all qualifying rows fall within the
+            // window) — this matches the repository behavior when opened_at
+            // is missing (returns 0 so shift-start clause becomes a no-op).
+            return null;
+          })();
+          const openedAt =
+            shift && typeof shift.opened_at === 'number' ? shift.opened_at :
+            shift && typeof shift.openedAt === 'number' ? shift.openedAt : 0;
+          const closedAt =
+            shift && typeof shift.closed_at === 'number' ? shift.closed_at :
+            shift && typeof shift.closedAt === 'number' ? shift.closedAt :
+            Date.now();
+          const branchId =
+            (shift && shift.branch_id != null) ? String(shift.branch_id) :
+            (shift && shift.branchId != null) ? String(shift.branchId) : null;
+
+          // Shared helper: does a row belong to this shift? Either shift_id
+          // matches DIRECTLY, OR the row has shift_id missing AND the row's
+          // created_at timestamp falls within [openedAt, closedAt] AND the
+          // branch_id matches (when branchId is available on shift meta + row).
+          const rowShiftId = (r: any): string | null => {
+            if (r.shiftId != null && String(r.shiftId)) return String(r.shiftId);
+            if (r.shift_id != null && String(r.shift_id)) return String(r.shift_id);
+            return null;
+          };
+          const rowBranchId = (r: any): string | null => {
+            if (r.branch_id != null && String(r.branch_id)) return String(r.branch_id);
+            if (r.branchId != null && String(r.branchId)) return String(r.branchId);
+            return null;
+          };
+          const rowCreatedAt = (r: any): number => {
+            if (typeof r.created_at === 'number') return r.created_at;
+            if (typeof r.createdAt === 'number') return r.createdAt;
+            return 0;
+          };
+          const inShiftWindow = (ts: number): boolean =>
+            (openedAt <= 0 || ts >= openedAt) && ts <= Math.max(closedAt, openedAt);
+          const rowInShift = (r: any): boolean => {
+            const direct = rowShiftId(r);
+            if (direct === String(shiftId)) return true;
+            if (direct) return false; // bound to a DIFFERENT shift — don't double-count
+            // No shift_id on row: use time-window + branch match.
+            const ts = rowCreatedAt(r);
+            if (!inShiftWindow(ts)) return false;
+            if (branchId) {
+              const rb = rowBranchId(r);
+              if (rb && rb !== branchId) return false;
+            }
+            return true;
+          };
+
           // -----------------------------------------------------------------
           // Shared "is qualifying payment" predicate — mirrors
           // reports.repository PAID_FILTER + payments.repository updated
@@ -2648,9 +2771,6 @@ export function installMockElectronAPI() {
                 (p.orderId != null) ? String(p.orderId) :
                 (p.order_id != null) ? String(p.order_id) : '';
               if (oid) {
-                // Walk mockOrders to find matching row (no separate
-                // getOrderById helper in the shim engine, keep local lookup so
-                // the file stays self-contained).
                 const order = mockOrders.find((oo: any) => {
                   const ooId =
                     oo.id != null ? String(oo.id) :
@@ -2675,14 +2795,12 @@ export function installMockElectronAPI() {
           };
 
           const realPays = mockPayments.filter((p) => {
-            if (p.shiftId !== shiftId && String(p.shift_id || '') !== String(shiftId)) return false;
+            if (!rowInShift(p)) return false;
             return isPaidPayment(p);
           });
 
-          // Shift-id matched orders — used for fallbacks + voids.
-          const shiftOrders = mockOrders.filter((o: any) =>
-            o.shiftId === shiftId || String(o.shift_id || '') === String(shiftId)
-          );
+          // ALL orders in shift scope (shift_id direct OR time-window match).
+          const shiftOrders = mockOrders.filter((o: any) => rowInShift(o));
 
           // PAID orders that DON'T have a qualifying payment → virtual
           // payments (mirrors the SQL fallback UNION above).
@@ -3967,43 +4085,57 @@ export function installMockElectronAPI() {
         return true;
       },
       receipt: async (orderId: string, copies = 1) => {
-        console.log(`[mock print] receipt for ${orderId} × ${copies}`);
-        const order = mockOrders.find((o) => o.id === orderId) || mockOrders.find((o) => (o.order_number || o.orderNumber) === orderId);
-        if (!order) {
-          console.warn(`[mock print] receipt skipped: order ${orderId} not found in mock DB`);
+        // Browser mock-shim print MUST never throw into PaymentModal. Any
+        // failure (missing order, print dialog blocked) is logged but the
+        // promise resolves cleanly so the "Payment not recorded" toast NEVER
+        // fires just because printing failed.
+        try {
+          console.log(`[mock print] receipt for ${orderId} × ${copies}`);
+          const order = mockOrders.find((o) => o.id === orderId) || mockOrders.find((o) => (o.order_number || o.orderNumber) === orderId);
+          if (!order) {
+            console.warn(`[mock print] receipt skipped: order ${orderId} not found in mock DB`);
+            return true;
+          }
+          const items = mockOrderItems.filter((i) => i.order_id === orderId || i.orderId === orderId);
+          const mods = mockOrderItemModifiers.filter((m) => m.order_id === orderId || m.orderId === orderId);
+          const payments = mockPayments.filter((p) => p.order_id === orderId || p.orderId === orderId);
+          const printedAt = Date.now();
+          const numCopies = Math.max(1, Math.min(5, Number(copies ?? 1)));
+          for (let i = 0; i < numCopies; i += 1) {
+            const title = i === 0 ? 'CUSTOMER COPY' : 'CASHIER COPY';
+            const html = mockBuildReceiptHtml(order, items, mods, payments, {
+              title,
+              printedAt,
+              copyIndex: i,
+              totalCopies: numCopies,
+            });
+            // Note: in browser mode multiple copies just re-issue the dialog N times
+            // — real Electron prints silently via Windows print spooler.
+            await mockPrintHtml(html);
+          }
+          return true;
+        } catch (e) {
+          console.warn('[mock print] receipt error (swallowed so payment flow continues):', e);
           return true;
         }
-        const items = mockOrderItems.filter((i) => i.order_id === orderId || i.orderId === orderId);
-        const mods = mockOrderItemModifiers.filter((m) => m.order_id === orderId || m.orderId === orderId);
-        const payments = mockPayments.filter((p) => p.order_id === orderId || p.orderId === orderId);
-        const printedAt = Date.now();
-        const numCopies = Math.max(1, Math.min(5, Number(copies ?? 1)));
-        for (let i = 0; i < numCopies; i += 1) {
-          const title = i === 0 ? 'CUSTOMER COPY' : 'CASHIER COPY';
-          const html = mockBuildReceiptHtml(order, items, mods, payments, {
-            title,
-            printedAt,
-            copyIndex: i,
-            totalCopies: numCopies,
-          });
-          // Note: in browser mode multiple copies just re-issue the dialog N times
-          // — real Electron prints silently via Windows print spooler.
-          await mockPrintHtml(html);
-        }
-        return true;
       },
       kitchenTicket: async (orderId: string) => {
-        console.log(`[mock print] kitchen ticket for ${orderId}`);
-        const order = mockOrders.find((o) => o.id === orderId) || mockOrders.find((o) => (o.order_number || o.orderNumber) === orderId);
-        if (!order) {
-          console.warn(`[mock print] kitchen ticket skipped: order ${orderId} not found`);
+        try {
+          console.log(`[mock print] kitchen ticket for ${orderId}`);
+          const order = mockOrders.find((o) => o.id === orderId) || mockOrders.find((o) => (o.order_number || o.orderNumber) === orderId);
+          if (!order) {
+            console.warn(`[mock print] kitchen ticket skipped: order ${orderId} not found`);
+            return true;
+          }
+          const items = mockOrderItems.filter((i) => i.order_id === orderId || i.orderId === orderId);
+          const mods = mockOrderItemModifiers.filter((m) => m.order_id === orderId || m.orderId === orderId);
+          const html = mockBuildKitchenTicketHtml(order, items, mods, { printedAt: Date.now() });
+          await mockPrintHtml(html);
+          return true;
+        } catch (e) {
+          console.warn('[mock print] kitchen-ticket error (swallowed):', e);
           return true;
         }
-        const items = mockOrderItems.filter((i) => i.order_id === orderId || i.orderId === orderId);
-        const mods = mockOrderItemModifiers.filter((m) => m.order_id === orderId || m.orderId === orderId);
-        const html = mockBuildKitchenTicketHtml(order, items, mods, { printedAt: Date.now() });
-        await mockPrintHtml(html);
-        return true;
       },
       listPrinters: async () => ({ printers: [] }),
       getQueueStatus: async () => ({ queued: 0, inProgress: 0, failed: 0 }),

@@ -78,6 +78,29 @@ export class PaymentsRepository {
     );
   }
 
+  /** Broad scan used by the ShiftModal LEGACY fallback when the shift_id
+   *  column on rows isn't set (QR sync pulled orders, Mark Paid later,
+   *  first sale before open-shift). The renderer then filters these by
+   *  opened_at <= created_at <= now in JS space. */
+  listRecent(branchId: string | null | undefined, limit = 1000): PaymentRow[] {
+    const safeBranch =
+      typeof branchId === 'string' && branchId ? branchId : null;
+    if (safeBranch) {
+      return this.db.all<PaymentRow>(
+        `SELECT * FROM payments
+         WHERE COALESCE(branch_id, '') = ?
+         ORDER BY created_at DESC
+         LIMIT ?`,
+        safeBranch,
+        limit
+      );
+    }
+    return this.db.all<PaymentRow>(
+      `SELECT * FROM payments ORDER BY created_at DESC LIMIT ?`,
+      limit
+    );
+  }
+
   markSynced(paymentId: string, serverVersion: number): void {
     this.db.run(
       `UPDATE payments SET synced = 1, server_version = ?, updated_at = unixepoch('now')*1000 WHERE id = ?`,
@@ -119,14 +142,28 @@ export class PaymentsRepository {
       count: number;
     };
   } {
-    // First, load the shift's opened_at (used to scope order-level fallback
-    // aggregation to opened_at <= ts <= Date.now()).
-    const shiftRow = this.db.get<{ opened_at: number }>(
-      `SELECT COALESCE(opened_at, 0) opened_at FROM shifts WHERE id = ?`,
+    // First, load the shift's opened_at + closed_at so we can scope BOTH
+    // shift_id-matched rows AND rows that fall within the shift time window
+    // but have shift_id = NULL. This catches:
+    //   (a) QR-code / website orders pulled by the sync-cloud-pull worker,
+    //       which often writes shift_id = NULL because server doesn't know
+    //       which device shift is active on the POS machine.
+    //   (b) Mark-Paid confirmations applied later from the History tab that
+    //       lost their shift binding.
+    //   (c) Any POS sale where getOpen() returned null at order creation time
+    //       (e.g. first sale before the open-shift modal was dismissed).
+    const shiftRow = this.db.get<{ opened_at: number; closed_at: number }>(
+      `SELECT COALESCE(opened_at, 0) opened_at,
+              COALESCE(closed_at, unixepoch('now')*1000) closed_at
+       FROM shifts WHERE id = ?`,
       shiftId,
     );
     const openedAt = Number(shiftRow?.opened_at || 0);
-    const closeAt = Date.now();
+    // A shift that hasn't been closed yet has closed_at = NULL in the DB, so
+    // the COALESCE above fills it with the current wall-clock time. For an
+    // already-closed shift, closed_at is the actual end timestamp. Numbers
+    // above are milliseconds (all created_at timestamps are ms in this DB).
+    const closeAt = Number(shiftRow?.closed_at || Date.now());
 
     // -------------------------------------------------------------------
     // Payment aggregation — mirrors reports.repository: accept payments
@@ -134,6 +171,10 @@ export class PaymentsRepository {
     // OR PENDING/AWAITING_CONFIRM where either completed_at is set OR the
     // attached order is already marked PAID. This ensures close-shift
     // numbers EXACTLY match ReportsPanel + History numbers above.
+    //
+    // In addition to shift_id = ? matching, we ALSO include rows within the
+    // [openedAt, closeAt] time window that have shift_id IS NULL (and match
+    // the same shift's branch_id when the row has branch_id info available).
     // -------------------------------------------------------------------
     const PAID_STATUS_FILTER = `
       status IN ('SUCCESS','COMPLETED','PAID','CLOSED')
@@ -150,20 +191,62 @@ export class PaymentsRepository {
          ))
     `;
 
+    // A payment row "belongs to this shift" if:
+    //   1. shift_id = ? directly, OR
+    //   2. shift_id IS NULL AND the payment was written between shift open
+    //      and shift close AND the branch row matches the shift's own
+    //      branch_id (avoids double-counting across two different branches
+    //      running concurrent shifts).
+    const shiftMeta = this.db.get<{ branch_id: unknown; employee_id: unknown }>(
+      `SELECT branch_id, employee_id FROM shifts WHERE id = ?`,
+      shiftId,
+    );
+    const branchId = shiftMeta?.branch_id != null ? String(shiftMeta.branch_id) : null;
+    const employeeId = shiftMeta?.employee_id != null ? String(shiftMeta.employee_id) : null;
+    // SCOPE_PAYMENTS positional order (used as prefix):
+    //   [shiftId, openedAt, closeAt, branchId]
+    const SCOPE_PAYMENTS = `
+      (shift_id = ?)
+      OR (
+        COALESCE(shift_id, '') = ''
+        AND COALESCE(created_at, 0) >= ?
+        AND COALESCE(created_at, 0) <= ?
+        AND (? IS NULL OR COALESCE(branch_id,'') = ?)
+      )
+    `;
+
     const payRows = this.db.all<{ method: string; amount: number; tip: number; cnt: number }>(
       `SELECT method,
               COALESCE(SUM(amount_cents),0) amount,
               COALESCE(SUM(tip_cents),0) tip,
               COUNT(*) cnt
-       FROM payments WHERE shift_id = ? AND (${PAID_STATUS_FILTER})
+       FROM payments WHERE (${SCOPE_PAYMENTS}) AND (${PAID_STATUS_FILTER})
        GROUP BY method`,
-      shiftId,
+      shiftId, openedAt, closeAt, branchId, branchId,
     );
 
     // PAID-ORDER FALLBACK — rows marked PAID/COMPLETED with paid_amount_cents
-    // > 0 AND shift_id = this shift that do NOT have a qualifying payment
-    // row. Bucket these as method = (order.payment_method else CASH). This is
-    // the exact same rule as used by Reports repository so numbers match.
+    // > 0 within the shift scope (shift_id=direct OR time-window-shift_id-null)
+    // that do NOT have a qualifying payment row. Bucket these as
+    // method = (order.payment_method else CASH). This is the exact same rule
+    // as used by Reports repository so numbers match.
+    //
+    // SCOPE_ORDERS positional order (prefix): [shiftId, openedAt, closeAt, branchId]
+    const SCOPE_ORDERS = `
+      (o.shift_id = ?)
+      OR (
+        COALESCE(o.shift_id, '') = ''
+        AND COALESCE(o.created_at, 0) >= ?
+        AND COALESCE(o.created_at, 0) <= ?
+        AND (? IS NULL OR COALESCE(o.branch_id,'') = ?)
+      )
+    `;
+    // Fallback NOT EXISTS subquery re-scopes payments to the same shift
+    // window. Positional: [shiftId, openedAt, closeAt, branchId,
+    //                      shiftId, openedAt, closeAt, branchId, branchId]
+    // (8 outer + 8 inner + 1 branchId alias = 17 positions, but note the
+    //  inner-payment PAID_STATUS_FILTER has zero ? bindings — it's self-
+    //  contained with columns only.)
     const fallbackRows = this.db.all<{ method: string; amount: number; tip: number; cnt: number }>(
       `SELECT
          COALESCE(o.payment_method, 'CASH') method,
@@ -171,20 +254,33 @@ export class PaymentsRepository {
          0 tip,
          COUNT(DISTINCT o.id) cnt
        FROM orders o
-       WHERE o.shift_id = ?
+       WHERE (${SCOPE_ORDERS})
          AND UPPER(COALESCE(o.status,'')) IN ('COMPLETED','PAID','CLOSED','SERVED','DELIVERED')
          AND UPPER(COALESCE(o.payment_status,'')) IN ('PAID','PARTIALLY_PAID')
          AND COALESCE(o.paid_amount_cents,0) > 0
          AND NOT EXISTS (
            SELECT 1 FROM payments pp
-           WHERE pp.shift_id = o.shift_id
+           WHERE (
+             (pp.shift_id = o.shift_id)
+             OR (
+               COALESCE(pp.shift_id, '') = ''
+               AND COALESCE(pp.created_at, 0) >= ?
+               AND COALESCE(pp.created_at, 0) <= ?
+               AND (? IS NULL OR COALESCE(pp.branch_id,'') = ?)
+             )
+           )
              AND pp.order_id = o.id
              AND COALESCE(pp.amount_cents,0) > 0
              AND (${PAID_STATUS_FILTER.replace(/payments\./g, 'pp.')})
          )
        GROUP BY COALESCE(o.payment_method, 'CASH')`,
-      shiftId,
+      // SCOPE_ORDERS (outer) bindings
+      shiftId, openedAt, closeAt, branchId, branchId,
+      // Inner NOT EXISTS time window
+      openedAt, closeAt, branchId, branchId,
     );
+    // Note: 4 outer scope + 1 duplicate branch check + 4 inner scope +
+    //       1 duplicate inner branch check = 10 bindings total above.
 
     // Merge real payments + fallback by method.
     const mergedByMethod = new Map<string, { method: string; amount: number; tip: number; count: number }>();
@@ -218,20 +314,10 @@ export class PaymentsRepository {
       } else { other += r.amount; otherCount += r.count; }
     }
 
-    // Order-level metrics for the close-shift sheet:
-    //   paidOrderCount: distinct orders whose SUM of qualifying payments +
-    //                   order paid_amount fallback covers their total OR
-    //                   order.payment_status = PAID / PARTIALLY_PAID with
-    //                   non-zero paid_amount.
-    //   voidedOrderCount: status = VOID / VOIDED in this shift.
-    //   refundedOrderCount: status = REFUNDED / payment_status REFUNDED /
-    //                       PARTIALLY_REFUNDED.
-    //   paidItemQty: SUM of item_qty from PAID orders; fallback 0 if column
-    //                absent in earlier migrations.
-    //   subtotal / discount / tax / total: sums from order rows; missing
-    //                columns → 0.
+    // Order-level metrics for the close-shift sheet. Same SCOPE_ORDERS rule
+    // so paidOrderCount, subtotal/discount/tax sums include shift-window rows.
     const scopedOrders = (sql: string, ...extraParams: unknown[]) =>
-      this.db.all(sql, shiftId, ...extraParams);
+      this.db.all(sql, shiftId, openedAt, closeAt, branchId, ...extraParams);
 
     let subtotal = 0, discount = 0, tax = 0, orderTotal = 0, itemQty = 0;
     try {
@@ -252,8 +338,8 @@ export class PaymentsRepository {
       const row = this.db.get<{
         subtotal: number; discount: number; tax: number; total: number; items_qty: number;
       }>(
-        `SELECT ${parts.join(', ')} FROM orders WHERE shift_id = ?`,
-        shiftId,
+        `SELECT ${parts.join(', ')} FROM orders WHERE (${SCOPE_ORDERS})`,
+        shiftId, openedAt, closeAt, branchId, branchId,
       );
       subtotal = Number(row?.subtotal || 0);
       discount = Number(row?.discount || 0);
@@ -269,11 +355,12 @@ export class PaymentsRepository {
          COALESCE(SUM(CASE WHEN UPPER(COALESCE(o.status,'')) = 'REFUNDED' OR UPPER(COALESCE(o.payment_status,'')) IN ('REFUNDED','PARTIALLY_REFUNDED') THEN 1 ELSE 0 END),0) refunded,
          COUNT(DISTINCT o.id) ordersCoveredCount
        FROM orders o
-       WHERE o.shift_id = ?`,
-      shiftId,
+       WHERE (${SCOPE_ORDERS})`,
+      shiftId, openedAt, closeAt, branchId, branchId,
     );
 
-    // Payouts — already filtered by shift_id (table present; else 0).
+    // Payouts — shift_id always set (not server-originated) so scope remains
+    // the simple shift_id = ? match.
     let payouts = { totalPayoutCents: 0, payoutCount: 0 };
     try {
       const p = this.db.all<{ amount: number; cnt: number }>(
@@ -283,7 +370,8 @@ export class PaymentsRepository {
       if (p && p[0]) payouts = { totalPayoutCents: p[0].amount || 0, payoutCount: p[0].cnt || 0 };
     } catch { /* payouts table may not exist in earlier schema — ignore */ }
 
-    // Cash adjustments — paid-in / paid-out by shift_id.
+    // Cash adjustments — paid-in / paid-out by shift_id (also always set by
+    // the POS, never synced from server so shift_id = ? is sufficient).
     let cashAdj = { totalPaidInCents: 0, totalPaidOutCents: 0, count: 0 };
     try {
       const c = this.db.all<{ paidin: number; paidout: number; cnt: number }>(
@@ -309,6 +397,7 @@ export class PaymentsRepository {
     // truth for paid $ because it reconciles with drawer math (cash) +
     // card processor (card) + any transfer methods.
     void orderTotal; void closeAt; void openedAt; void paidAndVoids?.ordersCoveredCount;
+    void employeeId; void scopedOrders;
     return {
       cash,
       card,

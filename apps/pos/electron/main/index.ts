@@ -519,6 +519,80 @@ function registerPrintHandlers(): void {
     return { line1: defaultLine1, line2: defaultLine2, defaultFooter: 'Powered by Prolific POS' };
   };
 
+  // Emits a 40mm paper-feed spacer with dashed tear-off line, used on BOTH
+  // receipts and kitchen tickets. Thermal printers (EPSON TM-T88/Xprinter/Zjiang
+  // 80mm/58mm series with auto-cutter) trigger cutter when job document ends;
+  // without this spacer the cut happens mid-Thank-You footer. The spacer also
+  // pushes footer lines past the printer-tear bar on models WITHOUT cutter
+  // (staff tears manually at the dashed line).
+  const renderPaperCutSpacer = (jobKind: 'receipt' | 'kitchen'): string => {
+    // 12 thin feed lines (about 6–8 mm) + 32mm tall invisible cut spacer
+    // = ~40mm of blank paper after the footer. Adjust amount if cut happens
+    // too early or too late on your printer fleet.
+    const feedLines = Array.from({ length: 12 }, () => `<div class="feed-line">&nbsp;</div>`).join('');
+    // Dashed tear-off cut line (visible on non-cutter printers so staff knows
+    // exactly where to rip). Skip on kitchen tickets — KDS doesn't need it.
+    const tearBar = jobKind === 'receipt'
+      ? `<div class="tear-off"><span>CUT / TEAR HERE</span></div>`
+      : '';
+    return `
+      ${tearBar}
+      <div class="cut-spacer" role="separator" aria-hidden="true"></div>
+      <div class="feed-lines" aria-hidden="true">${feedLines}</div>
+    `;
+  };
+
+  // CSS class helpers for the paper-cut spacer. Injected into the <style>
+  // block of each receipt/kitchen HTML so everything is self-contained (no
+  // external stylesheet deps needed for the hidden BrowserWindow print spool).
+  const PAPER_CUT_CSS = `
+    /* Tear-off cut bar: dashed line + CUT/TEAR HERE label so non-cutter
+       printers show staff the rip position. Label is small so auto-cutter
+       printers don't waste ink on the message. */
+    .tear-off {
+      width: 100%;
+      border-top: 1px dashed #000;
+      border-bottom: 1px dashed #000;
+      margin: 6mm 0 2mm 0;
+      padding: 0.5mm 0;
+      text-align: center;
+    }
+    .tear-off span {
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 9px;
+      line-height: 1;
+      letter-spacing: 0.2em;
+      color: #000;
+      opacity: 0.75;
+    }
+    /* Blank spacer div (32mm) = tall enough block so Chromium rasterizes a
+       region of empty paper past the last visible line. Thermal auto-cutter
+       fires at last-rasterized scan line; 32mm + 12 feed lines = ~40mm
+       after footer which is the standard "cut here" position on 80mm EPSON /
+       Xprinter / Zjiang / Gprinter hardware. */
+    .cut-spacer {
+      height: 32mm;
+      width: 100%;
+      visibility: hidden;
+      overflow: hidden;
+    }
+    /* 12 lines of non-breaking space (≈ 6–8 mm) so 58mm narrow printers
+       without cutter also get enough paper past the tear bar. */
+    .feed-lines .feed-line {
+      width: 100%;
+      height: 11px;
+      line-height: 11px;
+      visibility: hidden;
+      font-size: 11px;
+    }
+    /* Ensure spacer blocks don't get page-broken — we want cut offset to
+       always be at the very end of the single document page. */
+    .tear-off, .cut-spacer, .feed-lines, .feed-line {
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }
+  `;
+
   const buildReceiptHtml = (
     order: any,
     items: any[],
@@ -640,6 +714,7 @@ function registerPrintHandlers(): void {
       <div class="center small muted">Printed: ${escapeHtml(new Date(meta.printedAt).toLocaleString())}</div>
       <div class="center small bold">Thank you</div>
       <div class="center small muted">${escapeHtml(hdr.defaultFooter)}</div>
+      ${renderPaperCutSpacer('receipt')}
     `;
 
     return `
@@ -748,6 +823,11 @@ function registerPrintHandlers(): void {
               opacity: 0.8;
             }
 
+            /* Paper-cut / tear-off spacer classes so auto-cutter fires at the
+               right document boundary and manual-tear printers show a visible
+               dashed cut line. Shared with kitchen tickets. */
+            ${PAPER_CUT_CSS}
+
             /* ----- Thermal print styles ----- */
             @page {
               /* size: 80mm width and AUTO height so paper cuts dynamically
@@ -758,12 +838,14 @@ function registerPrintHandlers(): void {
             @media print {
               html, body { background: #fff !important; }
               body {
-                /* Remove any preview padding; @page margin=0 + controlled body padding
-                   keeps the receipt centered on 80mm paper. */
+                /* Preview padding replaced with print-optimized padding: L3/R3
+                   for paper margins, T3 for header clearance, B35 so Chromium
+                   print-driver advances paper past the tear bar / auto-cutter
+                   blade BEFORE signalling end-of-doc (which triggers GS V cut). */
                 width: 74mm;
                 max-width: 74mm;
                 margin: 0 auto !important;
-                padding: 3mm 3mm 3mm 3mm !important;
+                padding: 3mm 3mm 35mm 3mm !important;
                 font-family: var(--font-stack) !important;
                 font-size: var(--body-size) !important;
                 line-height: var(--body-lh) !important;
@@ -918,13 +1000,14 @@ function registerPrintHandlers(): void {
             .small { font-size: var(--small-size); color: #222; opacity: 0.85; }
 
             @page { size: 80mm auto; margin: 0; }
+            ${PAPER_CUT_CSS}
             @media print {
               html, body { background: #fff !important; }
               body {
                 width: 74mm;
                 max-width: 74mm;
                 margin: 0 auto !important;
-                padding: 3mm 3mm 3mm 3mm !important;
+                padding: 3mm 3mm 35mm 3mm !important;
                 font-family: var(--font-stack) !important;
                 font-size: var(--body-size) !important;
                 line-height: var(--body-lh) !important;
@@ -959,127 +1042,186 @@ function registerPrintHandlers(): void {
           ${rows.join('')}
           <div class="line"></div>
           <div class="center small">Printed ${escapeHtml(new Date(meta.printedAt).toLocaleTimeString())}</div>
+          ${renderPaperCutSpacer('kitchen')}
         </body>
       </html>
     `;
   };
 
-  const printHtml = async (html: string, deviceName?: string): Promise<void> => {
-    const win = new BrowserWindow({
-      show: false,
-      width: 360,
-      height: 800,
-      webPreferences: { sandbox: true },
-    });
-    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-    await new Promise<void>((resolve, reject) => {
-      win.webContents.print(
-        { silent: true, printBackground: true, deviceName },
-        (success, failureReason) => {
-          if (success) resolve();
-          else reject(new Error(failureReason || 'print failed'));
+  // All print helpers MUST swallow errors internally. Printer / spooler /
+  // device failures must NEVER propagate into the payment-confirm catch path
+  // (which shows the generic "Payment not recorded" toast).
+  const printHtml = async (html: string, deviceName?: string): Promise<{ success: boolean; error?: string }> => {
+    let win: Electron.BrowserWindow | null = null;
+    try {
+      win = new BrowserWindow({
+        show: false,
+        width: 360,
+        height: 800,
+        webPreferences: { sandbox: true },
+      });
+      await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+      const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
+        if (!win) return resolve({ success: false, error: 'window gone' });
+        try {
+          win.webContents.print(
+            { silent: true, printBackground: true, deviceName },
+            (ok, failureReason) => {
+              if (ok) resolve({ success: true });
+              else resolve({ success: false, error: failureReason || 'silent print failed' });
+            }
+          );
+        } catch (inner: any) {
+          resolve({ success: false, error: inner?.message || 'print call threw' });
         }
-      );
-    });
-    win.destroy();
+      });
+      return result;
+    } catch (e: any) {
+      return { success: false, error: e?.message || 'printHtml unexpected error' };
+    } finally {
+      if (win && !win.isDestroyed()) {
+        try { win.destroy(); } catch { /* ignore destroy errors */ }
+      }
+    }
   };
 
-  ipcMain.handle('print:list-printers', async () => {
-    if (!posWin || posWin.isDestroyed()) return { printers: [] };
-    const printers = await posWin.webContents.getPrintersAsync();
-    return { printers };
-  });
-
-  ipcMain.handle('print:queue-status', async () => ({ queued: 0, inProgress: 0, failed: 0 }));
-
-  ipcMain.handle('print:test-page', async () => {
-    if (!posWin || posWin.isDestroyed()) return { queued: false, error: 'no window' };
-    const printers = await posWin.webContents.getPrintersAsync();
-    const defaultPrinter = printers.find((p) => (p as any).isDefault) ?? printers[0];
-    const sampleItems = [
-      { id: 't1', name_snapshot: 'Jollof Rice with Chicken', quantity: 1, price_snapshot_cents: 250000, total_cents: 250000 },
-      { id: 't2', name_snapshot: 'Bottle Water', quantity: 2, price_snapshot_cents: 20000, total_cents: 40000, special_instructions: 'Cold please' },
-    ];
-    const sampleMods = [
-      { order_item_id: 't1', modifier_name: 'Protein', option_name: 'Extra Chicken', price_delta_cents: 0 },
-    ];
-    const html = buildReceiptHtml(
-      {
-        order_number: 'TEST-001',
-        order_type: 'DINE_IN',
-        table_id: 'T1',
-        table_name: 'VIP 1',
-        customer_name: 'Demo Guest',
-        subtotal_cents: 290000,
-        discount_cents: 10000,
-        tax_cents: 21000,
-        tip_cents: 5000,
-        total_cents: 306000,
-        payment_status: 'PAID',
-        change_due_cents: 94000,
-        created_at: Date.now(),
-      },
-      sampleItems,
-      sampleMods,
-      [{ method: 'CASH', amount_cents: 400000 }],
-      { title: 'TEST RECEIPT', printedAt: Date.now(), copyIndex: 0, totalCopies: 1 }
-    );
-    await printHtml(html, defaultPrinter?.name);
-    return { queued: true, jobId: `test_${Date.now()}` };
-  });
-
-  ipcMain.handle('print:kitchen-ticket', async (_e, payload) => {
-    const p = (payload ?? {}) as { orderId?: unknown };
-    const orderId = String(p.orderId ?? '');
-    if (!orderId) return { queued: false, error: 'missing orderId' };
-    if (!posWin || posWin.isDestroyed()) return { queued: false, error: 'no window' };
-    if (!repos) return { queued: false, error: 'db not ready' };
-
-    const order = repos.orders.getById(orderId);
-    if (!order) return { queued: false, error: 'order not found' };
-
-    const items = repos.orderItems.listByOrderId(orderId);
-    const modifiers = repos.orderItemModifierOptions.listByOrderId(orderId);
-    const printers = await posWin.webContents.getPrintersAsync();
-    const defaultPrinter = printers.find((pr) => (pr as any).isDefault) ?? printers[0];
-
-    const html = buildKitchenTicketHtml(order, items, modifiers, { printedAt: Date.now() });
-    await printHtml(html, defaultPrinter?.name);
-    return { queued: true, orderId, jobId: `ktn_${orderId}_${Date.now()}` };
-  });
-
-  ipcMain.handle('print:receipt', async (_e, payload) => {
-    const p = (payload ?? {}) as { orderId?: unknown; copy?: unknown };
-    const orderId = String(p.orderId ?? '');
-    const copies = Math.max(1, Math.min(5, Number(p.copy ?? 1)));
-    if (!orderId) return { queued: false, error: 'missing orderId' };
-    if (!posWin || posWin.isDestroyed()) return { queued: false, error: 'no window' };
-    if (!repos) return { queued: false, error: 'db not ready' };
-
-    const order = repos.orders.getById(orderId);
-    if (!order) return { queued: false, error: 'order not found' };
-
-    const items = repos.orderItems.listByOrderId(orderId);
-    const modifiers = repos.orderItemModifierOptions.listByOrderId(orderId);
-    const payments = repos.payments.listByOrderId(orderId);
-    const printers = await posWin.webContents.getPrintersAsync();
-    const defaultPrinter = printers.find((pr) => (pr as any).isDefault) ?? printers[0];
-    const printedAt = Date.now();
-    const header = resolveBranchHeader(order);
-
-    for (let i = 0; i < copies; i += 1) {
-      const title = i === 0 ? 'CUSTOMER COPY' : 'CASHIER COPY';
-      const html = buildReceiptHtml(order, items, modifiers, payments, {
-        title,
-        printedAt,
-        copyIndex: i,
-        totalCopies: copies,
-        header,
-      });
-      await printHtml(html, defaultPrinter?.name);
+  // All print handlers MUST swallow errors to avoid leaking printer exceptions
+  // into the payment-confirm toast catch path. Printer errors are logged but
+  // NEVER re-thrown; the payment-write success is independent of printer state.
+  safeHandle('print:list-printers', async () => {
+    try {
+      if (!posWin || posWin.isDestroyed()) return { printers: [] };
+      const printers = await posWin.webContents.getPrintersAsync();
+      return { printers: printers ?? [] };
+    } catch (e: any) {
+      return { printers: [], error: e?.message || 'list printers failed' };
     }
+  });
 
-    return { queued: true, orderId, copies, jobId: `rcpt_${orderId}_${Date.now()}` };
+  safeHandle('print:queue-status', async () => {
+    try {
+      return { queued: 0, inProgress: 0, failed: 0 };
+    } catch (e: any) {
+      return { queued: 0, inProgress: 0, failed: 0, error: e?.message || 'queue-status failed' };
+    }
+  });
+
+  safeHandle('print:test-page', async () => {
+    try {
+      if (!posWin || posWin.isDestroyed()) return { queued: false, error: 'no window' };
+      const printers = await posWin.webContents.getPrintersAsync();
+      const defaultPrinter = printers.find((p) => (p as any).isDefault) ?? printers[0];
+      const sampleItems = [
+        { id: 't1', name_snapshot: 'Jollof Rice with Chicken', quantity: 1, price_snapshot_cents: 250000, total_cents: 250000 },
+        { id: 't2', name_snapshot: 'Bottle Water', quantity: 2, price_snapshot_cents: 20000, total_cents: 40000, special_instructions: 'Cold please' },
+      ];
+      const sampleMods = [
+        { order_item_id: 't1', modifier_name: 'Protein', option_name: 'Extra Chicken', price_delta_cents: 0 },
+      ];
+      const html = buildReceiptHtml(
+        {
+          order_number: 'TEST-001',
+          order_type: 'DINE_IN',
+          table_id: 'T1',
+          table_name: 'VIP 1',
+          customer_name: 'Demo Guest',
+          subtotal_cents: 290000,
+          discount_cents: 10000,
+          tax_cents: 21000,
+          tip_cents: 5000,
+          total_cents: 306000,
+          payment_status: 'PAID',
+          change_due_cents: 94000,
+          created_at: Date.now(),
+        },
+        sampleItems,
+        sampleMods,
+        [{ method: 'CASH', amount_cents: 400000 }],
+        { title: 'TEST RECEIPT', printedAt: Date.now(), copyIndex: 0, totalCopies: 1 }
+      );
+      const res = await printHtml(html, defaultPrinter?.name);
+      if (!res.success) return { queued: false, error: res.error || 'test page print failed' };
+      return { queued: true, jobId: `test_${Date.now()}` };
+    } catch (e: any) {
+      return { queued: false, error: e?.message || 'test-page unexpected error' };
+    }
+  });
+
+  safeHandle('print:kitchen-ticket', async (_e, payload) => {
+    try {
+      const p = (payload ?? {}) as { orderId?: unknown };
+      const orderId = String(p.orderId ?? '');
+      if (!orderId) return { queued: false, error: 'missing orderId' };
+      if (!posWin || posWin.isDestroyed()) return { queued: false, error: 'no window' };
+      if (!repos) return { queued: false, error: 'db not ready' };
+
+      const order = repos.orders.getById(orderId);
+      if (!order) return { queued: false, error: 'order not found' };
+
+      const items = repos.orderItems.listByOrderId(orderId);
+      const modifiers = repos.orderItemModifierOptions.listByOrderId(orderId);
+      const printers = await posWin.webContents.getPrintersAsync();
+      const defaultPrinter = printers.find((pr) => (pr as any).isDefault) ?? printers[0];
+
+      const html = buildKitchenTicketHtml(order, items, modifiers, { printedAt: Date.now() });
+      const res = await printHtml(html, defaultPrinter?.name);
+      if (!res.success) return { queued: false, error: res.error || 'kitchen ticket print failed' };
+      return { queued: true, orderId, jobId: `ktn_${orderId}_${Date.now()}` };
+    } catch (e: any) {
+      return { queued: false, error: e?.message || 'kitchen-ticket unexpected error' };
+    }
+  });
+
+  safeHandle('print:receipt', async (_e, payload) => {
+    try {
+      const p = (payload ?? {}) as { orderId?: unknown; copy?: unknown };
+      const orderId = String(p.orderId ?? '');
+      const copies = Math.max(1, Math.min(5, Number(p.copy ?? 1)));
+      if (!orderId) return { queued: false, error: 'missing orderId' };
+      if (!posWin || posWin.isDestroyed()) return { queued: false, error: 'no window' };
+      if (!repos) return { queued: false, error: 'db not ready' };
+
+      const order = repos.orders.getById(orderId);
+      if (!order) return { queued: false, error: 'order not found' };
+
+      const items = repos.orderItems.listByOrderId(orderId);
+      const modifiers = repos.orderItemModifierOptions.listByOrderId(orderId);
+      const payments = repos.payments.listByOrderId(orderId);
+      const printers = await posWin.webContents.getPrintersAsync();
+      const defaultPrinter = printers.find((pr) => (pr as any).isDefault) ?? printers[0];
+      const printedAt = Date.now();
+      const header = resolveBranchHeader(order);
+
+      let lastError: string | undefined;
+      for (let i = 0; i < copies; i += 1) {
+        const title = i === 0 ? 'CUSTOMER COPY' : 'CASHIER COPY';
+        const html = buildReceiptHtml(order, items, modifiers, payments, {
+          title,
+          printedAt,
+          copyIndex: i,
+          totalCopies: copies,
+          header,
+        });
+        const res = await printHtml(html, defaultPrinter?.name);
+        if (!res.success) lastError = res.error || `copy ${i + 1} print failed`;
+      }
+
+      if (lastError) {
+        // If any copy failed, report it but still mark the handler as non-throwing.
+        // The payment DID record; only printing partially failed.
+        return {
+          queued: false,
+          partial: true,
+          orderId,
+          copies,
+          error: lastError,
+          jobId: `rcpt_${orderId}_${Date.now()}`,
+        };
+      }
+      return { queued: true, orderId, copies, jobId: `rcpt_${orderId}_${Date.now()}` };
+    } catch (e: any) {
+      return { queued: false, error: e?.message || 'print-receipt unexpected error' };
+    }
   });
 }
 
@@ -1105,11 +1247,41 @@ function toCentsFromNaira(value: unknown): number | null {
 function toCustomerOrderPreview(input: any): any | null {
   if (!input || typeof input !== 'object') return null;
 
+  // Pass-through fields that are ALWAYS preserved verbatim, no matter which
+  // branch below rebuilds the preview object. These are:
+  //   - bankDetails             (user strict rule: always show on CD regardless of payment method)
+  //   - paymentMethodLabel      (human label with emoji, e.g. "💵 Cash Paid")
+  //   - tenderedCents / changeDueCents  (CASH-only tender/change lines on ThankYou)
+  //   - orderStatus             (5-step pillar Received/Accepted/Preparing/Ready/Served)
+  // These are copied in via spread at each branch return site to keep the
+  // pipeline DRY. Branch 1 (exact verbatim pass-through) already keeps them.
+  const passthroughExtraFields = () => {
+    const out: Record<string, any> = {};
+    const preserveKeys = [
+      'bankDetails',
+      'bank_details',
+      'paymentMethodLabel',
+      'tenderedCents',
+      'tendered',
+      'changeDueCents',
+      'change',
+      'orderStatus',
+      'paidAt',
+    ];
+    for (const k of preserveKeys) {
+      if (Object.prototype.hasOwnProperty.call(input, k)) out[k] = input[k];
+    }
+    return out;
+  };
+
   if (
     typeof input.orderNumber === 'string' &&
     Array.isArray(input.lines) &&
     typeof input.totalCents === 'number'
   ) {
+    // Fast path: input already matches the new CustomerOrderPreview shape.
+    // Return as-is so the renderer receives every injected field
+    // (bankDetails, paymentMethodLabel, etc.) intact.
     return input;
   }
 
@@ -1131,9 +1303,7 @@ function toCustomerOrderPreview(input: any): any | null {
       totalCents,
       paymentStatus:
         typeof input.paymentStatus === 'string' ? input.paymentStatus : undefined,
-      orderStatus:
-        typeof input.orderStatus === 'string' ? input.orderStatus : undefined,
-      paidAt: typeof input.paidAt === 'number' ? input.paidAt : undefined,
+      ...passthroughExtraFields(),
     };
   }
 
@@ -1181,8 +1351,9 @@ function toCustomerOrderPreview(input: any): any | null {
       discountCents: toCentsFromNaira(input.discountAmount) ?? 0,
       taxCents: toCentsFromNaira(input.taxAmount) ?? 0,
       totalCents,
-      paymentStatus: 'PAID',
-      paidAt: Date.now(),
+      paymentStatus: typeof input.paymentStatus === 'string' ? input.paymentStatus : 'PAID',
+      paidAt: typeof input.paidAt === 'number' ? input.paidAt : Date.now(),
+      ...passthroughExtraFields(),
     };
   }
 
@@ -1209,14 +1380,52 @@ safeHandle('customer:show-paid', (_e, order) => {
   return { sent: true };
 });
 
-safeHandle('customer:get-branding', () => ({
-  name: 'Prolific POS',
-  tagline: 'Thanks for dining with us',
-  logoUrl: '',
-  wifi: '',
-  openingHours: '',
-  branchName: '',
-}));
+safeHandle('customer:get-branding', () => {
+  // Hardcoded defaults — the CustomerDisplayApp merges these over its baked-in
+  // branding. Additionally, we read the LATEST cached branch-scoped bank
+  // details from the SQLite settings table (written by the POS cart poller
+  // every time /public/customer-display-settings succeeds). This ensures the
+  // branding fallback always has bank details even when CartPanel hasn't
+  // populated the order-preview-level copy for the current cart.
+  const base: Record<string, any> = {
+    name: 'Prolific POS',
+    tagline: 'Thanks for dining with us',
+    logoUrl: '',
+    wifi: '',
+    openingHours: '',
+    branchName: '',
+  };
+  try {
+    if (repos && repos.settings && typeof repos.settings.getAllByScope === 'function') {
+      const rows = repos.settings.getAllByScope('BRANCH', {});
+      const allRows = Array.isArray(rows) ? rows : [];
+      for (const r of allRows) {
+        const rAny: any = r;
+        const key = typeof rAny.key === 'string' ? rAny.key : '';
+        if (key.startsWith('bank_details:')) {
+          const val = rAny.value ?? rAny.settings_value;
+          if (val && typeof val === 'object') {
+            base.bankDetails = val;
+            break;
+          }
+          if (typeof val === 'string' && val.length) {
+            try {
+              const parsed = JSON.parse(val);
+              if (parsed && typeof parsed === 'object') {
+                base.bankDetails = parsed;
+                break;
+              }
+            } catch { /* string not JSON, skip */ }
+          }
+        }
+      }
+    }
+  } catch (_e) {
+    // Swallow — branding lookup is best-effort; CustomerDisplayApp falls back
+    // to the promo poller cache and finally to the order-preview-level copy.
+  }
+  return base;
+});
 
 safeHandle('shift:open', (_e, data) => ({ success: true, shift: data }));
 safeHandle('shift:close', (_e, data) => ({ success: true, shift: data }));

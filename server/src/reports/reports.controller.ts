@@ -83,6 +83,7 @@ export class ReportsController {
       dateFrom: string;
       dateTo: string;
       branchId?: string;
+      sourceChannel?: string;
       basis?: 'payments' | 'orders';
       cursor?: string;
       limit?: string;
@@ -96,6 +97,7 @@ export class ReportsController {
       basis: query.basis,
     };
     if (query.branchId) filters.branchId = query.branchId;
+    if (query.sourceChannel) filters.sourceChannel = query.sourceChannel;
     if (query.cursor) filters.cursor = query.cursor;
     if (query.limit) filters.limit = parseInt(query.limit, 10);
     return this.reportsService.getSalesReport(user, filters);

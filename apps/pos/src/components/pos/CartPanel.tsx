@@ -130,24 +130,52 @@ export default function CartPanel() {
 
       if (cancelPreview) return;
 
+      // Build preview lines with proper modifier resolution (no more undefined
+      // modifierMap symbol). Uses the same safe pattern as PaymentModal.tsx
+      // confirm-flow preview builder: per-line fetch menuModifiers.listForItemId
+      // so the ActiveOrder live cart shows modifier pill names correctly, and
+      // a DB read failure only drops modifiers for that one line (never aborts
+      // the entire preview emit).
+      const previewLines: any[] = [];
+      for (const l of lines) {
+        let modDisplayNames: string[] = [];
+        if (l.modifiers && l.modifiers.length) {
+          try {
+            const fetchedMods = window.electronAPI?.db?.menuModifiers?.listForItemId
+              ? await window.electronAPI.db.menuModifiers.listForItemId(l.menuItem.id)
+              : [];
+            const itemModDefs = Array.isArray(fetchedMods) ? fetchedMods : [];
+            for (const sel of l.modifiers) {
+              const modDef = itemModDefs.find((m: any) => String(m.id) === String(sel.modifierId));
+              const optionNameById = new Map<string, string>();
+              for (const opt of modDef?.options ?? []) {
+                optionNameById.set(String(opt.id), opt.name || opt.label || String(opt.id));
+              }
+              for (const oid of sel.optionIds ?? []) {
+                const displayName = optionNameById.get(String(oid)) || String(oid);
+                modDisplayNames.push(displayName);
+              }
+            }
+          } catch {
+            // Swallow DB modifier read errors — the line still renders, just
+            // without modifier pill names (this mirrors PaymentModal behavior).
+          }
+        }
+        previewLines.push({
+          qty: l.quantity,
+          name: l.menuItem?.name ?? 'Item',
+          modifiers: modDisplayNames,
+          unitPriceCents: l.perUnitPriceCents,
+          totalCents: l.subtotalCents,
+        });
+      }
+
       const preview = {
         orderNumber: orderNumberRef.current,
         table: tableName || undefined,
         orderType: normalizedOrderType,
         customerName,
-        lines: lines.map((l) => {
-          const modifiers = (l.modifiers || []).flatMap((m) => {
-            const dict = modifierMap[m.modifierId] || {};
-            return (m.optionIds || []).map((oid) => dict[String(oid)] || String(oid));
-          });
-          return {
-            qty: l.quantity,
-            name: l.menuItem?.name ?? 'Item',
-            modifiers,
-            unitPriceCents: l.perUnitPriceCents,
-            totalCents: l.subtotalCents,
-          };
-        }),
+        lines: previewLines,
         subtotalCents: subtotal,
         discountCents: discount,
         taxCents: tax,
@@ -169,7 +197,7 @@ export default function CartPanel() {
       cancelPreview = true;
       clearTimeout(t);
     };
-  }, [branch, customer, discount, lines, modifierMap, orderType, subtotal, tableName, tax, total]);
+  }, [branch, customer, discount, lines, orderType, subtotal, tableName, tax, total]);
 
   const handleHold = async () => {
     if (lines.length === 0) return;

@@ -29,10 +29,12 @@ type Basis = 'PAYMENTS' | 'ORDERS';
 
 interface SalesRow {
   period: string;
+  periodLabel: string;
   startDate: string;
   endDate: string;
   orders: number;
-  customers: number;
+  voidCount: number;
+  refundCount: number;
   subtotal: number;
   tax: number;
   tips: number;
@@ -54,16 +56,78 @@ interface CashierRow {
   refundCount: number;
 }
 
+interface SalesSummary {
+  orderCount: number;
+  voidCount: number;
+  refundCount: number;
+  subtotalCents: number;
+  discountCents: number;
+  taxCents: number;
+  tipCents: number;
+  refundCents: number;
+  voidCents: number;
+  totalCents: number;
+  aovCents: number;
+}
+
+interface PaymentBreakdownRow {
+  method: string;
+  totalCents: number;
+  count: number;
+}
+
 const TABS: { value: GroupBy; label: string }[] = [
   { value: 'DAY', label: 'By Day' },
   { value: 'WEEK', label: 'By Week' },
   { value: 'MONTH', label: 'By Month' },
 ];
 
+const EMPTY_SUMMARY: SalesSummary = {
+  orderCount: 0,
+  voidCount: 0,
+  refundCount: 0,
+  subtotalCents: 0,
+  discountCents: 0,
+  taxCents: 0,
+  tipCents: 0,
+  refundCents: 0,
+  voidCents: 0,
+  totalCents: 0,
+  aovCents: 0,
+};
+
+const METHOD_LABELS: Record<string, string> = {
+  CASH: 'Cash',
+  CARD: 'Card',
+  BANK_TRANSFER: 'Bank Transfer',
+  ONLINE_PAYSTACK: 'Paystack',
+  ONLINE_FLUTTERWAVE: 'Flutterwave',
+  EXTERNAL: 'External',
+  OTHER: 'Other',
+};
+
+const METHOD_COLORS: Record<string, string> = {
+  CASH: 'bg-emerald-500',
+  CARD: 'bg-indigo-500',
+  BANK_TRANSFER: 'bg-sky-500',
+  ONLINE_PAYSTACK: 'bg-teal-500',
+  ONLINE_FLUTTERWAVE: 'bg-pink-500',
+  EXTERNAL: 'bg-amber-500',
+  OTHER: 'bg-slate-400',
+};
+
 function dateRangeToIso(dateFrom: string, dateTo: string): { fromIso: string; toIso: string } {
   const from = new Date(`${dateFrom}T00:00:00.000Z`);
   const to = new Date(`${dateTo}T23:59:59.999Z`);
   return { fromIso: from.toISOString(), toIso: to.toISOString() };
+}
+
+function methodLabel(m: string): string {
+  return METHOD_LABELS[m] || m;
+}
+
+function methodColor(m: string): string {
+  return METHOD_COLORS[m] || 'bg-slate-400';
 }
 
 export default function SalesReportPage() {
@@ -79,6 +143,8 @@ export default function SalesReportPage() {
   const [dateTo, setDateTo] = useState(() => new Date().toISOString().slice(0, 10));
   const [channel, setChannel] = useState('');
   const [rows, setRows] = useState<SalesRow[]>([]);
+  const [summary, setSummary] = useState<SalesSummary>(EMPTY_SUMMARY);
+  const [paymentBreakdown, setPaymentBreakdown] = useState<PaymentBreakdownRow[]>([]);
   const [cashierLoading, setCashierLoading] = useState(false);
   const [cashiers, setCashiers] = useState<CashierRow[]>([]);
   const [cashierSearch, setCashierSearch] = useState('');
@@ -92,27 +158,66 @@ export default function SalesReportPage() {
       params.set('dateTo', dateTo);
       params.set('basis', basis === 'ORDERS' ? 'orders' : 'payments');
       if (branch?.id) params.set('branchId', branch.id);
+      if (channel) params.set('sourceChannel', channel);
       const res: any = await apiGet(`/reports/sales?${params.toString()}`);
+
+      // Extract top-level summary and payment breakdown (new server contract)
+      const serverSummary: SalesSummary = res?.summary && typeof res.summary === 'object'
+        ? {
+            orderCount: Number(res.summary.orderCount ?? 0),
+            voidCount: Number(res.summary.voidCount ?? 0),
+            refundCount: Number(res.summary.refundCount ?? 0),
+            subtotalCents: Number(res.summary.subtotalCents ?? 0),
+            discountCents: Number(res.summary.discountCents ?? 0),
+            taxCents: Number(res.summary.taxCents ?? 0),
+            tipCents: Number(res.summary.tipCents ?? 0),
+            refundCents: Number(res.summary.refundCents ?? 0),
+            voidCents: Number(res.summary.voidCents ?? 0),
+            totalCents: Number(res.summary.totalCents ?? 0),
+            aovCents: Number(res.summary.aovCents ?? 0),
+          }
+        : EMPTY_SUMMARY;
+
+      const serverBreakdown: PaymentBreakdownRow[] = Array.isArray(res?.paymentBreakdown)
+        ? res.paymentBreakdown.map((b: any) => ({
+            method: String(b.method || 'OTHER'),
+            totalCents: Number(b.totalCents || 0),
+            count: Number(b.count || 0),
+          }))
+        : [];
+
       const serverRows: any[] = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : [];
+
+      setSummary(serverSummary);
+      setPaymentBreakdown(serverBreakdown);
       setRows(
-        serverRows.map((r: any) => ({
-          period: String(r.period || ''),
-          startDate: String(r.period || ''),
-          endDate: String(r.period || ''),
-          orders: Number(r.orderCount || 0),
-          customers: Number(r.orderCount || 0),
-          subtotal: Number(r.subtotalCents || 0),
-          tax: Number(r.taxCents || 0),
-          tips: 0,
-          discount: Number(r.discountCents || 0),
-          refunds: 0,
-          voids: 0,
-          total: Number(r.totalCents || 0),
-          aov: Number(r.aovCents || 0),
-        }))
+        serverRows.map((r: any) => {
+          const orderCount = Number(r.orderCount || 0);
+          const totalCents = Number(r.totalCents || 0);
+          return {
+            period: String(r.period || ''),
+            periodLabel: String(r.periodLabel || r.period || ''),
+            startDate: String(r.startDate || r.period || ''),
+            endDate: String(r.endDate || r.period || ''),
+            orders: orderCount,
+            voidCount: Number(r.voidCount || 0),
+            refundCount: Number(r.refundCount || 0),
+            subtotal: Number(r.subtotalCents || 0),
+            tax: Number(r.taxCents || 0),
+            tips: Number(r.tipCents || 0),
+            discount: Number(r.discountCents || 0),
+            refunds: Number(r.refundCents || 0),
+            voids: Number(r.voidCents || 0),
+            total: totalCents,
+            aov: Number(r.aovCents || (orderCount > 0 ? Math.round(totalCents / orderCount) : 0)),
+          };
+        })
       );
     } catch (err: any) {
       toast('Failed to load sales report', { description: err.message, variant: 'error' });
+      setSummary(EMPTY_SUMMARY);
+      setPaymentBreakdown([]);
+      setRows([]);
     } finally {
       setLoading(false);
     }
@@ -150,27 +255,8 @@ export default function SalesReportPage() {
   useEffect(() => { fetchReport(); }, [branch?.id, groupBy, dateFrom, dateTo, channel, basis]);
   useEffect(() => { fetchCashiers(); }, [dateFrom, dateTo, basis]);
 
-  const totals = useMemo(() => {
-    const t = {
-      orders: 0, customers: 0, subtotal: 0, tax: 0, tips: 0,
-      discount: 0, refunds: 0, voids: 0, total: 0,
-    };
-    rows.forEach((r) => {
-      t.orders += r.orders;
-      t.customers += r.customers;
-      t.subtotal += r.subtotal;
-      t.tax += r.tax;
-      t.tips += r.tips;
-      t.discount += r.discount;
-      t.refunds += r.refunds;
-      t.voids += r.voids;
-      t.total += r.total;
-    });
-    return { ...t, aov: t.orders ? Math.round(t.total / t.orders) : 0 };
-  }, [rows]);
-
   const chartData = rows.map((r) => ({
-    period: r.period,
+    period: r.periodLabel || r.period,
     Sales: r.total / 100,
     Orders: r.orders,
     AOV: r.aov / 100,
@@ -194,13 +280,46 @@ export default function SalesReportPage() {
     return sorted.slice(0, 5);
   }, [filteredCashiers]);
 
+  const paymentBreakdownTotal = useMemo(
+    () => paymentBreakdown.reduce((sum, b) => sum + Number(b.totalCents || 0), 0),
+    [paymentBreakdown]
+  );
+
   const exportCSV = () => {
-    const headers = ['Period', 'Orders', 'Customers', 'Subtotal', 'Tax', 'Tips', 'Discount', 'Refunds', 'Voids', 'Total', 'AOV'];
+    const headers = [
+      'Period', 'Period Label', 'Start Date', 'End Date',
+      'Orders', 'Void Count', 'Refund Count',
+      'Subtotal', 'Tax', 'Tips', 'Discount',
+      'Refunds', 'Voids', 'Total', 'AOV',
+    ];
     const data = rows.map((r) => [
-      r.period, r.orders, r.customers,
-      r.subtotal / 100, r.tax / 100, r.tips / 100, r.discount / 100, r.refunds / 100, r.voids / 100, r.total / 100, r.aov / 100,
+      r.period, r.periodLabel, r.startDate, r.endDate,
+      r.orders, r.voidCount, r.refundCount,
+      (r.subtotal / 100).toFixed(2),
+      (r.tax / 100).toFixed(2),
+      (r.tips / 100).toFixed(2),
+      (r.discount / 100).toFixed(2),
+      (r.refunds / 100).toFixed(2),
+      (r.voids / 100).toFixed(2),
+      (r.total / 100).toFixed(2),
+      (r.aov / 100).toFixed(2),
     ]);
-    const csv = [headers, ...data].map((row) => row.map((c) => `"${c}"`).join(',')).join('\n');
+    // Append a summary row at the bottom
+    const summaryRow = [
+      'GRAND TOTAL', `(${dateFrom} to ${dateTo})`, dateFrom, dateTo,
+      summary.orderCount, summary.voidCount, summary.refundCount,
+      (summary.subtotalCents / 100).toFixed(2),
+      (summary.taxCents / 100).toFixed(2),
+      (summary.tipCents / 100).toFixed(2),
+      (summary.discountCents / 100).toFixed(2),
+      (summary.refundCents / 100).toFixed(2),
+      (summary.voidCents / 100).toFixed(2),
+      (summary.totalCents / 100).toFixed(2),
+      (summary.aovCents / 100).toFixed(2),
+    ];
+    const csv = [headers, ...data, summaryRow]
+      .map((row) => row.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(','))
+      .join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -210,19 +329,25 @@ export default function SalesReportPage() {
   };
 
   const copySummary = async () => {
+    const channelLabel = channel ? `Channel: ${channel}` : 'Channel: All';
     const text = [
       `Sales Report (${TABS.find((t) => t.value === groupBy)?.label})`,
       `Period: ${dateFrom} to ${dateTo}`,
+      `Basis: ${basis === 'ORDERS' ? 'Order Date' : 'Payment Date'}`,
+      channelLabel,
       '',
-      `Orders: ${formatNumber(totals.orders)}`,
-      `Customers: ${formatNumber(totals.customers)}`,
-      `Net Sales: ${formatNGN(totals.total)}`,
-      `Tax: ${formatNGN(totals.tax)}`,
-      `Tips: ${formatNGN(totals.tips)}`,
-      `Discounts: ${formatNGN(totals.discount)}`,
-      `Refunds: ${formatNGN(totals.refunds)}`,
-      `Voids: ${formatNGN(totals.voids)}`,
-      `Avg Order Value: ${formatNGN(totals.aov)}`,
+      `Orders: ${formatNumber(summary.orderCount)}`,
+      `Voids: ${formatNumber(summary.voidCount)}`,
+      `Refunds: ${formatNumber(summary.refundCount)}`,
+      '',
+      `Net Sales: ${formatNGN(summary.totalCents)}`,
+      `Subtotal: ${formatNGN(summary.subtotalCents)}`,
+      `Tax: ${formatNGN(summary.taxCents)}`,
+      `Tips: ${formatNGN(summary.tipCents)}`,
+      `Discounts: -${formatNGN(summary.discountCents)}`,
+      `Void Dollars: -${formatNGN(summary.voidCents)}`,
+      `Refund Dollars: -${formatNGN(summary.refundCents)}`,
+      `Avg Order Value: ${formatNGN(summary.aovCents)}`,
     ].join('\n');
     try {
       await navigator.clipboard.writeText(text);
@@ -233,19 +358,40 @@ export default function SalesReportPage() {
   };
 
   const columns: Column<SalesRow>[] = [
-    { key: 'period', title: 'Period', className: 'font-semibold text-slate-900 whitespace-nowrap', render: (r) => (
-      <div>
-        <div className="font-semibold text-slate-900">{r.period}</div>
-        <div className="text-[11px] text-slate-400 font-mono">{r.startDate}</div>
-      </div>
-    ) },
+    {
+      key: 'period',
+      title: 'Period',
+      className: 'font-semibold text-slate-900 whitespace-nowrap',
+      render: (r) => (
+        <div>
+          <div className="font-semibold text-slate-900">{r.periodLabel || r.period}</div>
+          <div className="text-[11px] text-slate-400 font-mono">
+            {r.startDate && r.endDate && r.startDate !== r.endDate
+              ? `${r.startDate} → ${r.endDate}`
+              : r.startDate || r.period}
+          </div>
+        </div>
+      ),
+    },
     { key: 'orders', title: 'Orders', className: 'tabular-nums text-right', render: (r) => formatNumber(r.orders) },
-    { key: 'customers', title: 'Customers', className: 'tabular-nums text-right', render: (r) => formatNumber(r.customers) },
+    {
+      key: 'voidCount',
+      title: 'Voids',
+      className: 'tabular-nums text-right',
+      render: (r) => (r.voidCount > 0 ? <span className="text-red-600 font-semibold">{formatNumber(r.voidCount)}</span> : '—'),
+    },
+    {
+      key: 'refundCount',
+      title: 'Refunds',
+      className: 'tabular-nums text-right',
+      render: (r) => (r.refundCount > 0 ? <span className="text-red-600 font-semibold">{formatNumber(r.refundCount)}</span> : '—'),
+    },
     { key: 'subtotal', title: 'Subtotal', className: 'tabular-nums text-right text-slate-700', render: (r) => formatNGN(r.subtotal) },
     { key: 'tax', title: 'Tax', className: 'tabular-nums text-right text-slate-500', render: (r) => formatNGN(r.tax) },
     { key: 'tips', title: 'Tips', className: 'tabular-nums text-right text-emerald-600', render: (r) => r.tips > 0 ? formatNGN(r.tips) : '—' },
     { key: 'discount', title: 'Discount', className: 'tabular-nums text-right text-amber-600', render: (r) => r.discount > 0 ? `-${formatNGN(r.discount)}` : '—' },
-    { key: 'refunds', title: 'Refunds', className: 'tabular-nums text-right text-red-600', render: (r) => r.refunds > 0 ? `-${formatNGN(r.refunds)}` : '—' },
+    { key: 'refunds', title: 'Refund $', className: 'tabular-nums text-right text-red-600', render: (r) => r.refunds > 0 ? `-${formatNGN(r.refunds)}` : '—' },
+    { key: 'voids', title: 'Void $', className: 'tabular-nums text-right text-red-600', render: (r) => r.voids > 0 ? `-${formatNGN(r.voids)}` : '—' },
     { key: 'total', title: 'Net Sales', className: 'tabular-nums text-right font-bold text-slate-900', render: (r) => formatNGN(r.total) },
     { key: 'aov', title: 'AOV', className: 'tabular-nums text-right text-slate-600', render: (r) => formatNGN(r.aov) },
   ];
@@ -281,8 +427,66 @@ export default function SalesReportPage() {
         return aov > 0 ? formatNGN(aov) : '—';
       },
     },
-    { key: 'voidCount', title: 'Voids', className: 'tabular-nums text-right text-slate-600', render: (r) => formatNumber(r.voidCount) },
-    { key: 'refundCount', title: 'Refunds', className: 'tabular-nums text-right text-slate-600', render: (r) => formatNumber(r.refundCount) },
+    { key: 'voidCount', title: 'Voids', className: 'tabular-nums text-right text-red-600 font-semibold', render: (r) => r.voidCount > 0 ? formatNumber(r.voidCount) : '—' },
+    { key: 'refundCount', title: 'Refunds', className: 'tabular-nums text-right text-red-600 font-semibold', render: (r) => r.refundCount > 0 ? formatNumber(r.refundCount) : '—' },
+  ];
+
+  // Professional KPI card config — backed by server summary (full date-range, not paginated)
+  const kpiCards = [
+    {
+      label: 'Orders',
+      value: formatNumber(summary.orderCount),
+      sub: summary.voidCount > 0 || summary.refundCount > 0
+        ? `${formatNumber(summary.voidCount)} voids · ${formatNumber(summary.refundCount)} refunds`
+        : null,
+      tone: 'text-brand-700',
+      accent: 'bg-brand-50',
+    },
+    {
+      label: 'Voids',
+      value: formatNumber(summary.voidCount),
+      sub: summary.voidCents > 0 ? `${formatNGN(summary.voidCents)} voided` : null,
+      tone: summary.voidCount > 0 ? 'text-red-700' : 'text-slate-500',
+      accent: 'bg-red-50',
+    },
+    {
+      label: 'Refunds',
+      value: formatNumber(summary.refundCount),
+      sub: summary.refundCents > 0 ? `${formatNGN(summary.refundCents)} refunded` : null,
+      tone: summary.refundCount > 0 ? 'text-red-700' : 'text-slate-500',
+      accent: 'bg-red-50',
+    },
+    {
+      label: 'Subtotal',
+      value: formatNGN(summary.subtotalCents),
+      tone: 'text-slate-800',
+      accent: 'bg-slate-50',
+    },
+    {
+      label: 'Tax',
+      value: formatNGN(summary.taxCents),
+      tone: 'text-slate-600',
+      accent: 'bg-slate-50',
+    },
+    {
+      label: 'Tips',
+      value: formatNGN(summary.tipCents),
+      tone: summary.tipCents > 0 ? 'text-emerald-700' : 'text-slate-500',
+      accent: 'bg-emerald-50',
+    },
+    {
+      label: 'Discounts',
+      value: summary.discountCents > 0 ? `-${formatNGN(summary.discountCents)}` : '—',
+      tone: summary.discountCents > 0 ? 'text-amber-700' : 'text-slate-500',
+      accent: 'bg-amber-50',
+    },
+    {
+      label: 'Net Sales',
+      value: formatNGN(summary.totalCents),
+      sub: `AOV ${formatNGN(summary.aovCents)}`,
+      tone: 'text-brand-700 font-bold',
+      accent: 'bg-brand-50',
+    },
   ];
 
   return (
@@ -295,7 +499,9 @@ export default function SalesReportPage() {
             <span>{branch?.name || 'All Branches'}</span>
           </div>
           <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight mt-1.5">Sales Report</h1>
-          <p className="text-sm text-slate-500 mt-1">Revenue breakdown, volume trends, and average order value</p>
+          <p className="text-sm text-slate-500 mt-1">
+            Revenue breakdown, voids/refunds, payment mix, and staff performance
+          </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <Button variant="outline" onClick={copySummary}>
@@ -358,6 +564,7 @@ export default function SalesReportPage() {
                 { value: 'QR', label: 'QR Order' },
                 { value: 'WEBSITE', label: 'Website' },
                 { value: 'APP', label: 'App' },
+                { value: 'PHONE', label: 'Phone' },
               ]}
               value={channel}
               onChange={(e) => setChannel(e.target.value)}
@@ -369,24 +576,72 @@ export default function SalesReportPage() {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-px bg-slate-100">
-          {[
-            { label: 'Orders', value: formatNumber(totals.orders), tone: 'text-brand-700', accent: 'bg-brand-50' },
-            { label: 'Customers', value: formatNumber(totals.customers), tone: 'text-slate-700', accent: 'bg-slate-50' },
-            { label: 'Subtotal', value: formatNGN(totals.subtotal), tone: 'text-slate-800', accent: 'bg-slate-50' },
-            { label: 'Tax', value: formatNGN(totals.tax), tone: 'text-slate-600', accent: 'bg-slate-50' },
-            { label: 'Tips', value: formatNGN(totals.tips), tone: 'text-emerald-700', accent: 'bg-emerald-50' },
-            { label: 'Discounts', value: `-${formatNGN(totals.discount)}`, tone: 'text-amber-700', accent: 'bg-amber-50' },
-            { label: 'Refunds/Voids', value: `-${formatNGN(totals.refunds + totals.voids)}`, tone: 'text-red-700', accent: 'bg-red-50' },
-            { label: 'Net Sales', value: formatNGN(totals.total), tone: 'text-brand-700 font-bold', accent: 'bg-brand-50' },
-          ].map((kpi) => (
+        {/* KPI grid backed by server summary — correct for full date range, not paginated */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-4 xl:grid-cols-8 gap-px bg-slate-100">
+          {kpiCards.map((kpi) => (
             <div key={kpi.label} className={cn('px-4 py-3 bg-white', kpi.accent && `!${kpi.accent}`)}>
               <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">{kpi.label}</div>
               <div className={cn('mt-1 text-lg tabular-nums truncate', kpi.tone)}>{kpi.value}</div>
+              {kpi.sub && (
+                <div className="mt-0.5 text-[10px] text-slate-500 tabular-nums truncate">{kpi.sub}</div>
+              )}
             </div>
           ))}
         </div>
       </Card>
+
+      {/* Payment Method Mix — professional breakdown section */}
+      {paymentBreakdown.length > 0 && (
+        <Card>
+          <CardHeader padded>
+            <div className="flex flex-wrap items-start justify-between gap-3 w-full">
+              <div>
+                <CardTitle>Payment Method Mix</CardTitle>
+                <p className="text-sm text-slate-500 mt-0.5">
+                  Total collected: <span className="font-semibold text-slate-900">{formatNGN(paymentBreakdownTotal)}</span>
+                  {' · '}
+                  {formatNumber(paymentBreakdown.reduce((s, b) => s + Number(b.count || 0), 0))} payments
+                </p>
+              </div>
+              <Badge variant="soft">
+                {channel || 'All Channels'} · {basis === 'ORDERS' ? 'Order Basis' : 'Payment Basis'}
+              </Badge>
+            </div>
+          </CardHeader>
+          <div className="px-5 pb-5">
+            {/* Progress-bar style method breakdown */}
+            <div className="space-y-2.5">
+              {paymentBreakdown.map((b) => {
+                const total = paymentBreakdownTotal || 1;
+                const pct = Math.max(0, Math.min(100, Math.round((Number(b.totalCents || 0) / total) * 100)));
+                return (
+                  <div key={b.method} className="group">
+                    <div className="flex items-center justify-between mb-1">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className={cn('inline-block h-2.5 w-2.5 rounded-full shrink-0', methodColor(b.method))} />
+                        <span className="text-sm font-semibold text-slate-800 truncate">{methodLabel(b.method)}</span>
+                        <span className="text-xs text-slate-400 tabular-nums shrink-0">
+                          {formatNumber(b.count)} txn
+                        </span>
+                      </div>
+                      <div className="text-right shrink-0 ml-3">
+                        <span className="text-sm font-semibold text-slate-900 tabular-nums">{formatNGN(b.totalCents)}</span>
+                        <span className="ml-2 text-xs text-slate-500 tabular-nums w-10 inline-block text-right">{pct}%</span>
+                      </div>
+                    </div>
+                    <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+                      <div
+                        className={cn('h-full rounded-full transition-all duration-500', methodColor(b.method))}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </Card>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card>
@@ -441,33 +696,73 @@ export default function SalesReportPage() {
         <CardHeader padded className="flex-wrap gap-3">
           <div>
             <CardTitle>Period Breakdown</CardTitle>
-            <p className="text-sm text-slate-500 mt-0.5">{formatNumber(rows.length)} periods shown</p>
+            <p className="text-sm text-slate-500 mt-0.5">
+              {formatNumber(rows.length)} periods shown · Void and refund counts reflect actual data
+            </p>
           </div>
-          <Badge variant="soft">{dateFrom} → {dateTo}</Badge>
+          <div className="flex items-center gap-2 flex-wrap">
+            <Badge variant="soft">{dateFrom} → {dateTo}</Badge>
+            {channel && <Badge variant="outline">Channel: {channel}</Badge>}
+          </div>
         </CardHeader>
         <div className="border-t border-slate-100">
           <DataTable
             columns={columns}
             data={rows}
-            rowKey={(r) => r.period + r.startDate}
+            rowKey={(r) => `${r.period}_${r.startDate}_${r.endDate}`}
             loading={loading}
-            emptyText="No data for selected period"
+            emptyText="No sales data for selected filters"
           />
         </div>
+        {/* Grand summary footer — uses server summary, not paginated rows */}
         <div className="px-5 py-4 border-t border-slate-200 bg-slate-50/60 flex flex-wrap items-center gap-4 text-sm">
           <div className="flex-1 flex flex-wrap gap-x-6 gap-y-2">
-            <span><span className="text-slate-500">Total Orders:</span> <span className="font-semibold text-slate-900 tabular-nums">{formatNumber(totals.orders)}</span></span>
-            <span><span className="text-slate-500">Customers:</span> <span className="font-semibold text-slate-900 tabular-nums">{formatNumber(totals.customers)}</span></span>
-            <span><span className="text-slate-500">Gross Subtotal:</span> <span className="font-semibold text-slate-900 tabular-nums">{formatNGN(totals.subtotal + totals.tax + totals.tips)}</span></span>
-            <span><span className="text-slate-500">Deductions:</span> <span className="font-semibold text-red-700 tabular-nums">-{formatNGN(totals.discount + totals.refunds + totals.voids)}</span></span>
-            <span><span className="text-slate-500">Net Revenue:</span> <span className="font-bold text-brand-700 tabular-nums text-base">{formatNGN(totals.total)}</span></span>
+            <span>
+              <span className="text-slate-500">Total Orders:</span>{' '}
+              <span className="font-semibold text-slate-900 tabular-nums">{formatNumber(summary.orderCount)}</span>
+            </span>
+            {summary.voidCount > 0 && (
+              <span>
+                <span className="text-slate-500">Voids:</span>{' '}
+                <span className="font-semibold text-red-700 tabular-nums">{formatNumber(summary.voidCount)}</span>
+              </span>
+            )}
+            {summary.refundCount > 0 && (
+              <span>
+                <span className="text-slate-500">Refunds:</span>{' '}
+                <span className="font-semibold text-red-700 tabular-nums">{formatNumber(summary.refundCount)}</span>
+              </span>
+            )}
+            <span>
+              <span className="text-slate-500">Gross Subtotal:</span>{' '}
+              <span className="font-semibold text-slate-900 tabular-nums">
+                {formatNGN(summary.subtotalCents + summary.taxCents + summary.tipCents)}
+              </span>
+            </span>
+            <span>
+              <span className="text-slate-500">Deductions:</span>{' '}
+              <span className="font-semibold text-red-700 tabular-nums">
+                -{formatNGN(summary.discountCents + summary.refundCents + summary.voidCents)}
+              </span>
+            </span>
+            <span>
+              <span className="text-slate-500">Net Revenue:</span>{' '}
+              <span className="font-bold text-brand-700 tabular-nums text-base">
+                {formatNGN(summary.totalCents)}
+              </span>
+            </span>
+            <span>
+              <span className="text-slate-500">AOV:</span>{' '}
+              <span className="font-semibold text-slate-900 tabular-nums">{formatNGN(summary.aovCents)}</span>
+            </span>
           </div>
         </div>
       </Card>
 
       <Card>
-        <CardHeader>
+        <CardHeader padded>
           <CardTitle>Staff Performance</CardTitle>
+          <p className="text-sm text-slate-500 mt-0.5">Ranked by payments collected</p>
         </CardHeader>
         <div className="px-5 pb-5">
           <div className="flex flex-col sm:flex-row sm:items-center gap-2 mb-3">
@@ -484,9 +779,14 @@ export default function SalesReportPage() {
 
           {topCashiers.length > 0 && (
             <div className="mb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
-              {topCashiers.map((c) => (
-                <div key={c.employeeId} className="rounded-xl border border-slate-100 bg-white px-3.5 py-3">
-                  <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 truncate">
+              {topCashiers.map((c, i) => (
+                <div key={c.employeeId} className="rounded-xl border border-slate-100 bg-white px-3.5 py-3 relative">
+                  {i === 0 && (
+                    <span className="absolute top-2 right-2 inline-flex items-center gap-0.5 text-[10px] font-bold text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded-md">
+                      #1
+                    </span>
+                  )}
+                  <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 truncate pr-8">
                     {c.employeeName || '—'}
                   </div>
                   <div className="mt-1.5 text-sm font-semibold text-slate-900 tabular-nums">

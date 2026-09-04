@@ -50,7 +50,7 @@ export default function QRCodesPage() {
   const [showPreview, setShowPreview] = useState(false);
   const [printing, setPrinting] = useState(false);
   const [downloading, setDownloading] = useState(false);
-  const [regenerating, setRegenerating] = useState(false);
+  const [generatingMissing, setGeneratingMissing] = useState(false);
 
   // Resolve Website surface public URL once per render (stable — function has
   // localStorage + env + hostname chain internally, same as POS/api shims).
@@ -170,8 +170,9 @@ export default function QRCodesPage() {
         return;
       }
 
-      // Merge fresh tokens from server (regenerate-on-empty) into the list so
-      // the preview modal renders the exact same tokens the PDF will print.
+      // Merge tokens generated from server (generate-on-empty, never overwrite
+      // existing printed codes) into the list so the preview modal renders the
+      // exact same tokens the PDF will print.
       const now = new Date();
       const next: QRExtended[] = qrPacks.map((p) => ({
         id: `${p.token}`,
@@ -206,24 +207,24 @@ export default function QRCodesPage() {
     }
   };
 
-  const regenerateMissing = async () => {
+  const generateMissingQrs = async () => {
     const existingTableIds = new Set(codes.map((c) => sid(c.tableId)).filter(Boolean));
     const missingTables = tables.filter((t) => !existingTableIds.has(sid(t.id)));
     if (missingTables.length === 0) {
       toast('All tables already have QR codes', { variant: 'success' });
       return;
     }
-    setRegenerating(true);
+    setGeneratingMissing(true);
     try {
       await Promise.all(
         missingTables.map((t) => apiPost(`/qr-codes/tables/${encodeURIComponent(sid(t.id))}/regenerate`, {}))
       );
-      toast('QR codes generated', { description: `${missingTables.length} table(s) updated`, variant: 'success' });
+      toast('QR codes generated for new tables', { description: `${missingTables.length} table(s) now have a permanent QR code — print & tape to the table.`, variant: 'success' });
       fetchAll();
     } catch (err: any) {
       toast('Generate failed', { description: err.message, variant: 'error' });
     } finally {
-      setRegenerating(false);
+      setGeneratingMissing(false);
     }
   };
 
@@ -375,7 +376,7 @@ export default function QRCodesPage() {
           <p className="text-sm text-slate-500 mt-1">{formatNumber(filtered.length)} codes generated · {formatNumber(selected.length)} selected</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline" loading={regenerating} onClick={regenerateMissing}>
+          <Button variant="outline" loading={generatingMissing} onClick={generateMissingQrs}>
             Generate Missing
           </Button>
           <Button variant="secondary" loading={downloading} onClick={downloadPDF}>
@@ -401,7 +402,7 @@ export default function QRCodesPage() {
       </div>
 
       <Card>
-        <div className="px-5 py-4 border-b border-slate-100 grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="px-5 py-4 border-b border-slate-100 grid grid-cols-1 sm:grid-cols-2 gap-3">
           <Input
             placeholder="Search table or token..."
             value={search}
@@ -411,13 +412,6 @@ export default function QRCodesPage() {
             }
           />
           <Select options={ZONES} value={zoneFilter} onChange={(e) => setZoneFilter(e.target.value)} />
-          <Button variant="outline" onClick={fetchAll}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
-              <path d="M23 4v6h-6M1 20v-6h6" />
-              <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
-            </svg>
-            Refresh
-          </Button>
         </div>
         <DataTable
           columns={columns}

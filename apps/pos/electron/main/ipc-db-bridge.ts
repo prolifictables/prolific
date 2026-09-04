@@ -790,6 +790,36 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
     })
   );
 
+  // --- Orders visible for a shift: direct shift_id match OR implicit via
+  // payments INNER JOIN (repos.orders.listByShiftId uses the latter).
+  // Prefer the ShiftModal backend-level `db:payments:getShiftTotals` for
+  // reconciliation; this channel is used by the ShiftModal LEGACY fallback
+  // path when the getShiftTotals handler is unavailable on older installs.
+  ipcMain.handle(
+    'db:orders:listByShiftId',
+    wrap('db:orders:listByShiftId', (shiftId: unknown) => {
+      const id = String(shiftId ?? '');
+      const primary = repos.orders.listByShiftId(id, 2000);
+
+      // `repos.orders.listByShiftId` does INNER JOIN payments ON p.shift_id.
+      // That misses orders where order.shift_id is filled but no payment
+      // (e.g. ON_HOLD / PARTIALLY_PAID / held tabs). Augment with direct
+      // shift_id SELECT and dedupe by id. Generic SELECT cast via unknown
+      // first to satisfy TS's shape-sufficiency rule.
+      const direct = repos.db.all<{ id: string } & Record<string, unknown>>(
+        `SELECT * FROM orders WHERE COALESCE(shift_id, '') = ? ORDER BY created_at DESC LIMIT 2000`,
+        id
+      ) as unknown as typeof primary;
+      const seen = new Map<string, (typeof primary)[number]>();
+      for (const r of primary) seen.set(String(r.id), r);
+      for (const r of direct) {
+        const k = String(r.id);
+        if (!seen.has(k)) seen.set(k, r);
+      }
+      return Array.from(seen.values()).slice(0, 2000);
+    })
+  );
+
   ipcMain.handle(
     'db:orders:addItem',
     wrap('db:orders:addItem', (payload: unknown) => {
@@ -951,6 +981,30 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
     'db:payments:listByShiftId',
     wrap('db:payments:listByShiftId', (shiftId: unknown) => {
       return repos.payments.listByShiftId(String(shiftId ?? ''));
+    })
+  );
+
+  // Broad payment scan used by the ShiftModal LEGACY fallback when shift_id
+  // isn't set on rows (QR sync, Mark Paid later, first sale pre-open-shift).
+  // Signature mirrors orders.listRecent: 1 arg = limit, 2 args = (branchId, limit).
+  ipcMain.handle(
+    'db:payments:listRecent',
+    wrap('db:payments:listRecent', (branchId: unknown, limit: unknown) => {
+      const hasBoth =
+        typeof branchId === 'string' &&
+        branchId &&
+        (typeof limit === 'number' || typeof limit === 'string');
+      const inferredBranchId = hasBoth ? String(branchId) : getActiveBranchId(repos);
+      const inferredLimit =
+        limit !== undefined
+          ? limit
+          : typeof branchId === 'number' || typeof branchId === 'string'
+            ? branchId
+            : 1000;
+      return repos.payments.listRecent(
+        inferredBranchId ? String(inferredBranchId) : null,
+        Number(inferredLimit ?? 1000)
+      );
     })
   );
 

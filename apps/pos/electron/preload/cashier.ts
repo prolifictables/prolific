@@ -140,6 +140,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
         invokeDb('db:orders:setHeld', { id, held, reason }),
       listByTableId: (tableId: string) =>
         invokeDb('db:orders:listByTableId', tableId),
+      listByShiftId: (shiftId: string) =>
+        invokeDb('db:orders:listByShiftId', shiftId),
       addItem: (orderId: string, item: unknown) =>
         invokeDb('db:orders:addItem', { orderId, item }),
       removeItem: (orderId: string, itemId: string) =>
@@ -164,6 +166,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         invokeDb('db:payments:listByOrderId', orderId),
       listByShiftId: (shiftId: string) =>
         invokeDb('db:payments:listByShiftId', shiftId),
+      listRecent: (limit?: number) => invokeDb('db:payments:listRecent', limit),
       getShiftTotals: (shiftId: string) =>
         invokeDb('db:payments:getShiftTotals', shiftId),
     },

@@ -48,11 +48,19 @@ export interface SalesDashboardResult {
 
 export interface SalesReportRow {
   period: string;
+  periodLabel: string; // Human readable label, e.g. "Mon, Sep 1" or "Week of Sep 1"
+  startDate: string; // ISO YYYY-MM-DD
+  endDate: string;   // ISO YYYY-MM-DD
   subtotalCents: number;
   discountCents: number;
   taxCents: number;
+  tipCents: number;
+  refundCents: number;
+  voidCents: number;
   totalCents: number;
   orderCount: number;
+  voidCount: number;
+  refundCount: number;
   aovCents: number;
 }
 
@@ -61,6 +69,7 @@ export interface ListSalesReportFilters {
   dateFrom: Date;
   dateTo: Date;
   branchId?: string;
+  sourceChannel?: string; // Order.source: POS | QR | WEBSITE | APP | PHONE
   basis?: 'payments' | 'orders';
   cursor?: string;
   limit?: number;
@@ -68,6 +77,20 @@ export interface ListSalesReportFilters {
 
 export interface PaginatedSalesReportResult {
   data: SalesReportRow[];
+  summary: {
+    orderCount: number;
+    voidCount: number;
+    refundCount: number;
+    subtotalCents: number;
+    discountCents: number;
+    taxCents: number;
+    tipCents: number;
+    refundCents: number;
+    voidCents: number;
+    totalCents: number;
+    aovCents: number;
+  };
+  paymentBreakdown: Array<{ method: string; totalCents: number; count: number }>;
   meta: {
     cursor: string | null;
     count: number;
@@ -545,115 +568,298 @@ export class ReportsService {
     const limit = Math.min(filters.limit ?? 50, 100);
     const { dateFrom, dateTo, groupBy } = filters;
     const basis = filters.basis === 'orders' ? 'orders' : 'payments';
+    const sourceChannel = filters.sourceChannel?.trim?.() || '';
 
-    const paidOrders = await (async () => {
-      if (basis === 'orders') {
-        return this.orderModel
-          .find({
-            branchId,
-            paymentStatus: S.PaymentStatus.PAID,
-            createdAt: { $gte: dateFrom, $lte: dateTo },
-            status: { $nin: [S.OrderStatus.CANCELLED, S.OrderStatus.REFUNDED, S.OrderStatus.VOIDED] },
-          })
-          .exec();
-      }
+    // -----------------------------------------------------------------------
+    // Phase 1: Identify PAID orders in the period. For PAYMENTS basis we start
+    // from the payments table (completedAt bounded by the date range), then
+    // walk back to their orders. For ORDERS basis we start directly from
+    // orders that were both created in the window and have a PAID status.
+    // -----------------------------------------------------------------------
 
+    const paidAtByOrderId = new Map<string, Date>();
+
+    if (basis === 'payments') {
       const paymentsInRange = await this.paymentModel
         .find({
           branchId,
           status: S.PaymentStatus.PAID,
           completedAt: { $gte: dateFrom, $lte: dateTo },
-        })
+        } as any)
         .select({ orderId: 1, completedAt: 1 })
         .exec();
 
-      const paidAtByOrderId = new Map<string, Date>();
       for (const p of paymentsInRange as unknown as Array<{ orderId: any; completedAt?: Date }>) {
         const oid = p.orderId ? String(p.orderId) : '';
         const ts = p.completedAt ? new Date(p.completedAt) : null;
         if (!oid || !ts) continue;
+        // For split payments (1 order → N payments), remember the LATEST
+        // completed payment timestamp so the order is bucketed by when the
+        // customer finished paying, not the first instalment.
         const existing = paidAtByOrderId.get(oid);
         if (!existing || existing.getTime() < ts.getTime()) {
           paidAtByOrderId.set(oid, ts);
         }
       }
-      const paidOrderIds = Array.from(paidAtByOrderId.keys());
+    }
 
-      const rows = paidOrderIds.length
-        ? await this.orderModel
-            .find({
-              _id: { $in: paidOrderIds },
-              branchId,
-              status: { $nin: [S.OrderStatus.CANCELLED, S.OrderStatus.REFUNDED, S.OrderStatus.VOIDED] },
-            })
-            .exec()
-        : [];
-
-      return rows.map((o: any) => {
-        const paidAt = paidAtByOrderId.get(String(o._id));
-        if (paidAt) o._paidAt = paidAt;
-        return o;
-      });
-    })();
-
-    const periodMap = new Map<
-      string,
-      {
-        subtotalCents: number;
-        discountCents: number;
-        taxCents: number;
-        totalCents: number;
-        orderCount: number;
+    const ordersQuery: Record<string, unknown> = { branchId };
+    if (basis === 'orders') {
+      ordersQuery.createdAt = { $gte: dateFrom, $lte: dateTo };
+      ordersQuery.paymentStatus = S.PaymentStatus.PAID;
+    } else {
+      const paidIds = Array.from(paidAtByOrderId.keys());
+      if (paidIds.length === 0) {
+        // No paid payments in range → short-circuit; nothing further to do.
+        // Return an empty response to avoid a Mongo find with $in:[] → full scan.
+        const emptyRow: SalesReportRow[] = [];
+        const emptySummary: PaginatedSalesReportResult['summary'] = {
+          orderCount: 0,
+          voidCount: 0,
+          refundCount: 0,
+          subtotalCents: 0,
+          discountCents: 0,
+          taxCents: 0,
+          tipCents: 0,
+          refundCents: 0,
+          voidCents: 0,
+          totalCents: 0,
+          aovCents: 0,
+        };
+        return {
+          data: [],
+          summary: emptySummary,
+          paymentBreakdown: [],
+          meta: { cursor: null, count: 0, hasMore: false },
+        };
       }
-    >();
+      ordersQuery._id = { $in: paidIds.map((id) => new Types.ObjectId(id)) };
+    }
+    if (sourceChannel) ordersQuery.source = sourceChannel;
 
-    for (const order of paidOrders) {
-      const paidAt =
-        (order as any)._paidAt ||
-        (basis === 'orders' ? (order as any).createdAt : (order as any).createdAt);
-      const d = paidAt as Date;
-      let key: string;
+    const ordersInRange = await this.orderModel.find(ordersQuery as any).exec();
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Voids + refunds. We ALSO walk these statuses so the report can
+    // show negative-line adjustments (not a "silent exclude" which hides
+    // mistakes from the owner / accountant).
+    // -----------------------------------------------------------------------
+    const refundsVoidsQuery: Record<string, unknown> = {
+      branchId,
+      status: { $in: [S.OrderStatus.VOIDED, S.OrderStatus.REFUNDED] },
+    };
+    if (sourceChannel) refundsVoidsQuery.source = sourceChannel;
+    if (basis === 'orders') {
+      refundsVoidsQuery.createdAt = { $gte: dateFrom, $lte: dateTo };
+    } else if (paidAtByOrderId.size > 0) {
+      refundsVoidsQuery._id = {
+        $in: Array.from(paidAtByOrderId.keys()).map((id) => new Types.ObjectId(id)),
+      };
+    } else {
+      refundsVoidsQuery.createdAt = { $gte: dateFrom, $lte: dateTo };
+    }
+    const voidsRefundsOrders = await this.orderModel.find(refundsVoidsQuery as any).exec();
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Payment-method breakdown (CASH / CARD / ONLINE_PAYSTACK …).
+    // Used in the Admin UI to render the Method mix section.
+    // -----------------------------------------------------------------------
+    const breakdownQuery: Record<string, unknown> = {
+      branchId,
+      status: S.PaymentStatus.PAID,
+      completedAt: { $gte: dateFrom, $lte: dateTo },
+    };
+    if (sourceChannel) {
+      const ordersForSource = await this.orderModel
+        .find({ branchId, source: sourceChannel })
+        .select({ _id: 1 })
+        .lean()
+        .exec();
+      const idsForSource = ordersForSource
+        .map((o) => (o as any)._id?.toString?.() || String((o as any)._id))
+        .filter(Boolean);
+      breakdownQuery.orderId = { $in: idsForSource };
+    }
+    const breakdownPayments = await this.paymentModel
+      .find(breakdownQuery as any)
+      .select({ method: 1, amountCents: 1 })
+      .exec();
+    const breakdownMap = new Map<string, { total: number; count: number }>();
+    for (const p of breakdownPayments as any as Array<{ method: string; amountCents: number }>) {
+      const m = String(p.method || 'OTHER');
+      const ex = breakdownMap.get(m);
+      if (ex) {
+        ex.total += Number(p.amountCents || 0);
+        ex.count += 1;
+      } else {
+        breakdownMap.set(m, { total: Number(p.amountCents || 0), count: 1 });
+      }
+    }
+    const paymentBreakdown = Array.from(breakdownMap.entries()).map(([method, v]) => ({
+      method,
+      totalCents: v.total,
+      count: v.count,
+    }));
+
+    // -----------------------------------------------------------------------
+    // Phase 4: Date bucketing helpers.
+    // -----------------------------------------------------------------------
+    const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const iso = (dt: Date) =>
+      `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+
+    const periodFor = (d: Date) => {
+      const y = d.getFullYear();
+      const m = d.getMonth();
+      const day = d.getDate();
       if (groupBy === 'day') {
-        key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
-          d.getDate()
-        ).padStart(2, '0')}`;
-      } else if (groupBy === 'week') {
-        const weekStart = new Date(d);
-        weekStart.setDate(d.getDate() - d.getDay());
-        key = `${weekStart.getFullYear()}-${String(weekStart.getMonth() + 1).padStart(2, '0')}-${String(
-          weekStart.getDate()
-        ).padStart(2, '0')}`;
-      } else {
-        key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        const start = new Date(y, m, day);
+        const end = new Date(y, m, day);
+        return {
+          key: `${y}-${String(m + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+          label: `${DAY_NAMES[d.getDay()]}, ${MONTH_NAMES[m]} ${day}`,
+          startDate: iso(start),
+          endDate: iso(end),
+        };
       }
+      if (groupBy === 'week') {
+        const start = new Date(y, m, day - d.getDay());
+        const end = new Date(y, m, day - d.getDay() + 6);
+        return {
+          key: `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`,
+          label: `Week of ${MONTH_NAMES[start.getMonth()]} ${start.getDate()}`,
+          startDate: iso(start),
+          endDate: iso(end),
+        };
+      }
+      // month
+      const start = new Date(y, m, 1);
+      const end = new Date(y, m + 1, 0);
+      return {
+        key: `${y}-${String(m + 1).padStart(2, '0')}`,
+        label: `${MONTH_NAMES[m]} ${y}`,
+        startDate: iso(start),
+        endDate: iso(end),
+      };
+    };
 
-      const existing = periodMap.get(key);
-      if (existing) {
-        existing.subtotalCents += order.subtotalCents;
-        existing.discountCents += order.discountCents;
-        existing.taxCents += order.taxCents;
-        existing.totalCents += order.totalCents;
-        existing.orderCount += 1;
-      } else {
-        periodMap.set(key, {
-          subtotalCents: order.subtotalCents,
-          discountCents: order.discountCents,
-          taxCents: order.taxCents,
-          totalCents: order.totalCents,
-          orderCount: 1,
-        });
+    type Bucket = {
+      periodLabel: string;
+      startDate: string;
+      endDate: string;
+      subtotalCents: number;
+      discountCents: number;
+      taxCents: number;
+      tipCents: number;
+      refundCents: number;
+      voidCents: number;
+      totalCents: number;
+      orderCount: number;
+      voidCount: number;
+      refundCount: number;
+    };
+    const periodMap = new Map<string, Bucket>();
+    const emptyBucket = (label: string, start: string, end: string): Bucket => ({
+      periodLabel: label,
+      startDate: start,
+      endDate: end,
+      subtotalCents: 0,
+      discountCents: 0,
+      taxCents: 0,
+      tipCents: 0,
+      refundCents: 0,
+      voidCents: 0,
+      totalCents: 0,
+      orderCount: 0,
+      voidCount: 0,
+      refundCount: 0,
+    });
+    const getBucket = (d: Date) => {
+      const p = periodFor(d);
+      if (!periodMap.has(p.key)) periodMap.set(p.key, emptyBucket(p.label, p.startDate, p.endDate));
+      return { key: p.key, bucket: periodMap.get(p.key)! };
+    };
+
+    // Count orders already tracked for void/refund dedupe. If an order was
+    // already in the PAID set (shouldn't happen due to status), we still
+    // dedupe by id so a single order can't be double-counted.
+    const countedOrderIds = new Set<string>();
+
+    // -----------------------------------------------------------------------
+    // Phase 5: Apply orders/sales.
+    // -----------------------------------------------------------------------
+    for (const order of ordersInRange) {
+      const oidRaw = String((order as any)._id?.toString?.() ?? String((order as any)._id));
+      if (countedOrderIds.has(oidRaw)) continue;
+      countedOrderIds.add(oidRaw);
+
+      const paidAt = paidAtByOrderId.get(oidRaw);
+      const ts: Date = paidAt ?? ((order as any).createdAt as Date);
+      const { bucket } = getBucket(ts);
+
+      const status = String(order.status);
+      const totalCents = Math.max(0, Number((order as any).totalCents || 0));
+      if (status === S.OrderStatus.VOIDED) {
+        bucket.voidCount += 1;
+        bucket.voidCents += totalCents;
+        continue;
+      }
+      if (status === S.OrderStatus.REFUNDED) {
+        bucket.refundCount += 1;
+        bucket.refundCents += totalCents;
+        continue;
+      }
+      bucket.orderCount += 1;
+      bucket.subtotalCents += Math.max(0, Number((order as any).subtotalCents || 0));
+      bucket.discountCents += Math.max(0, Number((order as any).discountCents || 0));
+      bucket.taxCents += Math.max(0, Number((order as any).taxCents || 0));
+      bucket.totalCents += totalCents;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: Apply voids/refunds that may not have appeared in the PAID set.
+    // -----------------------------------------------------------------------
+    for (const o of voidsRefundsOrders) {
+      const oidRaw = String((o as any)._id?.toString?.() ?? String((o as any)._id));
+      if (countedOrderIds.has(oidRaw)) continue;
+      countedOrderIds.add(oidRaw);
+
+      const paidAt = paidAtByOrderId.get(oidRaw);
+      const ts: Date = paidAt ?? ((o as any).createdAt as Date);
+      const { bucket } = getBucket(ts);
+
+      const totalCents = Math.max(0, Number((o as any).totalCents || 0));
+      const status = String((o as any).status);
+      if (status === S.OrderStatus.VOIDED) {
+        bucket.voidCount += 1;
+        bucket.voidCents += totalCents;
+      } else if (status === S.OrderStatus.REFUNDED) {
+        bucket.refundCount += 1;
+        bucket.refundCents += totalCents;
       }
     }
 
-    const allRows = Array.from(periodMap.entries())
-      .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    // -----------------------------------------------------------------------
+    // Phase 7: Flatten + paginate rows.
+    // -----------------------------------------------------------------------
+    const allRows: SalesReportRow[] = Array.from(periodMap.entries())
+      .sort(([a], [b]) => (a < b ? -1 : 1))
       .map(([period, v]) => ({
         period,
+        periodLabel: v.periodLabel,
+        startDate: v.startDate,
+        endDate: v.endDate,
         subtotalCents: v.subtotalCents,
         discountCents: v.discountCents,
         taxCents: v.taxCents,
+        tipCents: v.tipCents,
+        refundCents: v.refundCents,
+        voidCents: v.voidCents,
         totalCents: v.totalCents,
         orderCount: v.orderCount,
+        voidCount: v.voidCount,
+        refundCount: v.refundCount,
         aovCents: v.orderCount > 0 ? Math.floor(v.totalCents / v.orderCount) : 0,
       }));
 
@@ -662,28 +868,59 @@ export class ReportsService {
       try {
         const decoded = Buffer.from(filters.cursor, 'base64').toString('utf-8');
         const parsed = JSON.parse(decoded);
-        const foundIdx = allRows.findIndex((r) => r.period === parsed.period);
-        if (foundIdx >= 0) {
-          startIdx = foundIdx + 1;
-        }
-      } catch (_e) {
+        const idx = allRows.findIndex((r) => r.period === parsed.period);
+        if (idx >= 0) startIdx = idx + 1;
+      } catch {
         throw new BadRequestException('Invalid cursor');
       }
     }
-
     const sliced = allRows.slice(startIdx, startIdx + limit + 1);
     const hasMore = sliced.length > limit;
     const data = sliced.slice(0, limit);
     const count = data.length;
-
     let cursor: string | null = null;
     if (hasMore && data.length > 0) {
       const last = data[data.length - 1];
       cursor = Buffer.from(JSON.stringify({ period: last.period })).toString('base64');
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 8: Grand totals summary (for the KPI cards) — aggregated across
+    // the full date range, NOT just the current page of rows.
+    // -----------------------------------------------------------------------
+    const summary = (() => {
+      const s = {
+        orderCount: 0,
+        voidCount: 0,
+        refundCount: 0,
+        subtotalCents: 0,
+        discountCents: 0,
+        taxCents: 0,
+        tipCents: 0,
+        refundCents: 0,
+        voidCents: 0,
+        totalCents: 0,
+      };
+      for (const r of allRows) {
+        s.orderCount += r.orderCount;
+        s.voidCount += r.voidCount;
+        s.refundCount += r.refundCount;
+        s.subtotalCents += r.subtotalCents;
+        s.discountCents += r.discountCents;
+        s.taxCents += r.taxCents;
+        s.tipCents += r.tipCents;
+        s.refundCents += r.refundCents;
+        s.voidCents += r.voidCents;
+        s.totalCents += r.totalCents;
+      }
+      const aovCents = s.orderCount > 0 ? Math.floor(s.totalCents / s.orderCount) : 0;
+      return { ...s, aovCents };
+    })();
+
     return {
       data,
+      summary,
+      paymentBreakdown,
       meta: {
         cursor,
         count,

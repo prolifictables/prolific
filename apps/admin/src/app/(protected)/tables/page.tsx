@@ -93,7 +93,7 @@ export default function TablesPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [del, setDel] = useState<TableType | null>(null);
   const [delLoading, setDelLoading] = useState(false);
-  const [regeneratingQrId, setRegeneratingQrId] = useState<string | null>(null);
+  const [generatingQrId, setGeneratingQrId] = useState<string | null>(null);
   const [qrDownloadLoadingId, setQrDownloadLoadingId] = useState<string | null>(null);
 
   const fetchAll = async () => {
@@ -331,16 +331,19 @@ export default function TablesPage() {
     return { variant: 'soft', label: s ? s.replace(/_/g, ' ') : '—' };
   };
 
-  const handleRegenerateQr = async (tableId: string) => {
-    setRegeneratingQrId(tableId);
+  const handleGenerateQr = async (tableId: string) => {
+    setGeneratingQrId(tableId);
     try {
+      // Server side: /regenerate endpoint is now a one-shot contract. If a
+      // table already has a permanent QR (any token), it throws a 400 so the
+      // printed sticker taped onto the table can never be rotated.
       await apiPost(`/qr-codes/tables/${encodeURIComponent(tableId)}/regenerate`, {});
-      toast('QR regenerated', { variant: 'success' });
+      toast('QR code generated permanently', { variant: 'success', description: 'Re-print this sticker and tape it onto the physical table.' });
       await fetchAll();
     } catch (err: any) {
-      toast('Failed to regenerate QR', { description: err?.message || 'Server error', variant: 'error' });
+      toast('Failed to generate QR', { description: err?.message || 'Server error', variant: 'error' });
     } finally {
-      setRegeneratingQrId(null);
+      setGeneratingQrId(null);
     }
   };
 
@@ -609,7 +612,7 @@ export default function TablesPage() {
       >
         {selected && (
           <div className="space-y-5">
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <Button
                 variant="outline"
                 onClick={() => viewOrdersForTable(selected.id)}
@@ -623,19 +626,15 @@ export default function TablesPage() {
               >
                 Download QR
               </Button>
-              <Button
-                variant="success"
-                loading={regeneratingQrId === selected.id}
-                onClick={() => handleRegenerateQr(selected.id)}
-              >
-                Regenerate QR
-              </Button>
-              <Button
-                variant="outline"
-                onClick={fetchAll}
-              >
-                Refresh
-              </Button>
+              {!selected._qr?.token ? (
+                <Button
+                  variant="success"
+                  loading={generatingQrId === selected.id}
+                  onClick={() => handleGenerateQr(selected.id)}
+                >
+                  Generate QR
+                </Button>
+              ) : null}
             </div>
 
             <Card>

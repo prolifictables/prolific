@@ -89,11 +89,232 @@ export default function ShiftModal({ mode, openShift, onClose, onDone }: ShiftMo
         } catch (e) {
           console.warn('[shift] getShiftTotals bridge unavailable — fallback', e);
         }
-        // LEGACY FALLBACK — if totals is still null after bridge call, manually
-        // compute a minimum viable summary using listByShiftId.
+        // LEGACY FALLBACK — if totals is still null after bridge call,
+        // manually compute a summary that MATCHES the 3-tier parity used by
+        // the repository & mock shim. Critical fixes vs the prior naive sum:
+        //   (a) filter payments with the SAME 3-tier PAID_STATUS rule,
+        //   (b) include "virtual payments" for orders marked PAID that have
+        //       no qualifying payment row (History/Reports include these),
+        //   (c) properly count paid/voided/refunded orders instead of zeros,
+        //   (d) sum subtotal/discount/tax and item qty from the shift orders.
         if (!data) {
+          // 3-tier qualifying-payment predicate — mirrors PAID_STATUS_FILTER
+          // used in the Electron SQLite repository and mock shim.
+          const isQualifyingPayment = (p: any, orderLookup: Map<string, any>): boolean => {
+            const status = (p.status == null) ? '' : String(p.status);
+            const up = status.toUpperCase();
+            const amt =
+              typeof p.amount_cents === 'number' ? p.amount_cents :
+              typeof p.amountCents === 'number' ? p.amountCents :
+              Math.round(Number(p.amount || 0) * 100);
+            if (['SUCCESS', 'COMPLETED', 'PAID', 'CLOSED'].includes(up)) return true;
+            if (!up && amt > 0) return true;
+            if (up === 'PENDING' || up === 'AWAITING_CONFIRM') {
+              if (amt <= 0) return false;
+              const completedAt =
+                typeof p.completed_at === 'number' ? p.completed_at :
+                typeof p.completedAt === 'number' ? p.completedAt : 0;
+              if (completedAt > 0) return true;
+              const oid =
+                (p.orderId != null) ? String(p.orderId) :
+                (p.order_id != null) ? String(p.order_id) : '';
+              if (oid) {
+                const order = orderLookup.get(oid);
+                if (order) {
+                  const os = (order.status || '').toUpperCase();
+                  const ps = (
+                    order.paymentStatus || order.payment_status || ''
+                  ).toUpperCase();
+                  if (
+                    ['COMPLETED', 'PAID', 'CLOSED', 'SERVED', 'DELIVERED', 'AWAITING_PAYMENT'].includes(os) ||
+                    ['PAID', 'PARTIALLY_PAID', 'REFUNDED', 'PARTIALLY_REFUNDED'].includes(ps)
+                  ) return true;
+                }
+              }
+            }
+            return false;
+          };
+
+          // Helper to read orders for a shiftId — fall back to "all orders for
+          // branch filtered by openedAt <= created <= now" if listByShiftId
+          // returns empty or the method is unavailable. For 99% of cases this
+          // will just listByShiftId.
+          const shiftStartTs = openShift.openedAt || 0;
+          const branchId = branch?.id ? String(branch.id) : null;
+          const orderRowShiftId = (o: any): string | null => {
+            if (o.shift_id != null && String(o.shift_id)) return String(o.shift_id);
+            if (o.shiftId != null && String(o.shiftId)) return String(o.shiftId);
+            return null;
+          };
+          const orderRowBranchId = (o: any): string | null => {
+            if (o.branch_id != null && String(o.branch_id)) return String(o.branch_id);
+            if (o.branchId != null && String(o.branchId)) return String(o.branchId);
+            return null;
+          };
+          const orderCreatedAt = (o: any): number => {
+            if (typeof o.created_at === 'number') return o.created_at;
+            if (typeof o.createdAt === 'number') return o.createdAt;
+            return 0;
+          };
+          const shiftOrdersFirst: any =
+            typeof (window.electronAPI as any)?.db?.orders?.listByShiftId === 'function'
+              ? await (window.electronAPI as any).db.orders.listByShiftId(shiftId)
+              : null;
+          const shiftOrdersListRaw = Array.isArray(shiftOrdersFirst)
+            ? shiftOrdersFirst
+            : ((shiftOrdersFirst as any)?.data ?? []);
+          // Also fall back to the general list (if available) so rows without
+          // shift_id still get picked up by time window scoping (matches repo).
+          // Use `listRecent(limit)` — preload exposes (limit) only; bridge
+          // auto-infers active branch. Older POS versions may lack listRecent
+          // on one or both collections, so we try listRecent first, then
+          // listAll as a compatibility shim, then fall through empty.
+          let allBranchOrders: any[] = [];
+          try {
+            if (typeof (window.electronAPI as any)?.db?.orders?.listRecent === 'function') {
+              const raw = await (window.electronAPI as any).db.orders.listRecent(5000);
+              allBranchOrders = Array.isArray(raw) ? raw : ((raw as any)?.data ?? []);
+            } else if (typeof (window.electronAPI as any)?.db?.orders?.listAll === 'function') {
+              const raw = await (window.electronAPI as any).db.orders.listAll();
+              allBranchOrders = Array.isArray(raw) ? raw : ((raw as any)?.data ?? []);
+            }
+          } catch { /* ignore — use whatever listByShiftId returned */ }
+          const shiftOrdersList = (() => {
+            const byId = new Map<string, any>();
+            const push = (o: any) => {
+              const oid =
+                (o.id != null) ? String(o.id) :
+                (o._id != null) ? String(o._id) :
+                null;
+              if (!oid) return;
+              byId.set(oid, o);
+            };
+            for (const o of shiftOrdersListRaw) push(o);
+            for (const o of allBranchOrders) {
+              // Time-window scoped: no shift_id on row, but created between
+              // shift open → now, and matches current branch if known.
+              const direct = orderRowShiftId(o);
+              if (direct === String(shiftId)) { push(o); continue; }
+              if (direct) continue; // bound to a different shift
+              const ts = orderCreatedAt(o);
+              if (!ts) continue;
+              if (shiftStartTs && ts < shiftStartTs) continue;
+              if (branchId) {
+                const ob = orderRowBranchId(o);
+                if (ob && ob !== branchId) continue;
+              }
+              push(o);
+            }
+            return Array.from(byId.values());
+          })();
+          const orderLookup = new Map<string, any>();
+          for (const o of shiftOrdersList) {
+            const oid =
+              (o.id != null) ? String(o.id) :
+              (o._id != null) ? String(o._id) : null;
+            if (oid) orderLookup.set(oid, o);
+          }
+
+          // 1. Real qualifying payments from listByShiftId.
           const pays: any = await window.electronAPI?.db?.payments?.listByShiftId?.(shiftId);
-          const list = Array.isArray(pays) ? pays : (pays as any)?.data || [];
+          const listRaw = Array.isArray(pays) ? pays : ((pays as any)?.data ?? []);
+          // Also include all payments filtered by time window + branch for
+          // rows whose shift_id is missing (mirrors repo SCOPE_PAYMENTS).
+          // Use listRecent(limit) (just added; auto-infers branch), fallback
+          // to listAll, then empty.
+          let allPaysRaw: any[] = [];
+          try {
+            if (typeof (window.electronAPI as any)?.db?.payments?.listRecent === 'function') {
+              const raw = await (window.electronAPI as any).db.payments.listRecent(5000);
+              allPaysRaw = Array.isArray(raw) ? raw : ((raw as any)?.data ?? []);
+            } else if (typeof (window.electronAPI as any)?.db?.payments?.listAll === 'function') {
+              const raw = await (window.electronAPI as any).db.payments.listAll();
+              allPaysRaw = Array.isArray(raw) ? raw : ((raw as any)?.data ?? []);
+            }
+          } catch { /* ignore */ }
+          const paymentRowShiftId = (p: any): string | null => {
+            if (p.shift_id != null && String(p.shift_id)) return String(p.shift_id);
+            if (p.shiftId != null && String(p.shiftId)) return String(p.shiftId);
+            return null;
+          };
+          const paymentRowBranchId = (p: any): string | null => {
+            if (p.branch_id != null && String(p.branch_id)) return String(p.branch_id);
+            if (p.branchId != null && String(p.branchId)) return String(p.branchId);
+            return null;
+          };
+          const paymentCreatedAt = (p: any): number => {
+            if (typeof p.created_at === 'number') return p.created_at;
+            if (typeof p.createdAt === 'number') return p.createdAt;
+            return 0;
+          };
+          const allQualifyingPays: any[] = (() => {
+            const byId = new Map<string, any>();
+            const push = (p: any) => {
+              if (!isQualifyingPayment(p, orderLookup)) return;
+              const pid =
+                (p.id != null) ? String(p.id) :
+                (p._id != null) ? String(p._id) : null;
+              if (pid) byId.set(pid, p);
+              else byId.set(`anon-${JSON.stringify(p).slice(0, 40)}`, p);
+            };
+            for (const p of listRaw) {
+              const direct = paymentRowShiftId(p);
+              if (!direct || direct === String(shiftId)) push(p);
+            }
+            for (const p of allPaysRaw) {
+              const direct = paymentRowShiftId(p);
+              if (direct === String(shiftId)) { push(p); continue; }
+              if (direct) continue;
+              const ts = paymentCreatedAt(p);
+              if (!ts) continue;
+              if (shiftStartTs && ts < shiftStartTs) continue;
+              if (branchId) {
+                const pb = paymentRowBranchId(p);
+                if (pb && pb !== branchId) continue;
+              }
+              push(p);
+            }
+            return Array.from(byId.values());
+          })();
+
+          // 2. Virtual payments: orders marked PAID with paid_amount_cents > 0
+          //    that don't have a qualifying real payment (mirrors repo fallback UNION).
+          const virtualPays: any[] = [];
+          for (const o of shiftOrdersList) {
+            const status = (o.status || '').toUpperCase();
+            const payStatus = (o.payment_status || o.paymentStatus || '').toUpperCase();
+            if (!['COMPLETED', 'PAID', 'CLOSED', 'SERVED', 'DELIVERED', 'AWAITING_PAYMENT'].includes(status)) continue;
+            if (!['PAID', 'PARTIALLY_PAID'].includes(payStatus)) continue;
+            const paidAmt =
+              typeof o.paid_amount_cents === 'number' ? o.paid_amount_cents :
+              typeof o.paidAmountCents === 'number' ? o.paidAmountCents :
+              typeof o.paidAmount === 'number' ? Math.round(o.paidAmount * 100) : 0;
+            if (paidAmt <= 0) continue;
+            const oid =
+              (o.id != null) ? String(o.id) :
+              (o._id != null) ? String(o._id) : '';
+            const hasReal = allQualifyingPays.some((p) => {
+              const amt =
+                typeof p.amount_cents === 'number' ? p.amount_cents :
+                typeof p.amountCents === 'number' ? p.amountCents :
+                Math.round(Number(p.amount || 0) * 100);
+              if (amt <= 0) return false;
+              const poid =
+                (p.orderId != null) ? String(p.orderId) :
+                (p.order_id != null) ? String(p.order_id) : '';
+              return poid && poid === oid;
+            });
+            if (hasReal) continue;
+            virtualPays.push({
+              order_id: oid,
+              orderId: oid,
+              method: (o.payment_method || o.paymentMethod || 'CASH').toString().toUpperCase(),
+              amount_cents: paidAmt,
+              tip_cents: 0,
+            });
+          }
+          const list = [...allQualifyingPays, ...virtualPays];
+
           let cash = 0, card = 0, other = 0, tip = 0;
           let cashCount = 0, cardCount = 0, otherCount = 0;
           const perMethod = new Map<string, { method: string; amount: number; tip: number; count: number }>();
@@ -116,9 +337,42 @@ export default function ShiftModal({ mode, openShift, onClose, onDone }: ShiftMo
             bucket.amount += amt; bucket.tip += tp; bucket.count += 1;
             perMethod.set(m, bucket);
             if (m === 'CASH') { cash += amt; cashCount++; }
-            else if (m.includes('CARD') || m === 'PAYSTACK' || m === 'FLUTTERWAVE') { card += amt; cardCount++; }
+            else if (m.includes('CARD') || m === 'POS_CARD' || m === 'CARD_POS' || m === 'PAYSTACK' || m === 'FLUTTERWAVE' || m === 'POS') { card += amt; cardCount++; }
             else { other += amt; otherCount++; }
           }
+
+          // Order-level counters: paid/voided/refunded + subtotal/discount/tax + qty
+          let paidOrderCount = 0, voidedOrderCount = 0, refundedOrderCount = 0;
+          let paidItemQty = 0, subtotalCents = 0, discountCents = 0, taxCents = 0;
+          for (const o of shiftOrdersList) {
+            const status = (o.status || '').toUpperCase();
+            const payStatus = (o.payment_status || o.paymentStatus || '').toUpperCase();
+            const paidAmtChk =
+              typeof o.paid_amount_cents === 'number' ? o.paid_amount_cents :
+              typeof o.paidAmountCents === 'number' ? o.paidAmountCents :
+              typeof o.paidAmount === 'number' ? Math.round(o.paidAmount * 100) : 0;
+            if ((payStatus === 'PAID' || payStatus === 'PARTIALLY_PAID') && paidAmtChk > 0) paidOrderCount++;
+            if (status === 'VOID' || status === 'VOIDED') voidedOrderCount++;
+            if (status === 'REFUNDED' || payStatus === 'REFUNDED' || payStatus === 'PARTIALLY_REFUNDED') refundedOrderCount++;
+            const itemQty =
+              typeof o.item_qty === 'number' ? o.item_qty :
+              typeof o.itemQty === 'number' ? o.itemQty :
+              Number(o.quantity || 0);
+            paidItemQty += itemQty;
+            subtotalCents +=
+              typeof o.subtotal_cents === 'number' ? o.subtotal_cents :
+              typeof o.subtotalCents === 'number' ? o.subtotalCents :
+              Math.round(Number(o.subtotal || 0) * 100);
+            discountCents +=
+              typeof o.discount_cents === 'number' ? o.discount_cents :
+              typeof o.discountCents === 'number' ? o.discountCents :
+              Math.round(Number(o.discount || 0) * 100);
+            taxCents +=
+              typeof o.tax_cents === 'number' ? o.tax_cents :
+              typeof o.taxCents === 'number' ? o.taxCents :
+              Math.round(Number(o.tax || 0) * 100);
+          }
+
           // List cash adjustments (paid-in / paid-out / payouts) for close-shift
           // math — expected in drawer, variance.
           const adj: any = await window.electronAPI?.db?.cashAdjustments?.listByShiftId?.(shiftId);
@@ -142,8 +396,8 @@ export default function ShiftModal({ mode, openShift, onClose, onDone }: ShiftMo
             counts: { cash: cashCount, card: cardCount, other: otherCount, total: cashCount + cardCount + otherCount },
             perMethod: Array.from(perMethod.values()),
             orders: {
-              paidOrderCount: 0, voidedOrderCount: 0, refundedOrderCount: 0,
-              paidItemQty: 0, subtotalCents: 0, discountCents: 0, taxCents: 0,
+              paidOrderCount, voidedOrderCount, refundedOrderCount,
+              paidItemQty, subtotalCents, discountCents, taxCents,
               totalPaidCents: cash + card + other,
             },
             payouts: { totalPayoutCents: paidOut, payoutCount: alist.filter((a: any) => ((a.direction || a.type) || '').toUpperCase() === 'PAID_OUT').length },
