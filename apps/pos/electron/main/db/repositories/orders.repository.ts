@@ -10,8 +10,41 @@ export class OrdersRepository {
 
   create(data: Partial<OrderRow> & { id: string }): string {
     const now = Date.now();
-    this.db.run(
-      `INSERT INTO orders (
+    const idempotencyKey = typeof (data as any).idempotency_key === 'string' && (data as any).idempotency_key
+      ? String((data as any).idempotency_key)
+      : null;
+
+    // Idempotency pre-check.
+    //  ——
+    // SQLite `idx_orders_idempotency` is a UNIQUE index on orders.idempotency_key
+    // (migrations.ts L342). Double-click on "Confirm payment" or a React
+    // StrictMode double-invoke that runs PaymentModal.confirmPayment twice in
+    // quick succession would otherwise throw "UNIQUE constraint failed:
+    // orders.idempotency_key". Because PaymentModal wraps the whole flow in a
+    // single try/catch with a generic toast, this surfaces to the cashier as
+    // "Payment not recorded. Try again." even though order + payments rows
+    // were actually persisted on the first pass.
+    //
+    // To fix:
+    //   (1) If an idempotency_key is supplied, try SELECT FIRST. If a row
+    //       exists with that idempotency key, return the existing row's id
+    //       immediately as if the create succeeded. Safe because the caller
+    //       guarantees idempotency_key maps 1:1 to orderId.
+    //   (2) Otherwise run INSERT OR IGNORE (not plain INSERT). The "OR
+    //       IGNORE" path silently swallows the UNIQUE race so this call is
+    //       safe even when two create()s race. If rows inserted = 0 and we
+    //       supplied an idempotency key, look up the loser-of-the-race row
+    //       and return its id instead of throwing.
+    if (idempotencyKey) {
+      const existing = this.db.get<{ id: string }>(
+        'SELECT id FROM orders WHERE idempotency_key = ? LIMIT 1',
+        idempotencyKey
+      );
+      if (existing && existing.id) return String(existing.id);
+    }
+
+    const result = this.db.run(
+      `INSERT OR IGNORE INTO orders (
         id, branch_id, restaurant_id, order_number, source, order_type,
         table_id, table_session_id, customer_id, customer_name, customer_phone, customer_email, employee_id,
         held_by, held_at, status, payment_status, payment_method, paid_amount_cents, balance_due_cents, subtotal_cents,
@@ -31,6 +64,16 @@ export class OrdersRepository {
       )`,
       data
     );
+    if (result && typeof result.changes === 'number' && result.changes > 0) {
+      return data.id;
+    }
+    if (idempotencyKey) {
+      const fallback = this.db.get<{ id: string }>(
+        'SELECT id FROM orders WHERE idempotency_key = ? LIMIT 1',
+        idempotencyKey
+      );
+      if (fallback && fallback.id) return String(fallback.id);
+    }
     return data.id;
   }
 

@@ -220,9 +220,110 @@ export default function CashierScreenLayout() {
 
       // ------- Camel path: browser mock shim already returns hydrated rows
       if (!isSnake) {
+        const lookup = new Map<string, any[]>();
+        for (const r of raw) lookup.set(String(r.id), []);
+        try {
+          const orderItems = (window as any).electronAPI?.db?.orderItems;
+          if (typeof orderItems?.listForOrderId === 'function') {
+            await Promise.all(
+              raw.map(async (r: any) => {
+                const id = String(r.id);
+                try {
+                  const list: any =
+                    (await orderItems.listForOrderId(id)) || [];
+                  lookup.set(id, Array.isArray(list) ? list : []);
+                } catch {
+                  lookup.set(id, []);
+                }
+              }),
+            );
+          }
+        } catch {
+          /* ignore */
+        }
+        const tableLookup = new Map<string, any>();
+        for (const t of tablesLoaded) tableLookup.set(String(t.id), t);
         return raw.map((o: any) => {
           if (!o.sourceChannel && o.source) o.sourceChannel = o.source;
-          return o;
+          const id = String(o.id ?? '');
+          const snakeItems = lookup.get(id) ?? [];
+          // Prefer the already-embedded items[] on mock/camel rows (from the
+          // remote upsertBackendExternalOrders pull), and drop back to the
+          // snake_case listForOrderId rows if embedded items is empty but
+          // SQL rows exist. Ensures browser-mock + electron SQL branches
+          // both produce the same item list length in HISTORY and recall.
+          const embeddedItems =
+            Array.isArray(o.items) && o.items.length > 0
+              ? o.items
+              : snakeItems.map((it: any) => ({
+                  menuItemId: it.menu_item_id,
+                  name: it.name_snapshot,
+                  unitPrice: typeof it.price_snapshot_cents === 'number' ? it.price_snapshot_cents / 100 : 0,
+                  quantity: it.quantity,
+                  selectedModifiers: [],
+                  notes: it.special_instructions || undefined,
+                }));
+          // Currency guard: camel rows can come from mixed sources (mock
+          // payments modal writes Amount dollars, sync-pull writes
+          // `Cents` integers). Detect + normalize to dollar scalars.
+          const fromMaybeCents = (kCents: string, kAmount: string, fallbackKey?: string): number => {
+            const cents = typeof (o as any)[kCents] === 'number' ? (o as any)[kCents] : null;
+            const amount = typeof (o as any)[kAmount] === 'number' ? (o as any)[kAmount] : null;
+            const fall = fallbackKey && typeof (o as any)[fallbackKey] === 'number' ? (o as any)[fallbackKey] : null;
+            if (cents !== null && isFinite(cents)) {
+              // If cents >= 10^9 it's probably mis-labeled dollar scalar.
+              if (cents >= 1_000_000_000) return cents;
+              return cents / 100;
+            }
+            if (amount !== null && isFinite(amount)) return amount;
+            if (fall !== null && isFinite(fall)) {
+              if (fall >= 1_000_000_000) return fall;
+              // `fall` is ambiguous (could be dollar or could be cents).
+              // Assume dollar scalar when > 10_000 000 (NGN 10M+ in cents
+              // is improbable to be a single order total)
+              if (fall >= 1_000_000) return fall / 100;
+              return fall;
+            }
+            return 0;
+          };
+          const subtotalAmount = fromMaybeCents('subtotalCents', 'subtotalAmount', 'subtotal');
+          const discountAmount = fromMaybeCents('discountCents', 'discountAmount', 'discount');
+          const taxAmount = fromMaybeCents('taxCents', 'taxAmount', 'tax');
+          const tipAmount = fromMaybeCents('tipCents', 'tipAmount', 'tip');
+          const totalAmount = fromMaybeCents('totalCents', 'totalAmount', 'total');
+          const paidAmount = fromMaybeCents('paidCents', 'paidAmount', 'paid');
+          const balanceDue = fromMaybeCents('balanceDueCents', 'balanceDue', 'balance');
+          const effTotal =
+            (typeof totalAmount === 'number' && totalAmount > 0)
+              ? totalAmount
+              : Math.max(0, subtotalAmount - discountAmount + taxAmount + tipAmount);
+          const effPaid =
+            (typeof paidAmount === 'number' && paidAmount > 0)
+              ? paidAmount
+              : (effTotal > 0 && balanceDue >= 0 ? Math.max(0, effTotal - balanceDue) : 0);
+          const t = o.tableId ? tableLookup.get(String(o.tableId)) : null;
+          return {
+            ...o,
+            // Attach resolved table name if the caller only passed tableId
+            tableId: o.tableId,
+            tableName: t?.name || o.tableName || undefined,
+            // Always attach the 8 standard currency keys (old + new) so
+            // downstream filters and totals use the same fields regardless
+            // of how the source row was shaped.
+            subtotalAmount,
+            discountAmount,
+            taxAmount,
+            tipAmount,
+            totalAmount: effTotal,
+            paidAmount: effPaid,
+            balanceDue,
+            totalCents: Math.round(effTotal * 100),
+            paidCents: Math.round(effPaid * 100),
+            balanceDueCents: Math.round(balanceDue * 100),
+            cashierName: o.cashierName || o.cashier_name || o.employeeName || o.employee_name || undefined,
+            employeeName: o.employeeName || o.employee_name || o.cashierName || o.cashier_name || undefined,
+            items: embeddedItems,
+          };
         });
       }
 
@@ -249,6 +350,41 @@ export default function CashierScreenLayout() {
       return raw.map((r: any) => {
         const tbl = r.table_id ? tableById.get(String(r.table_id)) : null;
         const items = itemsByOrderId.get(String(r.id)) || [];
+        // Currency fields from SQLite are snake_case INTs of kobo/cents.
+        // Safeguard: if any caller accidentally wrote dollar scalar values
+        // (e.g. 1250.75) instead of cents (125075), cap any "cents" value
+        // that exceeds 10^9 (NGN 10M+) as a dollar scalar and convert it.
+        const asCents = (v: unknown): number => {
+          const n = typeof v === 'number' ? v : Number(v || 0);
+          if (!isFinite(n) || n <= 0) return 0;
+          // If the value is > NGN 10M * 100 it's almost certainly already
+          // dollar scalar; treat as dollars and x100.
+          if (n >= 1_000_000_000) return Math.round(n * 100);
+          return Math.round(n);
+        };
+        const totalCents = asCents(r.total_cents);
+        const subtotalCents = asCents(r.subtotal_cents);
+        const discountCents = asCents(r.discount_cents);
+        const taxCents = asCents(r.tax_cents);
+        const tipCents = asCents(r.tip_cents);
+        const paidCents = asCents(r.paid_amount_cents);
+        const balanceCents = asCents(r.balance_due_cents);
+        // Derive paidCents from total-balance if the order row was written by
+        // an older client that only populated balance_due_cents, not
+        // paid_amount_cents. This ensures partial-pay orders still contribute
+        // the correct amount to the HISTORY tab paid totals instead of 0.
+        const effectivePaidCents =
+          paidCents > 0
+            ? paidCents
+            : (totalCents > 0 && balanceCents >= 0
+              ? Math.max(0, totalCents - balanceCents)
+              : 0);
+        // Similarly, effectiveTotal: if total_cents wasn't written (older
+        // version) but subtotal + tax - discount exists, derive it.
+        const effectiveTotalCents =
+          totalCents > 0
+            ? totalCents
+            : Math.max(0, subtotalCents - discountCents + taxCents + tipCents);
         return {
           id: String(r.id),
           orderNumber: String(r.order_number || ''),
@@ -257,15 +393,29 @@ export default function CashierScreenLayout() {
           tableId: r.table_id || undefined,
           tableName: tbl?.name || r.table_name || undefined,
           employeeId: r.employee_id || undefined,
+          // Denormalized cashier name snapshot (new field from v35 receipt
+          // upgrade). Preserve both camel + snake forms for downstream panels.
+          cashierName: r.cashier_name || r.employee_name || undefined,
+          employeeName: r.employee_name || r.cashier_name || undefined,
           customerName: r.customer_name || undefined,
           customerPhone: r.customer_phone || undefined,
           customerEmail: r.customer_email || undefined,
           status: r.status || 'NEW',
           paymentStatus: r.payment_status || 'UNPAID',
           paymentMethod: r.payment_method || undefined,
-          totalAmount: typeof r.total_cents === 'number' ? r.total_cents / 100 : 0,
-          paidAmount: typeof r.paid_amount_cents === 'number' ? r.paid_amount_cents / 100 : 0,
-          balanceDue: typeof r.balance_due_cents === 'number' ? r.balance_due_cents / 100 : 0,
+          // Numeric totals are stored in DOLLAR scalars on the hydrated React
+          // state objects (pre-existing POS convention used by all callers).
+          subtotalAmount: subtotalCents / 100,
+          discountAmount: discountCents / 100,
+          taxAmount: taxCents / 100,
+          tipAmount: tipCents / 100,
+          totalAmount: effectiveTotalCents / 100,
+          paidAmount: effectivePaidCents / 100,
+          balanceDue: balanceCents / 100,
+          // Also keep duplicate legacy currency keys used by older call sites:
+          totalCents: effectiveTotalCents,
+          paidCents: effectivePaidCents,
+          balanceDueCents: balanceCents,
           notes: r.note || undefined,
           createdAt: typeof r.created_at === 'number' ? r.created_at : Date.now(),
           updatedAt: typeof r.updated_at === 'number' ? r.updated_at : Date.now(),
@@ -2598,6 +2748,19 @@ function HistoryPanel({
   }, [orders]);
 
   // Sales total respects the date + status filters.
+  //
+  // Rule: for paid/closed sales use the ACTUAL amount paid by the customer
+  // (paidAmount / paidCents) NOT the order totalAmount. Why:
+  //   (a) Partial-pay orders — totalAmount != amount actually collected
+  //       today; paidAmount is the correct number for the daily ledger.
+  //   (b) Refunded/voided rows — totalAmount would overstate the day's
+  //       revenue; the cashier expects paidAmount (typically 0) to be
+  //       reflected, or negative totals (not yet modeled) to be excluded.
+  //   (c) External website/QR orders are often pushed WITHOUT a
+  //       paid_amount_cents column because they're pay-on-arrival. The
+  //       `effectivePaidCents` derivation in hydrateOrders handles that
+  //       case, but we still use MAX(paidAmount, 0) to drop any rogue
+  //       negatives from legacy rows.
   const salesTotalCents = useMemo(
     () => filtered
       .filter((o) => {
@@ -2608,11 +2771,21 @@ function HistoryPanel({
           s === 'PAID' ||
           s === 'CLOSED' ||
           ps === 'PAID' ||
-          s === 'REFUNDED' || // refunded sales still show on the day's ledger
+          ps === 'PARTIALLY_PAID' ||
+          s === 'REFUNDED' ||
           s === 'VOIDED';
         return closedSale;
       })
-      .reduce((s, o) => s + Math.round((o.totalAmount || 0) * 100), 0),
+      .reduce((s, o) => {
+        const paid =
+          typeof o.paidCents === 'number'
+            ? o.paidCents
+            : (typeof o.paidAmount === 'number'
+              ? Math.round(o.paidAmount * 100)
+              : 0);
+        if (!isFinite(paid) || paid < 0) return s;
+        return s + paid;
+      }, 0),
     [filtered],
   );
 

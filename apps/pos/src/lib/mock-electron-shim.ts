@@ -2347,6 +2347,27 @@ export function installMockElectronAPI() {
         getById: async (id: string) => mockOrders.find((o) => o.id === id) || null,
         create: async (draft: any) => {
           await delay(20);
+          const ikey =
+            typeof draft?.idempotency_key === 'string' && draft.idempotency_key
+              ? String(draft.idempotency_key)
+              : (typeof draft?.idempotencyKey === 'string' && draft.idempotencyKey
+                ? String(draft.idempotencyKey)
+                : null);
+          // Parity with Electron orders repo: treat repeated idempotency keys
+          // as an idempotent successful create (return the already-stored
+          // order) instead of pushing a duplicate into the array. This
+          // prevents PaymentModal's outer generic try/catch from surfacing
+          // "Payment not recorded" when a double-invoke happens during
+          // React StrictMode remount / double-tap on "Confirm payment".
+          if (ikey) {
+            const existing = mockOrders.find((o) => {
+              const oIkey =
+                typeof (o as any).idempotency_key === 'string' ? (o as any).idempotency_key :
+                typeof (o as any).idempotencyKey === 'string' ? (o as any).idempotencyKey : null;
+              return oIkey && String(oIkey) === ikey;
+            });
+            if (existing) return existing;
+          }
           const order = {
             id: draft.id || `ord-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             orderNumber: draft.orderNumber || `#${10000 + Math.floor(Math.random() * 90000)}`,
@@ -2508,6 +2529,28 @@ export function installMockElectronAPI() {
       payments: {
         create: async (p: any) => {
           await delay(15);
+          const ikey =
+            typeof p?.idempotency_key === 'string' && p.idempotency_key
+              ? String(p.idempotency_key)
+              : (typeof p?.idempotencyKey === 'string' && p.idempotencyKey
+                ? String(p.idempotencyKey)
+                : null);
+          // Parity with Electron payments repo: if a payment row with same
+          // idempotency_key already exists, treat it as a successful
+          // create of the existing row. This is POS safety-net when the
+          // payment button is double-tapped or React StrictMode invokes
+          // the confirm handler twice — we should never surface duplicate
+          // failures that confuse the cashier into retrying a successful
+          // charge.
+          if (ikey) {
+            const existing = mockPayments.find((pay: any) => {
+              const pKey =
+                typeof (pay as any).idempotency_key === 'string' ? (pay as any).idempotency_key :
+                typeof (pay as any).idempotencyKey === 'string' ? (pay as any).idempotencyKey : null;
+              return pKey && String(pKey) === ikey;
+            });
+            if (existing) return existing;
+          }
           const pay = { id: p.id || `pay-${Date.now()}`, createdAt: Date.now(), ...p };
           mockPayments.push(pay);
           return pay;
@@ -3967,7 +4010,6 @@ export function installMockElectronAPI() {
           const url = `${API_BASE}/public/recent-orders?branchId=${encodeURIComponent(BRANCH_ID)}&sinceHours=24`;
           const resp = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' }, credentials: 'omit' });
           if (!resp.ok) {
-            // 404 or offline — swallow silently. POS will retry in 30s.
             if (resp.status !== 404) {
               console.debug(`[mock sync] pull skipped (HTTP ${resp.status})`);
             }
@@ -3980,31 +4022,94 @@ export function installMockElectronAPI() {
           for (const remote of orders) {
             if (!remote?.id) continue;
             const id = String(remote.id);
+            // Currency normalization.
+            // The public endpoint can return ALREADY cents integers (short Mongo
+            // names: subtotalCents, discountCents, ... ending in "Cents") OR
+            // dollar-amount DTO scalars (subtotalAmount, totalAmount, etc.). We
+            // need BOTH shapes converted into the mock canonical form:
+            //   1. totalAmount / paidAmount / balanceDue dollar scalars for camel
+            //      POS views.
+            //   2. + totalCents / paidCents / balanceDueCents as redundant integers
+            //      so the `fromMaybeCents` guard in hydrateOrders works without
+            //      fallback to derived math.
+            const toDollar = (maybeCents: unknown, maybeAmount: unknown, fallbackAny?: unknown): number => {
+              const c = typeof maybeCents === 'number' ? maybeCents : null;
+              const a = typeof maybeAmount === 'number' ? maybeAmount : null;
+              const f = typeof fallbackAny === 'number' ? fallbackAny : null;
+              if (c !== null && isFinite(c)) {
+                // If the "cents" field is >= 10^9 it was almost certainly
+                // mislabeled as cents (means dollar scalar). Fall back.
+                if (c >= 1_000_000_000) return c;
+                return c / 100;
+              }
+              if (a !== null && isFinite(a)) return a;
+              if (f !== null && isFinite(f)) {
+                if (f >= 1_000_000_000) return f;
+                if (f >= 1_000_000) return f / 100;
+                return f;
+              }
+              return 0;
+            };
+            const subtotalAmount = toDollar(remote.subtotalCents, remote.subtotalAmount, remote.subtotal);
+            const discountAmount = toDollar(remote.discountCents, remote.discountAmount, remote.discount);
+            const taxAmount = toDollar(remote.taxCents, remote.taxAmount, remote.tax);
+            const tipAmount = toDollar(remote.tipCents, remote.tipAmount, remote.tip);
+            const totalAmount = toDollar(remote.totalCents, remote.totalAmount, remote.total);
+            const paidAmount = toDollar(remote.paidCents, remote.paidAmount, remote.paid);
+            const balanceDue = toDollar(remote.balanceDueCents, remote.balanceDue, remote.balance);
+            const effTotal = totalAmount > 0
+              ? totalAmount
+              : Math.max(0, subtotalAmount - discountAmount + taxAmount + tipAmount);
+            const effPaid = paidAmount > 0
+              ? paidAmount
+              : (effTotal > 0 && balanceDue >= 0 ? Math.max(0, effTotal - balanceDue) : 0);
             // Upsert order into mockOrders
             const idx = mockOrders.findIndex((o) => String((o as any).id) === id);
             const canonical: any = {
               id,
               orderNumber: String(remote.orderNumber ?? remote.order_number ?? `#${id.slice(-6)}`),
+              orderNo: String(remote.orderNumber ?? remote.order_number ?? `#${id.slice(-6)}`),
               restaurantId: String(remote.restaurantId ?? (mockOrders[0] as any)?.restaurantId ?? 'rst-prolific'),
               branchId: String(remote.branchId ?? (mockOrders[0] as any)?.branchId ?? 'br-main-01'),
               orderType: String(remote.orderType ?? remote.order_type ?? 'DINE_IN'),
               status: String(remote.status ?? 'AWAITING_PAYMENT'),
               paymentStatus: String(remote.paymentStatus ?? 'UNPAID'),
+              paymentMethod:
+                remote.paymentMethod
+                  ? String(remote.paymentMethod)
+                  : (remote.payment_method
+                    ? String(remote.payment_method)
+                    : undefined),
               source: String(remote.source ?? remote.sourceChannel ?? 'WEBSITE').toUpperCase(),
               sourceChannel: String(remote.source ?? remote.sourceChannel ?? 'WEBSITE').toUpperCase(),
               customerId: remote.customerId ? String(remote.customerId) : undefined,
               customerName: remote.customerName ? String(remote.customerName) : undefined,
               customerPhone: remote.customerPhone ? String(remote.customerPhone) : undefined,
               customerEmail: remote.customerEmail ? String(remote.customerEmail) : undefined,
-              subtotal: typeof remote.subtotal === 'number' ? remote.subtotal : typeof remote.subtotalAmount === 'number' ? remote.subtotalAmount : 0,
-              subtotalAmount: typeof remote.subtotalAmount === 'number' ? remote.subtotalAmount : typeof remote.subtotal === 'number' ? remote.subtotal : 0,
-              discountAmount: typeof remote.discountAmount === 'number' ? remote.discountAmount : 0,
-              taxAmount: typeof remote.taxAmount === 'number' ? remote.taxAmount : 0,
-              totalAmount: typeof remote.totalAmount === 'number' ? remote.totalAmount : 0,
-              tipAmount: typeof remote.tipAmount === 'number' ? remote.tipAmount : 0,
-              paidAmount: typeof remote.paidAmount === 'number' ? remote.paidAmount : 0,
-              balanceDue: typeof remote.balanceDue === 'number' ? remote.balanceDue : 0,
-              notes: remote.notes ?? null,
+              // Currency fields — dollar scalars + integer cents parallels
+              // (matches what hydrateOrders.camel path checks).
+              subtotalAmount,
+              discountAmount,
+              taxAmount,
+              tipAmount,
+              totalAmount: effTotal,
+              paidAmount: effPaid,
+              balanceDue,
+              subtotalCents: Math.round(subtotalAmount * 100),
+              discountCents: Math.round(discountAmount * 100),
+              taxCents: Math.round(taxAmount * 100),
+              tipCents: Math.round(tipAmount * 100),
+              totalCents: Math.round(effTotal * 100),
+              paidCents: Math.round(effPaid * 100),
+              balanceDueCents: Math.round(balanceDue * 100),
+              // Legacy short currency names (some view code checks these)
+              subtotal: subtotalAmount,
+              total: effTotal,
+              paid: effPaid,
+              discount: discountAmount,
+              tax: taxAmount,
+              tip: tipAmount,
+              notes: remote.notes ?? remote.note ?? null,
               createdAt: typeof remote.createdAt === 'number' ? remote.createdAt : remote.createdAt instanceof Date ? remote.createdAt.getTime() : Date.now() - 60_000,
               updatedAt: typeof remote.updatedAt === 'number' ? remote.updatedAt : remote.updatedAt instanceof Date ? remote.updatedAt.getTime() : Date.now(),
               items: Array.isArray(remote.items) ? remote.items : [],
@@ -4018,42 +4123,75 @@ export function installMockElectronAPI() {
             }
             upserted++;
 
-            // Upsert snake_case order_items rows (for CashierScreenLayout's
-            // recall-to-cart + line-item counts on history/rail cards)
-            const lineItems = Array.isArray(remote._lineItems) ? remote._lineItems : [];
-            for (const li of lineItems) {
-              if (!li?.id) continue;
-              const liExists = mockOrderItems.findIndex((x) => String((x as any).id) === String(li.id));
+            // Derive snake_case order_items rows from remote.items[] (not the
+            // missing `_lineItems` synthetic key). The server / public endpoint
+            // returns items embedded directly on remote.items, with
+            // remote.items[i].modifierOptions[] (camel DTO) or nested `modifiers`.
+            // We split them out here so the browser mock shim can serve
+            // `listForOrderId(orderId)` just like Electron SQLite does.
+            const lineItems: any[] = Array.isArray(remote.items) ? remote.items : [];
+            const modifierOptionsNested: any[][] = lineItems.map((it) => {
+              if (Array.isArray(it.modifierOptions)) return it.modifierOptions;
+              if (Array.isArray(it.modifier_options)) return it.modifier_options;
+              if (Array.isArray(it.modifiers)) return it.modifiers;
+              return [];
+            });
+            for (let i = 0; i < lineItems.length; i++) {
+              const li = lineItems[i];
+              if (!li) continue;
+              const unitCents = typeof li.unitPriceCents === 'number'
+                ? li.unitPriceCents
+                : (typeof li.unitPrice === 'number' ? Math.round(li.unitPrice * 100) : (typeof li.price === 'number' ? Math.round(li.price * 100) : 0));
+              const subCents = typeof li.subtotalCents === 'number'
+                ? li.subtotalCents
+                : (typeof li.subtotal === 'number' ? Math.round(li.subtotal * 100) : (unitCents * (Number(li.quantity ?? 1) || 1)));
+              const totalCents = typeof li.totalCents === 'number'
+                ? li.totalCents
+                : (typeof li.total === 'number'
+                  ? Math.round(li.total * 100)
+                  : Math.max(0, subCents - (Number(li.discountCents ?? li.discount_cents ?? 0) || 0) + (Number(li.taxCents ?? li.tax_cents ?? 0) || 0)));
+              const liId = String(li.id ?? li._id ?? `${id}__${i}`);
+              const liExists = mockOrderItems.findIndex((x) => String((x as any).id) === String(liId));
               const child = {
-                id: String(li.id),
+                id: liId,
                 order_id: id,
-                menu_item_id: String(li.menu_item_id ?? ''),
-                name_snapshot: String(li.name_snapshot ?? ''),
-                price_snapshot_cents: Number(li.price_snapshot_cents ?? 0) || 0,
+                menu_item_id: String(li.menuItemId ?? li.menu_item_id ?? li.menuId ?? ''),
+                name_snapshot: String(li.name_snapshot ?? li.menuItemName ?? li.name ?? ''),
+                price_snapshot_cents: unitCents,
                 quantity: Number(li.quantity ?? 1) || 1,
-                subtotal_cents: Number(li.subtotal_cents ?? 0) || 0,
-                tax_cents: Number(li.tax_cents ?? 0) || 0,
-                discount_cents: Number(li.discount_cents ?? 0) || 0,
-                total_cents: Number(li.total_cents ?? 0) || 0,
-                special_instructions: li.special_instructions ?? null,
-                preparation_status: String(li.preparation_status ?? 'NEW'),
+                subtotal_cents: subCents,
+                tax_cents: Number(li.taxCents ?? li.tax_cents ?? 0) || 0,
+                discount_cents: Number(li.discountCents ?? li.discount_cents ?? 0) || 0,
+                total_cents: totalCents,
+                special_instructions: (li.notes ?? li.specialInstructions ?? li.special_instructions ?? null) as any,
+                preparation_status: String(li.preparationStatus ?? li.preparation_status ?? 'NEW'),
               };
               if (liExists >= 0) mockOrderItems[liExists] = child as any;
               else mockOrderItems.push(child as any);
 
               // child-of-child: ORDER_ITEM_MODIFIER_OPTION rows
-              const mods = Array.isArray(li._modifierOptions) ? li._modifierOptions : [];
-              for (const mo of mods) {
-                if (!mo?.id) continue;
-                const moIdx = mockOrderItemModifiers.findIndex((m) => String((m as any).id) === String(mo.id));
+              const mods: any[] = modifierOptionsNested[i] || [];
+              for (let j = 0; j < mods.length; j++) {
+                const mo = mods[j];
+                if (!mo) continue;
+                const modId = mo.modifierId ?? mo.modifier_id ?? mo.modifier?.id ?? mo.groupId ?? null;
+                const optId = mo.optionId ?? mo.option_id ?? mo.id ?? mo.option?.id ?? null;
+                if (!modId || !optId) continue;
+                const moId = mo.id ? String(mo.id) : `${liId}__${j}`;
+                const moIdx = mockOrderItemModifiers.findIndex((m) => String((m as any).id) === String(moId));
+                const deltaCents = typeof mo.priceDeltaCents === 'number'
+                  ? mo.priceDeltaCents
+                  : (typeof mo.priceDelta === 'number'
+                    ? Math.round(mo.priceDelta * 100)
+                    : (typeof mo.price === 'number' ? Math.round(mo.price * 100) : 0));
                 const mrow = {
-                  id: String(mo.id),
-                  order_item_id: String(li.id),
-                  modifier_id: String(mo.modifier_id ?? ''),
-                  modifier_name: String(mo.modifier_name ?? ''),
-                  option_id: String(mo.option_id ?? ''),
-                  option_name: String(mo.option_name ?? ''),
-                  price_delta_cents: Number(mo.price_delta_cents ?? 0) || 0,
+                  id: moId,
+                  order_item_id: String(liId),
+                  modifier_id: String(modId),
+                  modifier_name: String(mo.modifierName ?? mo.modifier_name ?? mo.modifier?.name ?? mo.groupName ?? ''),
+                  option_id: String(optId),
+                  option_name: String(mo.optionName ?? mo.option_name ?? mo.option?.name ?? mo.name ?? ''),
+                  price_delta_cents: deltaCents,
                 };
                 if (moIdx >= 0) mockOrderItemModifiers[moIdx] = mrow as any;
                 else mockOrderItemModifiers.push(mrow as any);
@@ -4064,8 +4202,6 @@ export function installMockElectronAPI() {
             console.log(`[mock sync] pulled ${upserted} backend website/QR order(s) into POS mock stores`);
           }
         } catch (e: any) {
-          // Network error, CORS failure, offline — POS cashier works fully
-          // offline anyway; just log and try again in 30s.
           if (e?.name !== 'AbortError') {
             console.debug('[mock sync] pull skipped (network/offline):', e?.message ?? e);
           }

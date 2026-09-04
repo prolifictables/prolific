@@ -6,8 +6,34 @@ export class PaymentsRepository {
 
   create(data: Partial<PaymentRow> & { id: string }): string {
     const now = Date.now();
-    this.db.run(
-      `INSERT INTO payments (
+    const idempotencyKey = typeof (data as any).idempotency_key === 'string' && (data as any).idempotency_key
+      ? String((data as any).idempotency_key)
+      : null;
+
+    // Idempotency pre-check.
+    //  ——
+    // SQLite `idx_payments_idempotency` is a UNIQUE index on
+    // payments.idempotency_key (migrations.ts L420). The exact same race as
+    // the orders side: double-click on confirm or a React StrictMode double
+    // invoke runs payments.create() twice for the same payment → second pass
+    // throws SQLite UNIQUE constraint → PaymentModal's outer catch toasts
+    // "Payment not recorded. Try again." even though the first insert
+    // succeeded.
+    //
+    // Solution mirrors OrdersRepository.create: (1) short-circuit if a row
+    // with same idempotency_key already exists; (2) otherwise INSERT OR
+    // IGNORE and look up the existing id on 0-changes race fallthrough;
+    // (3) never throw for an idempotency collision.
+    if (idempotencyKey) {
+      const existing = this.db.get<{ id: string }>(
+        'SELECT id FROM payments WHERE idempotency_key = ? LIMIT 1',
+        idempotencyKey
+      );
+      if (existing && existing.id) return String(existing.id);
+    }
+
+    const result = this.db.run(
+      `INSERT OR IGNORE INTO payments (
         id, order_id, employee_id, shift_id, branch_id, restaurant_id,
         method, provider, transaction_reference, amount_cents, tip_cents,
         change_due_cents, status, verification_source, completed_at,
@@ -25,6 +51,16 @@ export class PaymentsRepository {
       )`,
       data
     );
+    if (result && typeof result.changes === 'number' && result.changes > 0) {
+      return data.id;
+    }
+    if (idempotencyKey) {
+      const fallback = this.db.get<{ id: string }>(
+        'SELECT id FROM payments WHERE idempotency_key = ? LIMIT 1',
+        idempotencyKey
+      );
+      if (fallback && fallback.id) return String(fallback.id);
+    }
     return data.id;
   }
 
