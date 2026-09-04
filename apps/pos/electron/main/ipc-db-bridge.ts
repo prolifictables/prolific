@@ -256,6 +256,37 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
   );
 
   ipcMain.handle(
+    'db:menu-categories:upsert',
+    wrap('db:menu-categories:upsert', (payload: unknown) => {
+      const c = (payload ?? {}) as any;
+      const fallbackBranchId = getActiveBranchId(repos);
+      const fallbackRestaurantId = getActiveRestaurantId(repos);
+      const now = Date.now();
+      repos.menuCategories.upsertOne({
+        id: String(c.id ?? c._id ?? ''),
+        branch_id: String(c.branchId ?? c.branch_id ?? fallbackBranchId),
+        restaurant_id: String(c.restaurantId ?? c.restaurant_id ?? fallbackRestaurantId),
+        name: c.name != null ? String(c.name) : null,
+        description: c.description != null ? String(c.description) : null,
+        image_url: c.imageUrl != null ? String(c.imageUrl) : c.image_url != null ? String(c.image_url) : null,
+        sort_order: typeof c.sortOrder === 'number' ? c.sortOrder : typeof c.sort_order === 'number' ? c.sort_order : 0,
+        is_active: c.isActive === false || c.is_active === 0 ? 0 : 1,
+        created_at: toEpochMillis(c.createdAt ?? c.created_at) ?? now,
+        updated_at: toEpochMillis(c.updatedAt ?? c.updated_at) ?? now,
+      });
+      return true;
+    })
+  );
+
+  ipcMain.handle(
+    'db:menu-categories:deleteById',
+    wrap('db:menu-categories:deleteById', (id: unknown) => {
+      repos.menuCategories.deleteById(String(id ?? ''));
+      return true;
+    })
+  );
+
+  ipcMain.handle(
     'db:menu-items:list',
     wrap('db:menu-items:list', (filters: unknown) => {
       return repos.menuItems.list(
@@ -283,6 +314,59 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
     'db:menu-items:listByCategory',
     wrap('db:menu-items:listByCategory', (categoryId: unknown) => {
       return repos.menuItems.listByCategory(getActiveBranchId(repos), String(categoryId ?? ''));
+    })
+  );
+
+  ipcMain.handle(
+    'db:menu-items:upsert',
+    wrap('db:menu-items:upsert', (payload: unknown) => {
+      const it = (payload ?? {}) as any;
+      const fallbackBranchId = getActiveBranchId(repos);
+      const fallbackRestaurantId = getActiveRestaurantId(repos);
+      const now = Date.now();
+      const taxIds = Array.isArray(it.taxIds) ? it.taxIds : Array.isArray(it.tax_ids) ? it.tax_ids : [];
+      const modifierIds = Array.isArray(it.modifierIds) ? it.modifierIds : Array.isArray(it.modifier_ids) ? it.modifier_ids : [];
+      const scheduled = it.scheduledAvailability ?? it.scheduled_availability;
+      repos.menuItems.upsertOne({
+        id: String(it.id ?? it._id ?? ''),
+        category_id: it.categoryId != null ? String(it.categoryId) : it.category_id != null ? String(it.category_id) : null,
+        branch_id: String(it.branchId ?? it.branch_id ?? fallbackBranchId),
+        restaurant_id: String(it.restaurantId ?? it.restaurant_id ?? fallbackRestaurantId),
+        sku: it.sku != null ? String(it.sku) : null,
+        name: it.name != null ? String(it.name) : null,
+        description: it.description != null ? String(it.description) : null,
+        image_url: it.imageUrl != null ? String(it.imageUrl) : it.image_url != null ? String(it.image_url) : null,
+        price_cents: typeof it.price === 'number' ? it.price : typeof it.priceCents === 'number' ? it.priceCents : typeof it.price_cents === 'number' ? it.price_cents : 0,
+        cost_cents: typeof it.cost === 'number' ? it.cost : typeof it.costCents === 'number' ? it.costCents : typeof it.cost_cents === 'number' ? it.cost_cents : null,
+        status: it.status != null ? String(it.status) : null,
+        allergen_tags: Array.isArray(it.allergenTags)
+          ? JSON.stringify(it.allergenTags)
+          : typeof it.allergen_tags === 'string'
+            ? it.allergen_tags
+            : null,
+        tax_ids: Array.isArray(taxIds) ? JSON.stringify(taxIds) : null,
+        modifier_ids: Array.isArray(modifierIds) ? JSON.stringify(modifierIds) : null,
+        preparation_needed: it.preparationNeeded === false || it.preparation_needed === 0 ? 0 : 1,
+        kitchen_station: it.kitchenStation != null ? String(it.kitchenStation) : it.kitchen_station != null ? String(it.kitchen_station) : null,
+        version: typeof it.version === 'number' ? it.version : 1,
+        last_modified_at: toEpochMillis(it.lastModifiedAt ?? it.last_modified_at) ?? now,
+        last_modified_by: it.lastModifiedBy != null ? String(it.lastModifiedBy) : it.last_modified_by != null ? String(it.last_modified_by) : null,
+        scheduled_availability: scheduled != null ? JSON.stringify(scheduled) : null,
+        is_tax_inclusive: it.isTaxInclusive === true || it.is_tax_inclusive === 1 ? 1 : 0,
+        max_per_order: typeof it.maxPerOrder === 'number' ? it.maxPerOrder : typeof it.max_per_order === 'number' ? it.max_per_order : 99,
+        is_active: it.isActive === false || it.is_active === 0 ? 0 : 1,
+        created_at: toEpochMillis(it.createdAt ?? it.created_at) ?? now,
+        updated_at: toEpochMillis(it.updatedAt ?? it.updated_at) ?? now,
+      });
+      return true;
+    })
+  );
+
+  ipcMain.handle(
+    'db:menu-items:deleteById',
+    wrap('db:menu-items:deleteById', (id: unknown) => {
+      repos.menuItems.deleteById(String(id ?? ''));
+      return true;
     })
   );
 
@@ -425,6 +509,70 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
     'db:menu-modifiers:listByIds',
     wrap('db:menu-modifiers:listByIds', (ids: unknown) => {
       return repos.menuModifiers.listByIds(Array.isArray(ids) ? ids.map(String) : []);
+    })
+  );
+
+  ipcMain.handle(
+    'db:menu-modifiers:listAll',
+    wrap('db:menu-modifiers:listAll', (branchId: unknown) => {
+      const b =
+        typeof branchId === 'string' && branchId
+          ? branchId
+          : getActiveBranchId(repos);
+      return repos.menuModifiers.listAll(b);
+    })
+  );
+
+  ipcMain.handle(
+    'db:menu-modifiers:listOptionsByModifierIds',
+    wrap('db:menu-modifiers:listOptionsByModifierIds', (ids: unknown) => {
+      return repos.menuModifiers.listAllOptions(Array.isArray(ids) ? ids.map(String) : []);
+    })
+  );
+
+  ipcMain.handle(
+    'db:menu-modifiers:upsert',
+    wrap('db:menu-modifiers:upsert', (payload: unknown) => {
+      const p = (payload ?? {}) as { modifier?: unknown; options?: unknown };
+      const m = (p.modifier ?? {}) as any;
+      const opts = Array.isArray(p.options) ? (p.options as any[]) : [];
+      const fallbackBranchId = getActiveBranchId(repos);
+      const now = Date.now();
+      const modifierId = String(m.id ?? m._id ?? '');
+      const modifierRow = {
+        id: modifierId,
+        branch_id: String(m.branchId ?? m.branch_id ?? fallbackBranchId),
+        name: m.name != null ? String(m.name) : null,
+        description: m.description != null ? String(m.description) : null,
+        is_required: m.required === true || m.is_required === 1 ? 1 : 0,
+        min_select: typeof m.minSelections === 'number' ? m.minSelections : typeof m.min_select === 'number' ? m.min_select : 0,
+        max_select: typeof m.maxSelections === 'number' ? m.maxSelections : typeof m.max_select === 'number' ? m.max_select : 1,
+        is_active: m.isActive === false || m.is_active === 0 ? 0 : 1,
+        created_at: toEpochMillis(m.createdAt ?? m.created_at) ?? now,
+        updated_at: toEpochMillis(m.updatedAt ?? m.updated_at) ?? now,
+      };
+      const optionRows = opts.map((o: any, i: number) => ({
+        id: String(o.id ?? ''),
+        modifier_id: modifierId,
+        name: o.name != null ? String(o.name) : null,
+        price_delta_cents:
+          typeof o.priceDelta === 'number' ? o.priceDelta : typeof o.priceDeltaCents === 'number' ? o.priceDeltaCents : typeof o.price_delta_cents === 'number' ? o.price_delta_cents : 0,
+        is_default: o.isDefault === true || o.is_default === 1 ? 1 : 0,
+        sort_order: typeof o.sortOrder === 'number' ? o.sortOrder : typeof o.sort_order === 'number' ? o.sort_order : i,
+        is_active: o.isActive === false || o.is_active === 0 ? 0 : 1,
+        created_at: toEpochMillis(o.createdAt ?? o.created_at) ?? now,
+        updated_at: toEpochMillis(o.updatedAt ?? o.updated_at) ?? now,
+      }));
+      repos.menuModifiers.upsertOneWithOptions({ modifier: modifierRow, options: optionRows });
+      return true;
+    })
+  );
+
+  ipcMain.handle(
+    'db:menu-modifiers:deleteById',
+    wrap('db:menu-modifiers:deleteById', (id: unknown) => {
+      repos.menuModifiers.deleteById(String(id ?? ''));
+      return true;
     })
   );
 
@@ -1393,6 +1541,35 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
           typeof p.metadata === 'object' && p.metadata
             ? JSON.stringify(p.metadata)
             : null,
+      });
+    })
+  );
+
+  // --- Offline Reports Aggregation ---
+
+  ipcMain.handle(
+    'db:reports:periodSales',
+    wrap('db:reports:periodSales', (opts: unknown) => {
+      const o = (opts ?? {}) as Record<string, unknown>;
+      return repos.reports.periodSales({
+        period: (o.period as any) ?? 'DAY',
+        year: o.year != null ? Number(o.year) : undefined,
+        month: o.month != null ? Number(o.month) : undefined,
+        weekStartTs: o.weekStartTs != null ? Number(o.weekStartTs) : undefined,
+        dayTs: o.dayTs != null ? Number(o.dayTs) : undefined,
+        branchId: o.branchId != null ? (o.branchId as string | null) : undefined,
+        restaurantId: o.restaurantId != null ? (o.restaurantId as string | null) : undefined,
+      });
+    })
+  );
+
+  ipcMain.handle(
+    'db:reports:availableYears',
+    wrap('db:reports:availableYears', (scope: unknown) => {
+      const s = (scope ?? {}) as Record<string, unknown>;
+      return repos.reports.listAvailableYears({
+        branchId: s.branchId != null ? (s.branchId as string | null) : undefined,
+        restaurantId: s.restaurantId != null ? (s.restaurantId as string | null) : undefined,
       });
     })
   );

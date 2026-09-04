@@ -17,6 +17,7 @@ import CartPanel from './CartPanel';
 import ShiftModal from './ShiftModal';
 import TableTabDetailsModal from './TableTabDetailsModal';
 import ManagerTools from './ManagerTools';
+import ReportsPanel from './ReportsPanel';
 
 type SidebarTab = 'MENU' | 'TABLES' | 'HISTORY' | 'SHIFT' | 'REPORTS' | 'MANAGER';
 
@@ -1501,8 +1502,24 @@ export default function CashierScreenLayout() {
                 tab="SHIFT"
                 subtitle="Use the modal to open / close your shift and reconcile float."
                 actions={[
-                  { label: '🔓 Open Shift', variant: 'primary', onClick: () => setShowShiftModal('OPEN') },
-                  { label: '🔒 Close Shift', variant: 'secondary', onClick: () => setShowShiftModal('CLOSE') },
+                  {
+                    label: '🔓 Open Shift',
+                    variant: 'primary',
+                    disabled: !!openShift.shiftId,
+                    title: openShift.shiftId
+                      ? 'A shift is already open — close it first before opening a new one.'
+                      : 'Open a new shift and count opening cash in the drawer.',
+                    onClick: () => setShowShiftModal('OPEN'),
+                  },
+                  {
+                    label: '🔒 Close Shift',
+                    variant: 'secondary',
+                    disabled: !openShift.shiftId,
+                    title: openShift.shiftId
+                      ? 'Close the current open shift — shows professional reconciliation.'
+                      : 'No open shift to close. Open a new shift first.',
+                    onClick: () => setShowShiftModal('CLOSE'),
+                  },
                 ]}
               />
             )}
@@ -1516,6 +1533,25 @@ export default function CashierScreenLayout() {
                 branchId={branch?.id}
                 employeeRole={employee?.role as any}
                 connectionStatus={connection.status}
+                // Transparent 401 recovery: if a Manager API call returns
+                // "Invalid or expired token" (common combination of
+                // offline-first login that never promoted, or a token that
+                // timed out after 1h idle), silently re-run pinLogin using
+                // the cached offlinePin → promoteOnlineLogin to inject a
+                // fresh access token → the API layer inside
+                // remote-menu-admin call<T> retries the EXACT same request
+                // once. This zero-interaction recovery resolves your exact
+                // screenshot: "Couldn't load data / Invalid or expired token".
+                reauthAccessToken={async (_failedToken, _lastErr) => {
+                  let deviceId: string | undefined;
+                  try {
+                    const did: any = await window.electronAPI?.getDeviceId?.();
+                    if (typeof did === 'string' && did) deviceId = did;
+                    else if (did && typeof did === 'object' && did.deviceId) deviceId = String(did.deviceId);
+                  } catch { /* ignore */ }
+                  const fn = authActions.refreshAccessToken;
+                  return await fn({ deviceId });
+                }}
                 onMenuChanged={async () => {
                   // After a manager edit, re-fetch the full public menu and
                   // dual-write the snapshot to in-memory cache + localStorage
@@ -1833,7 +1869,13 @@ export default function CashierScreenLayout() {
 function PlaceholderPanel({ tab, subtitle, actions }: {
   tab: SidebarTab;
   subtitle?: string;
-  actions?: { label: string; variant: 'primary' | 'secondary' | 'neon-pink' | 'neon-cyan'; onClick: () => void }[];
+  actions?: {
+    label: string;
+    variant: 'primary' | 'secondary' | 'neon-pink' | 'neon-cyan';
+    onClick: () => void;
+    disabled?: boolean;
+    title?: string;
+  }[];
 }) {
   const tabMeta = ALL_SIDEBAR_TABS_META.find((t) => t.id === tab);
   const icon = tabMeta?.icon || '🧭';
@@ -1857,11 +1899,27 @@ function PlaceholderPanel({ tab, subtitle, actions }: {
         </p>
         {actions && actions.length > 0 && (
           <div className={`relative mt-8 grid gap-3 ${actions.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
-            {actions.map((a) => (
-              <button key={a.label} onClick={a.onClick} className={a.variant === 'primary' ? 'btn-primary' : a.variant === 'secondary' ? 'btn-secondary' : a.variant === 'neon-pink' ? 'btn-neon-pink' : 'btn-neon-cyan'}>
-                {a.label}
-              </button>
-            ))}
+            {actions.map((a) => {
+              const baseClass = a.variant === 'primary'
+                ? 'btn-primary'
+                : a.variant === 'secondary'
+                  ? 'btn-secondary'
+                  : a.variant === 'neon-pink'
+                    ? 'btn-neon-pink'
+                    : 'btn-neon-cyan';
+              const disabledClass = a.disabled ? ' opacity-50 cursor-not-allowed grayscale-[60%]' : '';
+              return (
+                <button
+                  key={a.label}
+                  onClick={a.onClick}
+                  disabled={!!a.disabled}
+                  title={a.title}
+                  className={`${baseClass}${disabledClass}`}
+                >
+                  {a.label}
+                </button>
+              );
+            })}
           </div>
         )}
       </div>
@@ -2696,191 +2754,3 @@ function HistoryPanel({
   );
 }
 
-// ====================== ReportsPanel: Quick shift stats ======================
-function ReportsPanel({ orders, employee, shift }: { orders: any[]; employee: any; shift: OpenShiftState }) {
-  const paid = orders.filter((o) => o.paymentStatus === 'PAID' || ['COMPLETED', 'DELIVERED', 'CLOSED'].includes(o.status || ''));
-  const revenueCents = paid.reduce((s, o) => s + Math.round((o.totalAmount || 0) * 100), 0);
-  const ordersCount = orders.length;
-  const avgCents = ordersCount > 0 ? Math.round(revenueCents / ordersCount) : 0;
-
-  const topItems = useMemo(() => {
-    const tally: Record<string, { name: string; qty: number; revenue: number }> = {};
-    for (const o of orders) {
-      for (const it of o.items || []) {
-        const key = it.menuItemId || it.name || 'unknown';
-        const entry = tally[key] || { name: it.name, qty: 0, revenue: 0 };
-        entry.qty += it.quantity || 1;
-        entry.revenue += (it.unitPrice || 0) * (it.quantity || 1);
-        tally[key] = entry;
-      }
-    }
-    return Object.values(tally).sort((a, b) => b.qty - a.qty).slice(0, 6);
-  }, [orders]);
-
-  const byStatus = useMemo(() => {
-    const m: Record<string, number> = {};
-    for (const o of orders) m[o.status || 'NEW'] = (m[o.status || 'NEW'] || 0) + 1;
-    return m;
-  }, [orders]);
-
-  const shiftElapsed = shift.openedAt ? Date.now() - shift.openedAt : 0;
-  const hrs = Math.floor(shiftElapsed / 3600000);
-  const mins = Math.floor((shiftElapsed % 3600000) / 60000);
-
-  const cards = [
-    { label: 'Revenue', value: formatCentsToNgn(revenueCents), sub: `${paid.length} paid orders`, icon: '💰', tint: 'from-[#FFD700]/30' },
-    { label: 'Orders', value: ordersCount.toString(), sub: `${Object.values(byStatus).reduce((a, b) => a + b, 0) || 0} total lifecycle`, icon: '📦', tint: 'from-[#CD7F32]/30' },
-    { label: 'Avg Order', value: formatCentsToNgn(avgCents), sub: 'Across all orders', icon: '📊', tint: 'from-[#EA580C]/28' },
-    { label: 'Shift Length', value: `${hrs}h ${pad2(mins)}m`, sub: shift.shiftId ? 'Since opened' : 'Shift not yet opened', icon: '🕒', tint: 'from-[#22D3EE]/26' },
-  ];
-
-  return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-y-auto">
-      <div className="p-6 pb-4 border-b border-white/5 bg-slate-900/30 backdrop-blur-xl space-y-3">
-        <div className="flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <div className="text-[11px] uppercase tracking-[0.18em] font-black text-amber-400/80">Live Analytics</div>
-            <h2 className="text-3xl font-black mt-1">
-              <span className="text-gradient-neon animate-text-glow">Reports</span>
-              <span className="text-white"> · Shift Console</span>
-            </h2>
-            <div className="mt-2 text-sm text-ink-300 font-semibold">
-              Cashier: <span className="text-white font-bold">{employee?.firstName || employee?.name || '—'} {employee?.lastName || ''}</span>
-              <span className="dot-separator mx-2.5 align-middle" />
-              Branch: <span className="text-white font-bold">{employee?.branch?.name || 'Main Branch'}</span>
-            </div>
-          </div>
-          <div className="chip-neon !py-2 !px-4 !text-xs !font-black uppercase tracking-[0.14em]">
-            📈 {new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
-          </div>
-        </div>
-      </div>
-
-      <div className="p-6 space-y-6">
-        {/* KPI cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          {cards.map((c) => (
-            <div key={c.label} className="card-glow card neon-border p-5 relative overflow-hidden group">
-              <div className={`absolute -top-16 -right-16 h-40 w-40 rounded-full blur-3xl opacity-60 bg-gradient-to-br ${c.tint} to-transparent group-hover:opacity-90 transition-opacity`} />
-              <div className="flex items-start justify-between mb-4 relative">
-                <div className="text-[11px] uppercase tracking-[0.18em] font-black text-ink-300">{c.label}</div>
-                <div className="h-11 w-11 rounded-2xl shadow-glow-restaurant flex items-center justify-center text-xl animate-float-slow ring-1 ring-inset ring-white/15"
-                  style={{ background: 'linear-gradient(135deg, rgba(255,215,0,0.20) 0%, rgba(205,127,50,0.15) 100%)' }}
-                >
-                  {c.icon}
-                </div>
-              </div>
-              <div className="text-3xl font-black text-white leading-none mb-2 relative tabular-nums">
-                {c.value}
-              </div>
-              <div className="text-xs text-ink-300 font-bold relative">{c.sub}</div>
-            </div>
-          ))}
-        </div>
-
-        {/* 2-column split */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          {/* Top items */}
-          <div className="lg:col-span-2 card-glow card p-6 relative overflow-hidden">
-            <div className="absolute inset-x-0 top-0 h-1 bg-gradient-neon" />
-            <div className="flex items-center justify-between mb-5">
-              <div>
-                <div className="text-[11px] uppercase tracking-[0.18em] font-black text-amber-400/80">Performance</div>
-                <h3 className="text-xl font-black text-white mt-1">🏆 Top Selling Items</h3>
-              </div>
-              <div className="chip !py-1 !px-3 !text-xs !font-bold uppercase tracking-widest text-amber-300 !ring-amber-400/30 !bg-amber-500/10">
-                Top {topItems.length}
-              </div>
-            </div>
-            {topItems.length === 0 ? (
-              <div className="text-center py-12 text-ink-300">No sales yet — create orders in Menu tab to populate reports.</div>
-            ) : (
-              <div className="space-y-3">
-                {topItems.map((it, i) => {
-                  const max = topItems[0]?.qty || 1;
-                  const pct = Math.max(4, Math.round((it.qty / max) * 100));
-                  return (
-                    <div key={i} className="relative">
-                      <div className="flex items-center justify-between text-sm mb-2 relative z-10">
-                        <div className="flex items-center gap-3 min-w-0">
-                          <span className="h-8 w-8 rounded-xl flex items-center justify-center text-xs font-black text-slate-950 shadow-glow-restaurant shrink-0"
-                            style={{ background: i === 0 ? 'linear-gradient(135deg, #FFD700, #D4AF37)' : i === 1 ? 'linear-gradient(135deg, #CD7F32, #EA580C)' : 'linear-gradient(135deg, rgba(212,175,55,0.6), rgba(205,127,50,0.6))' }}
-                          >
-                            {i + 1}
-                          </span>
-                          <div className="font-bold text-white truncate">{it.name}</div>
-                        </div>
-                        <div className="text-ink-200 font-bold tabular-nums shrink-0 ml-3 flex items-center gap-3">
-                          <span className="chip-neon !py-0.5 !px-2.5 !text-[11px]">
-                            {it.qty} sold
-                          </span>
-                          <span className="text-amber-300">
-                            ₦{(it.revenue || 0).toFixed(0)}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="h-2.5 rounded-full bg-white/5 ring-1 ring-inset ring-white/10 overflow-hidden relative">
-                        <div className="h-full rounded-full animate-neon-pulse"
-                          style={{
-                            width: `${pct}%`,
-                            background: 'linear-gradient(90deg, #FFD700 0%, #D4AF37 45%, #CD7F32 100%)',
-                            boxShadow: '0 0 14px -2px rgba(212,175,55,0.7)',
-                          }}
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {/* Status breakdown */}
-          <div className="card-glow card p-6 relative overflow-hidden">
-            <div className="absolute inset-x-0 top-0 h-1" style={{ background: 'linear-gradient(90deg, #22D3EE, #CD7F32, #FFD700)' }} />
-            <div className="mb-5">
-              <div className="text-[11px] uppercase tracking-[0.18em] font-black text-amber-400/80">Snapshot</div>
-              <h3 className="text-xl font-black text-white mt-1">📊 Order Status</h3>
-            </div>
-            <div className="space-y-3">
-              {Object.entries(ORDER_STATUS_STYLES).filter(([k]) => !['COMPLETED', 'CANCELLED'].includes(k)).map(([k, stl]) => {
-                const cnt = k === 'CLOSED' ? (byStatus.CLOSED || 0) + (byStatus.COMPLETED || 0) : byStatus[k] || 0;
-                const pct = Math.max(0, Math.round((cnt / Math.max(1, orders.length)) * 100));
-                return (
-                  <div key={k}>
-                    <div className="flex items-center justify-between text-xs mb-1.5">
-                      <div className="flex items-center gap-2">
-                        <span className={`status-dot ${stl.dot}`} />
-                        <span className="font-black text-white">{stl.label}</span>
-                      </div>
-                      <span className="font-bold text-ink-200 tabular-nums">{cnt} · {pct}%</span>
-                    </div>
-                    <div className="h-2.5 rounded-full bg-white/5 ring-1 ring-inset ring-white/10 overflow-hidden">
-                      <div className={`h-full rounded-full ${stl.bg}`} style={{ width: `${pct}%`, boxShadow: '0 0 10px -2px rgba(212,175,55,0.45)' }} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="mt-6 pt-5 border-t border-white/5">
-              <div className="text-[11px] uppercase tracking-[0.16em] font-black text-ink-300 mb-3">Opening Float</div>
-              <div className="text-2xl font-black text-gradient-neon tabular-nums">
-                {shift.openingCashCents ? formatCentsToNgn(shift.openingCashCents) : '— Not opened'}
-              </div>
-              <div className="text-xs text-ink-300 mt-1.5 font-semibold">
-                {shift.openedAt
-                  ? `Since ${new Date(shift.openedAt).toLocaleTimeString()}`
-                  : 'Open your shift in the Shift tab →'}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function pad2(n: number) {
-  return n < 10 ? `0${n}` : `${n}`;
-}

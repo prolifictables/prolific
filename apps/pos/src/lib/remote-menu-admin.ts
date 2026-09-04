@@ -17,6 +17,17 @@
  *   professional implementation we DISABLE save buttons when the connection
  *   status is not 'ONLINE' and throw a clear error. A future v2 can integrate
  *   with the existing sync queue for deferred push + merge.
+ *
+ * Token management (v2 — fixes "Invalid or expired token" on Manager tab):
+ *   Cashier flow logs in via PIN → POS navigates immediately to /pos via offline
+ *   verify (< 50ms) → access token may NOT be set yet if Render was cold or the
+ *   background warm never completed. Manager tab's API calls therefore need a
+ *   transparent refresh layer:
+ *     1. If the caller provides a custom `reauth` callback (set by CashierScreen)
+ *        and we hit HTTP 401 → callback runs to refresh credentials → the EXACT
+ *        same fetch is retried exactly ONCE with the new token.
+ *     2. If the refresh callback is not provided, 401s fall through to the
+ *        normal error throw so old callers behave identically.
  */
 import type { MenuCategory, MenuItem, MenuModifier } from '@prolific/shared-types';
 import { resolveApiBase, guardedFetch, SERVER_UNREACHABLE_MARKER } from './remote-auth';
@@ -24,6 +35,16 @@ import { resolveApiBase, guardedFetch, SERVER_UNREACHABLE_MARKER } from './remot
 const API_BASE = resolveApiBase();
 
 export type ApiListResult<T> = { data: T[] } | T[];
+
+/**
+ * Optional callback used by `call<T>` to refresh credentials on 401.
+ * Returns a FRESH access token string (never the stale input). If the callback
+ * throws, the original 401 response error is re-thrown to the caller.
+ */
+export type ReauthCallback = (
+  failedAccessToken: string,
+  lastError: string | Error | unknown
+) => Promise<string>;
 
 // Unwrap either { data: [...] } or plain [...] responses consistently.
 function unwrapList<T>(raw: unknown): T[] {
@@ -78,13 +99,13 @@ function normalizeDocIds<T extends Record<string, any>>(doc: T | null | undefine
   return cloned as T;
 }
 
-async function call<T>(
+async function callOnce<T>(
   accessToken: string,
   method: 'GET' | 'POST' | 'PATCH' | 'DELETE' | 'PUT',
   path: string,
   body?: unknown,
   opts?: { timeoutMs?: number },
-): Promise<T> {
+): Promise<{ res: Response; json: any }> {
   const url = `${API_BASE}${path}`;
   const fetchInit: RequestInit = {
     method,
@@ -106,6 +127,38 @@ async function call<T>(
   } catch {
     // empty body — no problem (e.g. DELETE 204/200 with no payload)
   }
+  return { res, json };
+}
+
+async function call<T>(
+  accessToken: string,
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE' | 'PUT',
+  path: string,
+  body?: unknown,
+  opts?: { timeoutMs?: number; reauth?: ReauthCallback },
+): Promise<T> {
+  let token = accessToken;
+  let result = await callOnce<T>(token, method, path, body, opts);
+  let threw401: Error | null = null;
+  if (!result.res.ok && result.res.status === 401 && opts?.reauth) {
+    const msg =
+      (result.json && (result.json.error?.message || result.json.message || JSON.stringify(result.json.error))) ||
+      `HTTP ${result.res.status}`;
+    threw401 = new Error(msg);
+    try {
+      // Caller-provided refresh (normally auth-store.refreshAccessToken()).
+      // Returns the new token string; we retry the EXACT same request once.
+      token = await opts.reauth(token, threw401);
+      result = await callOnce<T>(token, method, path, body, opts);
+      threw401 = null;
+    } catch (refreshErr) {
+      // Refresh failed → fall through to the original 401 error so the user
+      // sees the server-provided message (e.g. "Invalid or expired token")
+      // rather than a refresh-internal message.
+      console.warn('[admin-menu] 401 refresh attempt failed', refreshErr);
+    }
+  }
+  const { res, json } = result;
   if (!res.ok) {
     const msg =
       (json && (json.error?.message || json.message || JSON.stringify(json.error))) ||
@@ -113,6 +166,10 @@ async function call<T>(
     if (res.status >= 500) {
       throw new Error(`${SERVER_UNREACHABLE_MARKER}: ${msg}`);
     }
+    // If a 401 path just went through a failed refresh, throw the server's
+    // error but prepend context so CashierScreen can render a better message
+    // than the generic "Invalid or expired token".
+    if (threw401) throw threw401;
     throw new Error(msg);
   }
   // Some endpoints return { data: <doc } envelope, others return the doc raw.
@@ -130,31 +187,34 @@ export interface AdminCategoryInput {
   isActive?: boolean;
 }
 
-export async function listAdminCategories(accessToken: string): Promise<MenuCategory[]> {
-  const raw = await call<ApiListResult<MenuCategory>>(accessToken, 'GET', '/menu/categories');
+export async function listAdminCategories(accessToken: string, opts?: { reauth?: ReauthCallback; timeoutMs?: number }): Promise<MenuCategory[]> {
+  const raw = await call<ApiListResult<MenuCategory>>(accessToken, 'GET', '/menu/categories', undefined, opts);
   return unwrapList<MenuCategory>(raw);
 }
 
 export async function createAdminCategory(
   accessToken: string,
   input: AdminCategoryInput,
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuCategory> {
-  return call<MenuCategory>(accessToken, 'POST', '/menu/categories', input);
+  return call<MenuCategory>(accessToken, 'POST', '/menu/categories', input, opts);
 }
 
 export async function updateAdminCategory(
   accessToken: string,
   categoryId: string,
   patch: Partial<AdminCategoryInput>,
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuCategory> {
-  return call<MenuCategory>(accessToken, 'PATCH', `/menu/categories/${encodeURIComponent(categoryId)}`, patch);
+  return call<MenuCategory>(accessToken, 'PATCH', `/menu/categories/${encodeURIComponent(categoryId)}`, patch, opts);
 }
 
 export async function deleteAdminCategory(
   accessToken: string,
   categoryId: string,
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuCategory> {
-  return call<MenuCategory>(accessToken, 'DELETE', `/menu/categories/${encodeURIComponent(categoryId)}`);
+  return call<MenuCategory>(accessToken, 'DELETE', `/menu/categories/${encodeURIComponent(categoryId)}`, undefined, opts);
 }
 
 // ============================ Menu Items =======================================
@@ -189,6 +249,7 @@ export interface ListAdminItemsFilters {
 export async function listAdminMenuItems(
   accessToken: string,
   filters: ListAdminItemsFilters = {},
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuItem[]> {
   const qp = new URLSearchParams();
   if (filters.status) qp.set('status', filters.status);
@@ -198,6 +259,8 @@ export async function listAdminMenuItems(
     accessToken,
     'GET',
     `/menu/items${qp.toString() ? `?${qp.toString()}` : ''}`,
+    undefined,
+    opts,
   );
   return unwrapList<MenuItem>(raw);
 }
@@ -205,23 +268,26 @@ export async function listAdminMenuItems(
 export async function createAdminMenuItem(
   accessToken: string,
   input: AdminMenuItemInput,
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuItem> {
-  return call<MenuItem>(accessToken, 'POST', '/menu/items', input);
+  return call<MenuItem>(accessToken, 'POST', '/menu/items', input, opts);
 }
 
 export async function updateAdminMenuItem(
   accessToken: string,
   itemId: string,
   patch: Partial<AdminMenuItemInput>,
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuItem> {
-  return call<MenuItem>(accessToken, 'PATCH', `/menu/items/${encodeURIComponent(itemId)}`, patch);
+  return call<MenuItem>(accessToken, 'PATCH', `/menu/items/${encodeURIComponent(itemId)}`, patch, opts);
 }
 
 export async function deleteAdminMenuItem(
   accessToken: string,
   itemId: string,
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuItem> {
-  return call<MenuItem>(accessToken, 'DELETE', `/menu/items/${encodeURIComponent(itemId)}`);
+  return call<MenuItem>(accessToken, 'DELETE', `/menu/items/${encodeURIComponent(itemId)}`, undefined, opts);
 }
 
 // ============================ Modifiers ========================================
@@ -244,31 +310,34 @@ export interface AdminModifierInput {
   options: AdminModifierOptionInput[];
 }
 
-export async function listAdminModifiers(accessToken: string): Promise<MenuModifier[]> {
-  const raw = await call<ApiListResult<MenuModifier>>(accessToken, 'GET', '/menu/modifiers');
+export async function listAdminModifiers(accessToken: string, opts?: { reauth?: ReauthCallback; timeoutMs?: number }): Promise<MenuModifier[]> {
+  const raw = await call<ApiListResult<MenuModifier>>(accessToken, 'GET', '/menu/modifiers', undefined, opts);
   return unwrapList<MenuModifier>(raw);
 }
 
 export async function createAdminModifier(
   accessToken: string,
   input: AdminModifierInput,
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuModifier> {
-  return call<MenuModifier>(accessToken, 'POST', '/menu/modifiers', input);
+  return call<MenuModifier>(accessToken, 'POST', '/menu/modifiers', input, opts);
 }
 
 export async function updateAdminModifier(
   accessToken: string,
   modifierId: string,
   patch: Partial<AdminModifierInput>,
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuModifier> {
-  return call<MenuModifier>(accessToken, 'PATCH', `/menu/modifiers/${encodeURIComponent(modifierId)}`, patch);
+  return call<MenuModifier>(accessToken, 'PATCH', `/menu/modifiers/${encodeURIComponent(modifierId)}`, patch, opts);
 }
 
 export async function deleteAdminModifier(
   accessToken: string,
   modifierId: string,
+  opts?: { reauth?: ReauthCallback; timeoutMs?: number },
 ): Promise<MenuModifier> {
-  return call<MenuModifier>(accessToken, 'DELETE', `/menu/modifiers/${encodeURIComponent(modifierId)}`);
+  return call<MenuModifier>(accessToken, 'DELETE', `/menu/modifiers/${encodeURIComponent(modifierId)}`, undefined, opts);
 }
 
 export const REMOTE_MENU_ADMIN_API_BASE = API_BASE;

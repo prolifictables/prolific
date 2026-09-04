@@ -9,6 +9,9 @@ import { Payment } from '../payments/schemas/payment.schema';
 import { Customer } from '../customers/schemas/customer.schema';
 import { Shift } from '../shifts/schemas/shift.schema';
 import { CashAdjustment } from '../shifts/schemas/cash-adjustment.schema';
+import { MenuCategory } from '../menu/schemas/menu-category.schema';
+import { MenuItem } from '../menu/schemas/menu-item.schema';
+import { MenuModifier } from '../menu/schemas/menu-modifier.schema';
 import { AuditLogsService } from '../audit/audit-logs.service';
 
 export interface SyncCommand {
@@ -47,7 +50,9 @@ const SYNC_ELIGIBLE_ENTITY_TYPES = [
   'CASH_ADJUSTMENT',
   'KITCHEN_ORDER',
   'TABLE_SESSION',
+  'MENU_CATEGORY',
   'MENU_ITEM',
+  'MENU_MODIFIER',
   'INVENTORY_TRANSACTION',
 ];
 
@@ -78,6 +83,9 @@ export class SyncService {
     @InjectModel(Customer.name) private readonly customerModel: Model<Customer>,
     @InjectModel(Shift.name) private readonly shiftModel: Model<Shift>,
     @InjectModel(CashAdjustment.name) private readonly cashAdjustmentModel: Model<CashAdjustment>,
+    @InjectModel(MenuCategory.name) private readonly menuCategoryModel: Model<MenuCategory>,
+    @InjectModel(MenuItem.name) private readonly menuItemModel: Model<MenuItem>,
+    @InjectModel(MenuModifier.name) private readonly menuModifierModel: Model<MenuModifier>,
     private readonly auditLogsService: AuditLogsService
   ) {}
 
@@ -306,6 +314,15 @@ export class SyncService {
 
       case 'CASH_ADJUSTMENT':
         return this.applyCashAdjustmentCommand(restaurantId, branchId, cmd);
+
+      case 'MENU_CATEGORY':
+        return this.applyMenuCategoryCommand(restaurantId, branchId, cmd);
+
+      case 'MENU_ITEM':
+        return this.applyMenuItemCommand(restaurantId, branchId, cmd);
+
+      case 'MENU_MODIFIER':
+        return this.applyMenuModifierCommand(restaurantId, branchId, cmd);
 
       default:
         throw new Error(`Unsupported sync entityType: ${cmd.entityType}`);
@@ -757,6 +774,244 @@ export class SyncService {
     }
 
     throw new Error(`Unsupported operation for CASH_ADJUSTMENT: ${cmd.operation}`);
+  }
+
+  private async applyMenuCategoryCommand(
+    restaurantId: string | undefined,
+    branchId: string | undefined,
+    cmd: SyncCommand
+  ): Promise<{
+    entityId: string | null;
+    snapshot: Record<string, unknown> | null;
+    serverVersion: number | undefined;
+    conflictDetected: boolean;
+  }> {
+    const payload = cmd.payload;
+
+    if (!restaurantId || !branchId) {
+      throw new Error('restaurantId and branchId required for MENU_CATEGORY sync');
+    }
+
+    if (cmd.operation === 'CREATE') {
+      const created = await this.menuCategoryModel.create({
+        restaurantId,
+        branchId,
+        ...payload,
+      });
+      return {
+        entityId: created._id.toString(),
+        snapshot: toPlain(created),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    if (cmd.operation === 'UPDATE') {
+      const entityId = cmd.entityId ?? (payload._id as string) ?? (payload.id as string);
+      if (!entityId) throw new Error('UPDATE MENU_CATEGORY requires entityId');
+
+      const existing = await this.menuCategoryModel.findById(entityId).exec();
+      if (existing) {
+        const updated = await this.menuCategoryModel
+          .findByIdAndUpdate(entityId, { $set: payload }, { new: true })
+          .exec();
+        return {
+          entityId,
+          snapshot: toPlain(updated),
+          serverVersion: 0,
+          conflictDetected: false,
+        };
+      }
+
+      const upserted = await this.menuCategoryModel.create({
+        _id: entityId,
+        restaurantId,
+        branchId,
+        ...payload,
+      });
+      return {
+        entityId,
+        snapshot: toPlain(upserted),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    if (cmd.operation === 'DELETE') {
+      const entityId = cmd.entityId ?? (payload._id as string) ?? (payload.id as string);
+      if (!entityId) throw new Error('DELETE MENU_CATEGORY requires entityId');
+      const softDeleted = await this.menuCategoryModel
+        .findByIdAndUpdate(entityId, { $set: { isActive: false } }, { new: true })
+        .exec();
+      return {
+        entityId,
+        snapshot: toPlain(softDeleted),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    throw new Error(`Unknown operation for MENU_CATEGORY: ${cmd.operation}`);
+  }
+
+  private async applyMenuItemCommand(
+    restaurantId: string | undefined,
+    branchId: string | undefined,
+    cmd: SyncCommand
+  ): Promise<{
+    entityId: string | null;
+    snapshot: Record<string, unknown> | null;
+    serverVersion: number | undefined;
+    conflictDetected: boolean;
+  }> {
+    const payload = cmd.payload;
+
+    if (!restaurantId || !branchId) {
+      throw new Error('restaurantId and branchId required for MENU_ITEM sync');
+    }
+
+    if (cmd.operation === 'CREATE') {
+      const created = await this.menuItemModel.create({
+        restaurantId,
+        branchId,
+        ...payload,
+      });
+      return {
+        entityId: created._id.toString(),
+        snapshot: toPlain(created),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    if (cmd.operation === 'UPDATE') {
+      const entityId = cmd.entityId ?? (payload._id as string) ?? (payload.id as string);
+      if (!entityId) throw new Error('UPDATE MENU_ITEM requires entityId');
+
+      const existing = await this.menuItemModel.findById(entityId).exec();
+      if (existing) {
+        const updated = await this.menuItemModel
+          .findOneAndUpdate({ _id: entityId }, { $set: payload }, { new: true })
+          .exec();
+        return {
+          entityId,
+          snapshot: toPlain(updated),
+          serverVersion: 0,
+          conflictDetected: false,
+        };
+      }
+
+      const upserted = await this.menuItemModel.create({
+        _id: entityId,
+        restaurantId,
+        branchId,
+        ...payload,
+      });
+      return {
+        entityId,
+        snapshot: toPlain(upserted),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    if (cmd.operation === 'DELETE') {
+      const entityId = cmd.entityId ?? (payload._id as string) ?? (payload.id as string);
+      if (!entityId) throw new Error('DELETE MENU_ITEM requires entityId');
+      const softDeleted = await this.menuItemModel
+        .findByIdAndUpdate(
+          entityId,
+          { $set: { isActive: 0, status: S.MenuItemStatus.DISABLED } },
+          { new: true }
+        )
+        .exec();
+      return {
+        entityId,
+        snapshot: toPlain(softDeleted),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    throw new Error(`Unknown operation for MENU_ITEM: ${cmd.operation}`);
+  }
+
+  private async applyMenuModifierCommand(
+    restaurantId: string | undefined,
+    branchId: string | undefined,
+    cmd: SyncCommand
+  ): Promise<{
+    entityId: string | null;
+    snapshot: Record<string, unknown> | null;
+    serverVersion: number | undefined;
+    conflictDetected: boolean;
+  }> {
+    const payload = cmd.payload;
+
+    if (!restaurantId || !branchId) {
+      throw new Error('restaurantId and branchId required for MENU_MODIFIER sync');
+    }
+
+    if (cmd.operation === 'CREATE') {
+      const created = await this.menuModifierModel.create({
+        restaurantId,
+        branchId,
+        ...payload,
+      });
+      return {
+        entityId: created._id.toString(),
+        snapshot: toPlain(created),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    if (cmd.operation === 'UPDATE') {
+      const entityId = cmd.entityId ?? (payload._id as string) ?? (payload.id as string);
+      if (!entityId) throw new Error('UPDATE MENU_MODIFIER requires entityId');
+
+      const existing = await this.menuModifierModel.findById(entityId).exec();
+      if (existing) {
+        const updated = await this.menuModifierModel
+          .findByIdAndUpdate(entityId, { $set: payload }, { new: true })
+          .exec();
+        return {
+          entityId,
+          snapshot: toPlain(updated),
+          serverVersion: 0,
+          conflictDetected: false,
+        };
+      }
+
+      const upserted = await this.menuModifierModel.create({
+        _id: entityId,
+        restaurantId,
+        branchId,
+        ...payload,
+      });
+      return {
+        entityId,
+        snapshot: toPlain(upserted),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    if (cmd.operation === 'DELETE') {
+      const entityId = cmd.entityId ?? (payload._id as string) ?? (payload.id as string);
+      if (!entityId) throw new Error('DELETE MENU_MODIFIER requires entityId');
+      const softDeleted = await this.menuModifierModel
+        .findByIdAndUpdate(entityId, { $set: { isActive: 0 } }, { new: true })
+        .exec();
+      return {
+        entityId,
+        snapshot: toPlain(softDeleted),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    throw new Error(`Unknown operation for MENU_MODIFIER: ${cmd.operation}`);
   }
 
   async pullUpdates(

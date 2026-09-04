@@ -378,6 +378,51 @@ export default function ShiftModal({ mode, openShift, onClose, onDone }: ShiftMo
           const idFromObj = (res as any).id || (res as any)._id || (res as any).shiftId;
           if (idFromObj) resolvedId = String(idFromObj);
         }
+        // =================================================================
+        // 100% OFFLINE shift open: after persisting to local SQLite, enqueue
+        // a SHIFT CREATE record into sync_queue with the same server-shape
+        // payload used by the server sync.service applyShiftCommand.
+        // When the POS reconnects, command-queue-reader picks the row up
+        // (FIFO by id ASC, 1.5s poll interval) and forwards the shift open
+        // to Render Mongo — no network required at open time.
+        // =================================================================
+        try {
+          const serverShapePayload = {
+            id: resolvedId,
+            deviceId: deviceId || undefined,
+            branchId: String(branch.id),
+            restaurantId: String(restaurant.id),
+            employeeId: String(employee.id),
+            status: 'OPEN',
+            openingCashCents: amountCents,
+            expectedCashCents: 0,
+            closingCashCents: 0,
+            varianceCents: 0,
+            cashSalesCents: 0,
+            cardSalesCents: 0,
+            otherSalesCents: 0,
+            refundsCents: 0,
+            payoutCents: 0,
+            note: null,
+            openedAt: now,
+            idempotencyKey,
+            localEntityVersion: 1,
+          };
+          await (window as any).electronAPI?.db?.syncQueue?.push?.({
+            op_id: `shift_open_${resolvedId}_${now}`,
+            entity_type: 'SHIFT',
+            operation: 'CREATE',
+            entity_id: resolvedId,
+            payload: JSON.stringify(serverShapePayload),
+            idempotency_key: `shift_create_${resolvedId}_${idempotencyKey}`,
+            local_entity_version: 1,
+          });
+        } catch (syncQueueErr) {
+          // Never block shift open because sync queue failed — the shift row
+          // is already in SQLite; if sync queue is unavailable, the admin
+          // can manually reconcile later without breaking cashier flow.
+          console.warn('[shift] open — syncQueue.push unavailable', syncQueueErr);
+        }
         console.log('[shift] opened', resolvedId);
         onDone({
           shiftId: resolvedId,
@@ -435,6 +480,66 @@ export default function ShiftModal({ mode, openShift, onClose, onDone }: ShiftMo
           updated_at: now,
         };
         await window.electronAPI?.db?.shifts?.close?.(closingPayload);
+        // =================================================================
+        // 100% OFFLINE shift close — ALL totals computed from LOCAL SQLite
+        // totals = payments.getShiftTotals(shiftId) in useEffect L76-120
+        // above — zero network calls, zero JWT. Cash drawer reconciliation
+        // is available immediately; print below fires offline too.
+        // After persisting to SQLite, enqueue SHIFT UPDATE with the same
+        // server-shape payload so sync queue forwards it on reconnect.
+        // =================================================================
+        try {
+          const serverShapeClose = {
+            id: openShift.shiftId,
+            branchId: String(branch?.id || ''),
+            restaurantId: String(restaurant?.id || ''),
+            employeeId: String(employee?.id || ''),
+            deviceId: (() => {
+              try {
+                const did: any = window.electronAPI?.getDeviceId?.();
+                if (typeof did === 'string' && did) return did;
+                if (did && typeof did === 'object' && did.deviceId) return String(did.deviceId);
+              } catch {}
+              return undefined;
+            })(),
+            status: 'CLOSED',
+            openingCashCents: openShift.openingCashCents || 0,
+            closingCashCents: amountCents,
+            expectedCashCents: expectedClosing,
+            varianceCents: variance,
+            cashSalesCents: cashSales,
+            cardSalesCents: cardSales,
+            otherSalesCents: otherSales,
+            tipCents: tips,
+            refundsCents: 0,
+            payoutCents: totalCashOutflows,
+            paidCount: totals?.counts?.total ?? 0,
+            ordersCount: totals?.orders?.paidOrderCount ?? 0,
+            voidedOrdersCount: totals?.orders?.voidedOrderCount ?? 0,
+            itemsSold: totals?.orders?.paidItemQty ?? 0,
+            perMethodBreakdown: totals?.perMethod ?? [],
+            note: needsManagerPin
+              ? `Manager-approved variance ${formatCentsToNgn(variance)}`
+              : null,
+            openedAt: openShift.openedAt || undefined,
+            closedAt: now,
+            localEntityVersion: 1,
+          };
+          await (window as any).electronAPI?.db?.syncQueue?.push?.({
+            op_id: `shift_close_${openShift.shiftId}_${now}`,
+            entity_type: 'SHIFT',
+            operation: 'UPDATE',
+            entity_id: openShift.shiftId,
+            payload: JSON.stringify(serverShapeClose),
+            idempotency_key: `shift_update_${openShift.shiftId}_closed_${now}`,
+            local_entity_version: 1,
+          });
+        } catch (syncQueueErr) {
+          // Same resilience: never prevent close/onDone because sync-queue
+          // is broken. Cashier can walk away with the drawer closed; sync
+          // can be manually re-queued later from Admin if necessary.
+          console.warn('[shift] close — syncQueue.push unavailable', syncQueueErr);
+        }
         // Fire-and-forget print of the close-shift reconciliation receipt
         // so the cashier & manager each have a signed physical copy.
         // Silently ignore print failures (offline printer, etc.) — the

@@ -80,17 +80,24 @@ declare global {
         };
         menuCategories: {
           listAll: () => Promise<unknown>;
+          upsert: (row: unknown) => Promise<unknown>;
+          deleteById: (id: string) => Promise<unknown>;
         };
         menuItems: {
           list: (filters?: unknown) => Promise<unknown>;
           findById: (id: string) => Promise<unknown>;
           search: (query: string) => Promise<unknown>;
           listByCategory: (categoryId: string) => Promise<unknown>;
+          upsert: (row: unknown) => Promise<unknown>;
+          deleteById: (id: string) => Promise<unknown>;
         };
         menuModifiers: {
           listForItemId: (itemId: string) => Promise<unknown>;
           listByIds: (ids: string[]) => Promise<unknown>;
-          listAll: () => Promise<unknown>;
+          listAll: (branchId?: string) => Promise<unknown>;
+          listOptionsByModifierIds: (ids: string[]) => Promise<unknown>;
+          upsert: (payload: { modifier: unknown; options: unknown }) => Promise<unknown>;
+          deleteById: (id: string) => Promise<unknown>;
         };
         menu: {
           applySnapshot: (snapshot: unknown) => Promise<unknown>;
@@ -251,6 +258,21 @@ declare global {
         tableSessionLedger: {
           listForSession: (sessionId: string) => Promise<unknown>;
           appendNote: (payload: unknown) => Promise<unknown>;
+        };
+        reports: {
+          periodSales: (opts: {
+            period: 'DAY' | 'WEEK' | 'MONTH' | 'YEAR';
+            year?: number;
+            month?: number;
+            weekStartTs?: number;
+            dayTs?: number;
+            branchId?: string | null;
+            restaurantId?: string | null;
+          }) => Promise<unknown>;
+          availableYears: (scope?: {
+            branchId?: string | null;
+            restaurantId?: string | null;
+          }) => Promise<number[]>;
         };
       };
       sync: {

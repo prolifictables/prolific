@@ -945,6 +945,92 @@ function modifiersForItem(item: any, allModifiers: any[]): any[] {
   return allModifiers.filter((m) => ids.has(m.id));
 }
 
+// ---------------------------------------------------------------------------
+// Shared write-side helpers for menuCategories / menuItems / menuModifiers.
+// Ensures that UPSERT / DELETE operations mutate the same in-memory arrays
+// that resolveMenuSource() reads from so reads immediately see the writes,
+// and also persist to the branch-scoped localStorage offline document so
+// page refresh + offline continues to reflect edits.
+// ---------------------------------------------------------------------------
+function ensureRemoteSnapshotWritable(): NonNullable<typeof remoteMenuSnapshot> {
+  if (!remoteMenuSnapshot) {
+    const existing = readOfflineSnapshotForBranch();
+    if (existing) {
+      remoteMenuSnapshot = existing;
+    } else if (isLocalhostHostname()) {
+      remoteMenuSnapshot = {
+        categories: SEEDED_CATEGORIES.map((c) => ({ ...c })),
+        items: SEEDED_MENU_ITEMS.map((m) => ({ ...m })),
+        modifiers: SEEDED_MODIFIERS.map((m) => ({ ...m, options: Array.isArray(m.options) ? m.options.map((o) => ({ ...o })) : [] })),
+        fetchedAt: Date.now(),
+      };
+    } else {
+      remoteMenuSnapshot = { categories: [], items: [], modifiers: [], fetchedAt: Date.now() };
+    }
+  }
+  return remoteMenuSnapshot!;
+}
+
+function persistRemoteSnapshotToOffline(): void {
+  if (!remoteMenuSnapshot) return;
+  const bid = inferBranchIdFromSnapshot(remoteMenuSnapshot) || guessCurrentBranchId();
+  if (!bid) return;
+  const store = readOfflineStore();
+  store[bid] = {
+    categories: remoteMenuSnapshot.categories,
+    items: remoteMenuSnapshot.items,
+    modifiers: remoteMenuSnapshot.modifiers,
+    fetchedAt: remoteMenuSnapshot.fetchedAt,
+  };
+  writeOfflineStore(store);
+}
+
+type MenuKey = 'categories' | 'items' | 'modifiers';
+
+function upsertIntoMenuArray<K extends MenuKey>(
+  key: K,
+  row: any,
+  matchFn?: (existing: any, incoming: any) => boolean
+): any {
+  const snap = ensureRemoteSnapshotWritable();
+  const arr = snap[key] as any[];
+  const id = String(row?.id ?? '');
+  const matcher = matchFn
+    ? (e: any) => matchFn(e, row)
+    : (e: any) => id && String(e.id) === id;
+  const idx = arr.findIndex(matcher);
+  const timestamped = { ...row, updatedAt: row?.updatedAt ?? Date.now() };
+  if (idx >= 0) {
+    arr[idx] = { ...arr[idx], ...timestamped };
+    persistRemoteSnapshotToOffline();
+    return arr[idx];
+  } else {
+    const inserted = { createdAt: row?.createdAt ?? Date.now(), ...timestamped, isActive: row?.isActive ?? true };
+    arr.push(inserted);
+    persistRemoteSnapshotToOffline();
+    return inserted;
+  }
+}
+
+function softDeleteFromMenuArray<K extends MenuKey>(
+  key: K,
+  id: string,
+  matchFn?: (existing: any, idStr: string) => boolean
+): boolean {
+  const snap = ensureRemoteSnapshotWritable();
+  const arr = snap[key] as any[];
+  const matcher = matchFn
+    ? (e: any) => matchFn(e, id)
+    : (e: any) => String(e.id) === String(id);
+  const idx = arr.findIndex(matcher);
+  if (idx < 0) return false;
+  (arr[idx] as any).isActive = false;
+  (arr[idx] as any).is_active = 0;
+  (arr[idx] as any).updatedAt = Date.now();
+  persistRemoteSnapshotToOffline();
+  return true;
+}
+
 // In-memory stores for orders, payments, shifts
 const mockOrders: any[] = [
   {
@@ -1907,20 +1993,24 @@ export function installMockElectronAPI() {
       menuCategories: {
         listAll: async () => {
           await delay(5);
-          // Mirror SQLite repo: only ACTIVE categories so the POS never shows
-          // categories the admin has toggled off on the menu.
           const source = resolveMenuSource('categories');
           return source.filter(
             (c) => (c as any).isActive !== false && (c as any).is_active !== 0
           );
+        },
+        upsert: async (row: any) => {
+          await delay(5);
+          return upsertIntoMenuArray('categories', row);
+        },
+        deleteById: async (id: string) => {
+          await delay(5);
+          return softDeleteFromMenuArray('categories', id);
         },
       },
 
       menuItems: {
         list: async (filters?: { status?: string; categoryId?: string }) => {
           await delay(5);
-          // Only allow admin-configured visibility statuses — matches the
-          // server public.menu + SQLite menu repository filters.
           const allowed = new Set(['AVAILABLE', 'OUT_OF_STOCK', 'OOS', 'SCHEDULED']);
           const source = resolveMenuSource('items');
           const out = source.filter((m) => {
@@ -1962,23 +2052,112 @@ export function installMockElectronAPI() {
               (m.description || '').toLowerCase().includes(ql)
           );
         },
+        upsert: async (row: any) => {
+          await delay(5);
+          return upsertIntoMenuArray('items', row);
+        },
+        deleteById: async (id: string) => {
+          await delay(5);
+          return softDeleteFromMenuArray('items', id);
+        },
       },
 
       menuModifiers: {
-        // Return all menu modifier definitions (used by CartPanel to build a friendly
-        // modifierId -> optionId -> optionName lookup map so cart lines show real labels
-        // like "· Medium · Grilled Chicken" instead of "· option · option").
-        listAll: async () => {
+        listAll: async (branchId?: string) => {
           await delay(5);
-          return [...resolveMenuSource('modifiers')];
+          const source = resolveMenuSource('modifiers');
+          const filtered = source.filter((m) => {
+            if ((m as any).isActive === false || (m as any).is_active === 0) return false;
+            if (branchId && String((m as any).branchId) !== String(branchId)) return false;
+            return true;
+          });
+          return filtered.map((m) => {
+            const opts = Array.isArray((m as any).options) ? (m as any).options : [];
+            return { ...m, options: opts };
+          });
+        },
+        listByIds: async (ids: string[]) => {
+          await delay(5);
+          if (!Array.isArray(ids) || ids.length === 0) return [];
+          const set = new Set(ids.map((i) => String(i)));
+          const source = resolveMenuSource('modifiers');
+          const filtered = source.filter((m) => {
+            if ((m as any).isActive === false || (m as any).is_active === 0) return false;
+            return set.has(String((m as any).id));
+          });
+          return filtered.map((m) => {
+            const opts = Array.isArray((m as any).options) ? (m as any).options : [];
+            return { ...m, options: opts };
+          });
+        },
+        listOptionsByModifierIds: async (ids: string[]) => {
+          await delay(5);
+          if (!Array.isArray(ids) || ids.length === 0) return [];
+          const set = new Set(ids.map((i) => String(i)));
+          const source = resolveMenuSource('modifiers');
+          const options: any[] = [];
+          for (const m of source) {
+            if (!set.has(String((m as any).id))) continue;
+            if ((m as any).isActive === false || (m as any).is_active === 0) continue;
+            const opts = Array.isArray((m as any).options) ? (m as any).options : [];
+            for (const opt of opts) {
+              if ((opt as any).isActive === false || (opt as any).is_active === 0) continue;
+              options.push({ ...opt, modifierId: (m as any).id });
+            }
+          }
+          return options;
         },
         listForItemId: async (itemId: string) => {
           await delay(10);
           const itemsSource = resolveMenuSource('items');
           const modifiersSource = resolveMenuSource('modifiers');
-          const item = itemsSource.find((m) => m.id === itemId);
+          const item = itemsSource.find((m) => String(m.id) === String(itemId));
           if (!item) return [];
-          return modifiersForItem(item, modifiersSource);
+          const joined = modifiersForItem(item, modifiersSource);
+          return joined.map((m) => {
+            const opts = Array.isArray((m as any).options) ? (m as any).options : [];
+            return { ...m, options: opts };
+          });
+        },
+        upsert: async (payload: { modifier: any; options: any[] }) => {
+          await delay(5);
+          const { modifier, options } = payload || {};
+          const snap = ensureRemoteSnapshotWritable();
+          const arr = snap.modifiers as any[];
+          const modIn = modifier || {};
+          const optsIn = Array.isArray(options) ? options : [];
+          const id = String(modIn?.id ?? '');
+          const idx = id ? arr.findIndex((e) => String(e.id) === id) : -1;
+          const timestampedMod = { ...modIn, updatedAt: modIn?.updatedAt ?? Date.now() };
+          const mergedOptions = optsIn.map((o: any) => ({
+            ...o,
+            updatedAt: o?.updatedAt ?? Date.now(),
+            isActive: o?.isActive ?? true,
+          }));
+          let final: any;
+          if (idx >= 0) {
+            arr[idx] = {
+              ...arr[idx],
+              ...timestampedMod,
+              options: mergedOptions,
+              updatedAt: Date.now(),
+            };
+            final = arr[idx];
+          } else {
+            final = {
+              createdAt: modIn?.createdAt ?? Date.now(),
+              ...timestampedMod,
+              options: mergedOptions,
+              isActive: modIn?.isActive ?? true,
+            };
+            arr.push(final);
+          }
+          persistRemoteSnapshotToOffline();
+          return final;
+        },
+        deleteById: async (id: string) => {
+          await delay(5);
+          return softDeleteFromMenuArray('modifiers', id);
         },
       },
 
@@ -2662,6 +2841,478 @@ export function installMockElectronAPI() {
           return entry.id;
         },
       },
+
+      reports: (() => {
+        type ReportPeriod = 'DAY' | 'WEEK' | 'MONTH' | 'YEAR';
+        interface PeriodBucket {
+          key: string; label: string; startTs: number; endTs: number;
+          netCents: number; grossCents: number; tipCents: number;
+          paymentCount: number; ordersCount: number;
+        }
+        interface MethodSplit { method: string; netCents: number; tipCents: number; count: number; }
+        interface TopItem { menuItemId: string | null; name: string | null; qty: number; revenueCents: number; }
+        interface PeriodReport {
+          period: ReportPeriod;
+          scope: { year?: number; month?: number; weekStartTs?: number; dayTs?: number; branchId?: string | null; restaurantId?: string | null; };
+          totals: { netCents: number; grossCents: number; tipCents: number; paymentCount: number; ordersCount: number; refundCents: number; payoutCents: number; };
+          comparePrevPeriod: { netDeltaCents: number; orderDelta: number; pct: number; samePeriodLabel: string; } | null;
+          buckets: PeriodBucket[];
+          methodSplit: MethodSplit[];
+          topItems: TopItem[];
+          availableYears: number[];
+        }
+        const PAID_STATUSES = new Set(['SUCCESS', 'COMPLETED', 'PAID', 'CLOSED']);
+
+        const norm = (o: any, k1: string, k2?: string, k3?: string) => {
+          if (o == null) return undefined;
+          if (k1 in o && o[k1] != null) return o[k1];
+          if (k2 != null && k2 in o && o[k2] != null) return o[k2];
+          if (k3 != null && k3 in o && o[k3] != null) return o[k3];
+          return undefined;
+        };
+
+        const normStr = (o: any, ...keys: string[]): string | null => {
+          for (const k of keys) {
+            const v = norm(o, k);
+            if (v != null && String(v).length > 0) return String(v);
+          }
+          return null;
+        };
+
+        const normNum = (o: any, ...keys: string[]): number => {
+          for (const k of keys) {
+            const v = norm(o, k);
+            if (v == null) continue;
+            const n = Number(v);
+            if (Number.isFinite(n)) return n;
+          }
+          return 0;
+        };
+
+        const getOrderById = (id: string) => mockOrders.find((o) =>
+          String(normStr(o, 'id') || '') === String(id)
+        );
+
+        const isPaidPayment = (p: any): boolean => {
+          const status = normStr(p, 'status');
+          const amt = normNum(p, 'amount_cents', 'amountCents', 'amount');
+          if (status && PAID_STATUSES.has(status.toUpperCase())) return true;
+          if ((status == null || status === '') && amt > 0) return true;
+          return false;
+        };
+
+        const filterScope = (
+          item: any,
+          scope: { branchId?: string | null; restaurantId?: string | null }
+        ): boolean => {
+          const bid = scope.branchId;
+          const rid = scope.restaurantId;
+          if (bid) {
+            const ib = normStr(item, 'branch_id', 'branchId');
+            if (ib && String(ib) !== String(bid)) return false;
+          }
+          if (rid) {
+            const ir = normStr(item, 'restaurant_id', 'restaurantId');
+            if (ir && String(ir) !== String(rid)) return false;
+          }
+          return true;
+        };
+
+        const startOfDayMs = (ts: number): number => {
+          const d = new Date(ts);
+          d.setHours(0, 0, 0, 0);
+          return d.getTime();
+        };
+
+        const startOfWeekMondayMs = (ts: number): number => {
+          const d = new Date(ts);
+          d.setHours(0, 0, 0, 0);
+          const dow = d.getDay();
+          const diff = dow === 0 ? -6 : 1 - dow;
+          d.setDate(d.getDate() + diff);
+          return d.getTime();
+        };
+
+        const startOfMonthMs = (y: number, m0: number) =>
+          new Date(y, m0, 1, 0, 0, 0, 0).getTime();
+
+        const endOfMonthMs = (y: number, m0: number) =>
+          new Date(y, m0 + 1, 0, 23, 59, 59, 999).getTime();
+
+        const daysInMonth = (y: number, m0: number) =>
+          new Date(y, m0 + 1, 0).getDate();
+
+        const resolveRange = (period: ReportPeriod, scope: any, now: number) => {
+          switch (period) {
+            case 'DAY': {
+              const base = scope.dayTs && scope.dayTs > 0 ? Number(scope.dayTs) : now;
+              const s = startOfDayMs(base);
+              return { startTs: s, endTs: s + 86400000 - 1, label: new Date(s).toLocaleDateString() };
+            }
+            case 'WEEK': {
+              const base = scope.weekStartTs && scope.weekStartTs > 0 ? Number(scope.weekStartTs) : now;
+              const s = startOfWeekMondayMs(base);
+              return { startTs: s, endTs: s + 7 * 86400000 - 1, label: `Week of ${new Date(s).toLocaleDateString()}` };
+            }
+            case 'MONTH': {
+              const nd = new Date(now);
+              const y = scope.year != null ? Number(scope.year) : nd.getFullYear();
+              const m = (scope.month != null ? Number(scope.month) : nd.getMonth() + 1) - 1;
+              return {
+                startTs: startOfMonthMs(y, m),
+                endTs: endOfMonthMs(y, m),
+                label: new Date(y, m, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' }),
+              };
+            }
+            case 'YEAR': {
+              const nd = new Date(now);
+              const y = scope.year != null ? Number(scope.year) : nd.getFullYear();
+              return {
+                startTs: new Date(y, 0, 1, 0, 0, 0, 0).getTime(),
+                endTs: new Date(y, 11, 31, 23, 59, 59, 999).getTime(),
+                label: String(y),
+              };
+            }
+          }
+        };
+
+        const prevRange = (period: ReportPeriod, cur: { startTs: number; endTs: number }) => {
+          switch (period) {
+            case 'DAY': {
+              const s = cur.startTs - 86400000;
+              return { startTs: s, endTs: s + 86400000 - 1, label: new Date(s).toLocaleDateString() };
+            }
+            case 'WEEK': {
+              const s = cur.startTs - 7 * 86400000;
+              return { startTs: s, endTs: s + 7 * 86400000 - 1, label: `Prev week ${new Date(s).toLocaleDateString()}` };
+            }
+            case 'MONTH': {
+              const cd = new Date(cur.startTs);
+              const y = cd.getFullYear();
+              const m = cd.getMonth();
+              const pm = m === 0 ? 11 : m - 1;
+              const py = m === 0 ? y - 1 : y;
+              return {
+                startTs: startOfMonthMs(py, pm),
+                endTs: endOfMonthMs(py, pm),
+                label: new Date(py, pm, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' }),
+              };
+            }
+            case 'YEAR': {
+              const y = new Date(cur.startTs).getFullYear() - 1;
+              return {
+                startTs: new Date(y, 0, 1, 0, 0, 0, 0).getTime(),
+                endTs: new Date(y, 11, 31, 23, 59, 59, 999).getTime(),
+                label: String(y),
+              };
+            }
+          }
+        };
+
+        const collectPaidPayments = (startTs: number, endTs: number, scope: any) => {
+          return mockPayments.filter((p) => {
+            const completedAt = normNum(p, 'completed_at', 'completedAt');
+            if (completedAt <= 0) return false;
+            if (completedAt < startTs || completedAt > endTs) return false;
+            if (!isPaidPayment(p)) return false;
+            if (!filterScope(p, scope)) return false;
+            return true;
+          });
+        };
+
+        const aggregateTotals = (startTs: number, endTs: number, scope: any) => {
+          const paid = collectPaidPayments(startTs, endTs, scope);
+          let gross = 0, tip = 0;
+          const orderIds = new Set<string>();
+          for (const p of paid) {
+            gross += normNum(p, 'amount_cents', 'amountCents', 'amount');
+            tip += normNum(p, 'tip_cents', 'tipCents', 'tip');
+            const oid = normStr(p, 'order_id', 'orderId');
+            if (oid) orderIds.add(oid);
+          }
+
+          let refundCents = 0;
+          for (const o of mockOrders) {
+            const status = normStr(o, 'status');
+            const payStatus = normStr(o, 'payment_status', 'paymentStatus');
+            const isRefund =
+              (status && status.toUpperCase().includes('REFUND')) ||
+              (payStatus && payStatus.toUpperCase().includes('REFUND'));
+            if (!isRefund) continue;
+            const ct = normNum(o, 'created_at', 'createdAt');
+            if (ct < startTs || ct > endTs) continue;
+            if (!filterScope(o, scope)) continue;
+            refundCents += Math.abs(normNum(o, 'paid_amount_cents', 'paidAmountCents', 'paidAmount'));
+          }
+
+          let payoutCents = 0;
+          for (const c of mockCashAdjustments) {
+            const type = normStr(c, 'type');
+            const dir = normStr(c, 'direction');
+            const isPayout =
+              (type && type.toUpperCase() === 'PAYOUT') ||
+              (dir && (dir.toUpperCase() === 'OUT' || dir.toUpperCase() === 'PAID_OUT'));
+            if (!isPayout) continue;
+            const ct = normNum(c, 'created_at', 'createdAt');
+            if (ct < startTs || ct > endTs) continue;
+            if (!filterScope(c, scope)) continue;
+            payoutCents += Math.abs(normNum(c, 'amount_cents', 'amountCents', 'amount'));
+          }
+
+          return {
+            grossCents: gross,
+            tipCents: tip,
+            netCents: gross,
+            paymentCount: paid.length,
+            ordersCount: orderIds.size,
+            refundCents,
+            payoutCents,
+          };
+        };
+
+        const buildBuckets = (period: ReportPeriod, range: { startTs: number; endTs: number }, scope: any): PeriodBucket[] => {
+          const paid = collectPaidPayments(range.startTs, range.endTs, scope);
+
+          const getPaymentBucketKey = (p: any): string | null => {
+            const ts = normNum(p, 'completed_at', 'completedAt');
+            if (ts <= 0) return null;
+            const d = new Date(ts);
+            switch (period) {
+              case 'DAY': return `h${d.getHours()}`;
+              case 'WEEK': {
+                const dow = d.getDay();
+                const idx = dow === 0 ? 6 : dow - 1;
+                return `d${idx}`;
+              }
+              case 'MONTH': return `dm${d.getDate()}`;
+              case 'YEAR': return `mo${d.getMonth() + 1}`;
+            }
+          };
+
+          const bucketMap = new Map<string, { gross: number; tip: number; payCount: number; orderIds: Set<string> }>();
+          for (const p of paid) {
+            const k = getPaymentBucketKey(p);
+            if (!k) continue;
+            let b = bucketMap.get(k);
+            if (!b) {
+              b = { gross: 0, tip: 0, payCount: 0, orderIds: new Set() };
+              bucketMap.set(k, b);
+            }
+            b.gross += normNum(p, 'amount_cents', 'amountCents', 'amount');
+            b.tip += normNum(p, 'tip_cents', 'tipCents', 'tip');
+            b.payCount += 1;
+            const oid = normStr(p, 'order_id', 'orderId');
+            if (oid) b.orderIds.add(oid);
+          }
+
+          const buckets: PeriodBucket[] = [];
+          switch (period) {
+            case 'DAY': {
+              const dayStart = startOfDayMs(range.startTs);
+              for (let h = 0; h < 24; h++) {
+                const b = bucketMap.get(`h${h}`);
+                const startTs = dayStart + h * 3600000;
+                buckets.push({
+                  key: `h${h}`,
+                  label: `${h.toString().padStart(2, '0')}:00`,
+                  startTs,
+                  endTs: startTs + 3600000 - 1,
+                  grossCents: b?.gross ?? 0,
+                  tipCents: b?.tip ?? 0,
+                  netCents: b?.gross ?? 0,
+                  paymentCount: b?.payCount ?? 0,
+                  ordersCount: b?.orderIds.size ?? 0,
+                });
+              }
+              break;
+            }
+            case 'WEEK': {
+              const names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+              for (let i = 0; i < 7; i++) {
+                const b = bucketMap.get(`d${i}`);
+                const startTs = range.startTs + i * 86400000;
+                buckets.push({
+                  key: `d${i}`,
+                  label: names[i],
+                  startTs,
+                  endTs: startTs + 86400000 - 1,
+                  grossCents: b?.gross ?? 0,
+                  tipCents: b?.tip ?? 0,
+                  netCents: b?.gross ?? 0,
+                  paymentCount: b?.payCount ?? 0,
+                  ordersCount: b?.orderIds.size ?? 0,
+                });
+              }
+              break;
+            }
+            case 'MONTH': {
+              const sd = new Date(range.startTs);
+              const y = sd.getFullYear();
+              const m = sd.getMonth();
+              const maxD = daysInMonth(y, m);
+              for (let d = 1; d <= maxD; d++) {
+                const b = bucketMap.get(`dm${d}`);
+                const startTs = new Date(y, m, d, 0, 0, 0, 0).getTime();
+                buckets.push({
+                  key: `dm${d}`,
+                  label: String(d),
+                  startTs,
+                  endTs: startTs + 86400000 - 1,
+                  grossCents: b?.gross ?? 0,
+                  tipCents: b?.tip ?? 0,
+                  netCents: b?.gross ?? 0,
+                  paymentCount: b?.payCount ?? 0,
+                  ordersCount: b?.orderIds.size ?? 0,
+                });
+              }
+              break;
+            }
+            case 'YEAR': {
+              const y = new Date(range.startTs).getFullYear();
+              const mnames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+              for (let m = 1; m <= 12; m++) {
+                const b = bucketMap.get(`mo${m}`);
+                const startTs = new Date(y, m - 1, 1, 0, 0, 0, 0).getTime();
+                const endTs = endOfMonthMs(y, m - 1);
+                buckets.push({
+                  key: `mo${m}`,
+                  label: mnames[m - 1],
+                  startTs,
+                  endTs,
+                  grossCents: b?.gross ?? 0,
+                  tipCents: b?.tip ?? 0,
+                  netCents: b?.gross ?? 0,
+                  paymentCount: b?.payCount ?? 0,
+                  ordersCount: b?.orderIds.size ?? 0,
+                });
+              }
+              break;
+            }
+          }
+          return buckets;
+        };
+
+        const aggregateMethodSplit = (startTs: number, endTs: number, scope: any): MethodSplit[] => {
+          const paid = collectPaidPayments(startTs, endTs, scope);
+          const map = new Map<string, { net: number; tip: number; count: number }>();
+          for (const p of paid) {
+            const method = normStr(p, 'method') || 'OTHER';
+            let b = map.get(method);
+            if (!b) { b = { net: 0, tip: 0, count: 0 }; map.set(method, b); }
+            b.net += normNum(p, 'amount_cents', 'amountCents', 'amount');
+            b.tip += normNum(p, 'tip_cents', 'tipCents', 'tip');
+            b.count += 1;
+          }
+          return Array.from(map.entries())
+            .sort((a, b) => b[1].net - a[1].net)
+            .map(([method, v]) => ({ method, netCents: v.net, tipCents: v.tip, count: v.count }));
+        };
+
+        const aggregateTopItems = (startTs: number, endTs: number, scope: any): TopItem[] => {
+          const paidOrderIds = new Set<string>();
+          for (const p of collectPaidPayments(startTs, endTs, scope)) {
+            const oid = normStr(p, 'order_id', 'orderId');
+            if (oid) paidOrderIds.add(oid);
+          }
+          const keyMap = new Map<string, { menuItemId: string | null; name: string | null; qty: number; revenue: number }>();
+          for (const oi of mockOrderItems) {
+            const oid = normStr(oi, 'order_id', 'orderId');
+            if (!oid || !paidOrderIds.has(oid)) continue;
+            const order = getOrderById(oid);
+            if (order && !filterScope(order, scope)) continue;
+            const menuItemId = normStr(oi, 'menu_item_id', 'menuItemId');
+            const name = normStr(oi, 'name_snapshot', 'nameSnapshot', 'name');
+            const qty = normNum(oi, 'quantity', 'qty');
+            const revenue = normNum(oi, 'subtotal_cents', 'subtotalCents', 'subtotal');
+            const key = `${menuItemId || ''}__${name || ''}`;
+            let b = keyMap.get(key);
+            if (!b) {
+              b = { menuItemId: menuItemId ?? null, name: name ?? null, qty: 0, revenue: 0 };
+              keyMap.set(key, b);
+            }
+            b.qty += qty;
+            b.revenue += revenue;
+          }
+          return Array.from(keyMap.values())
+            .sort((a, b) => b.revenue - a.revenue)
+            .slice(0, 10)
+            .map((v, i) => ({
+              menuItemId: v.menuItemId,
+              name: v.name ?? (v.menuItemId ? `Item #${i + 1}` : null),
+              qty: v.qty,
+              revenueCents: v.revenue,
+            }));
+        };
+
+        const listAvailableYears = (scope?: any): number[] => {
+          const s = scope ?? {};
+          const years = new Set<number>();
+          for (const p of mockPayments) {
+            if (!filterScope(p, s)) continue;
+            const ts = normNum(p, 'completed_at', 'completedAt');
+            if (ts <= 0) continue;
+            years.add(new Date(ts).getFullYear());
+          }
+          return Array.from(years).sort((a, b) => b - a);
+        };
+
+        const periodSales = (opts: any): PeriodReport => {
+          const o = opts ?? {};
+          const period: ReportPeriod = (o.period as ReportPeriod) || 'DAY';
+          const now = Date.now();
+          const current = resolveRange(period, o, now);
+          const prev = prevRange(period, current);
+          const scopeObj = {
+            year: o.year != null ? Number(o.year) : undefined,
+            month: o.month != null ? Number(o.month) : undefined,
+            weekStartTs: o.weekStartTs != null ? Number(o.weekStartTs) : undefined,
+            dayTs: o.dayTs != null ? Number(o.dayTs) : undefined,
+            branchId: o.branchId != null ? o.branchId : undefined,
+            restaurantId: o.restaurantId != null ? o.restaurantId : undefined,
+          };
+          const filterScopeOnly = { branchId: scopeObj.branchId, restaurantId: scopeObj.restaurantId };
+
+          const totals = aggregateTotals(current.startTs, current.endTs, filterScopeOnly);
+          const prevTotals = aggregateTotals(prev.startTs, prev.endTs, filterScopeOnly);
+          const buckets = buildBuckets(period, current, filterScopeOnly);
+          const methodSplit = aggregateMethodSplit(current.startTs, current.endTs, filterScopeOnly);
+          const topItems = aggregateTopItems(current.startTs, current.endTs, filterScopeOnly);
+          const availableYears = listAvailableYears(filterScopeOnly);
+
+          let comparePrevPeriod: PeriodReport['comparePrevPeriod'] = null;
+          if (prevTotals.netCents > 0 || prevTotals.ordersCount > 0) {
+            const netDeltaCents = totals.netCents - prevTotals.netCents;
+            const orderDelta = totals.ordersCount - prevTotals.ordersCount;
+            const pct = prevTotals.netCents > 0
+              ? Math.round((netDeltaCents / prevTotals.netCents) * 10000) / 100
+              : 0;
+            comparePrevPeriod = { netDeltaCents, orderDelta, pct, samePeriodLabel: prev.label };
+          } else {
+            comparePrevPeriod = {
+              netDeltaCents: totals.netCents,
+              orderDelta: totals.ordersCount,
+              pct: totals.netCents > 0 ? 100 : 0,
+              samePeriodLabel: prev.label,
+            };
+          }
+
+          return {
+            period,
+            scope: scopeObj,
+            totals,
+            comparePrevPeriod,
+            buckets,
+            methodSplit,
+            topItems,
+            availableYears,
+          };
+        };
+
+        return {
+          periodSales: async (opts: any) => { await delay(5); return periodSales(opts); },
+          availableYears: async (scope?: any) => { await delay(5); return listAvailableYears(scope); },
+        };
+      })(),
     },
 
     customerDisplay: {

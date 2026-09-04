@@ -1,6 +1,7 @@
 export * from './types';
 export * from './migrations';
 export { PosDatabase } from './database';
+export * from './repositories/reports.repository';
 
 import { PosDatabase } from './database';
 import path from 'node:path';
@@ -51,6 +52,7 @@ import {
   LoyaltyAccountsRepository,
   PromotionsRepository,
 } from './repositories/sync-audit-meta.repository';
+import { ReportsRepository } from './repositories/reports.repository';
 
 export interface ReposBundle {
   db: PosDatabase;
@@ -83,6 +85,7 @@ export interface ReposBundle {
   connectionEvents: ConnectionEventsRepository;
   loyaltyAccounts: LoyaltyAccountsRepository;
   promotions: PromotionsRepository;
+  reports: ReportsRepository;
 }
 
 let singletonDb: PosDatabase | null = null;
@@ -145,5 +148,6 @@ export function createRepos(db: PosDatabase): ReposBundle {
     connectionEvents: new ConnectionEventsRepository(db),
     loyaltyAccounts: new LoyaltyAccountsRepository(db),
     promotions: new PromotionsRepository(db),
+    reports: new ReportsRepository(db),
   };
 }

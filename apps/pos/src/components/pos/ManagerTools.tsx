@@ -19,8 +19,153 @@ import {
   type AdminMenuItemInput,
   type AdminModifierInput,
   type AdminModifierOptionInput,
+  type ReauthCallback,
 } from '../../lib/remote-menu-admin';
+import {
+  applyRemoteMenuSnapshot,
+  readOfflineMenuSnapshotMirror,
+} from '../../lib/mock-electron-shim';
 import { formatCentsToNgn } from '../../lib/ui-helpers';
+
+// =========================================================================
+// SQLite row → shared-types normalisation helpers.
+// IPC bridge stores snake_case columns. The repos may return either case.
+// We normalise both directions (snake→camel and any-string-id variants)
+// so CategoryEditor / ItemEditor / ModifierEditor drawers always receive
+// the exact same MenuCategory/MenuItem/MenuModifier shapes the server REST
+// layer used to return.
+// =========================================================================
+type AnyRow = Record<string, unknown>;
+
+function toId(v: unknown): string {
+  if (v == null) return '';
+  return String(v);
+}
+function toBool(v: unknown, fallback = false): boolean {
+  if (v === true || v === 1 || v === '1' || v === 'true') return true;
+  if (v === false || v === 0 || v === '0' || v === 'false') return false;
+  return fallback;
+}
+function toNum(v: unknown, fallback = 0): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+function toStr(v: unknown): string {
+  return v == null ? '' : String(v);
+}
+function toTs(v: unknown): Date {
+  if (v instanceof Date) return v;
+  const n = Number(v);
+  if (Number.isFinite(n) && n > 0) return new Date(n);
+  const s = String(v || '');
+  if (s) {
+    const t = Date.parse(s);
+    if (Number.isFinite(t)) return new Date(t);
+  }
+  return new Date();
+}
+
+function normCategory(row: AnyRow): MenuCategory {
+  return {
+    id: toId(row.id ?? row._id),
+    restaurantId: toId(row.restaurantId ?? row.restaurant_id),
+    branchId: toId(row.branchId ?? row.branch_id),
+    name: toStr(row.name),
+    description: row.description != null && String(row.description) ? String(row.description) : undefined,
+    sortOrder: toNum(row.sortOrder ?? row.sort_order, 0),
+    isActive: toBool(row.isActive ?? row.is_active, true),
+    imageUrl: row.imageUrl != null && String(row.imageUrl) ? String(row.imageUrl) : undefined,
+    createdAt: toTs(row.createdAt ?? row.created_at),
+    updatedAt: toTs(row.updatedAt ?? row.updated_at),
+  };
+}
+
+function normItem(row: AnyRow): MenuItem {
+  let modifierIds: string[] = [];
+  const rawMod = row.modifierIds ?? row.modifier_ids;
+  if (Array.isArray(rawMod)) {
+    modifierIds = rawMod.map((x) => toId(x));
+  } else if (typeof rawMod === 'string' && rawMod) {
+    try { modifierIds = JSON.parse(rawMod).map((x: unknown) => toId(x)); } catch { modifierIds = []; }
+  }
+  let taxIds: string[] = [];
+  const rawTax = row.taxIds ?? row.tax_ids;
+  if (Array.isArray(rawTax)) {
+    taxIds = rawTax.map((x) => toId(x));
+  } else if (typeof rawTax === 'string' && rawTax) {
+    try { taxIds = JSON.parse(rawTax).map((x: unknown) => toId(x)); } catch { taxIds = []; }
+  }
+  let scheduled: MenuItem['scheduledAvailability'] = undefined;
+  const rawSched = row.scheduledAvailability ?? row.scheduled_availability;
+  if (rawSched && typeof rawSched === 'object') {
+    scheduled = rawSched as MenuItem['scheduledAvailability'];
+  } else if (typeof rawSched === 'string' && rawSched) {
+    try { scheduled = JSON.parse(rawSched) as MenuItem['scheduledAvailability']; } catch { scheduled = undefined; }
+  }
+  return {
+    id: toId(row.id ?? row._id),
+    restaurantId: toId(row.restaurantId ?? row.restaurant_id),
+    branchId: toId(row.branchId ?? row.branch_id),
+    categoryId: toId(row.categoryId ?? row.category_id),
+    name: toStr(row.name),
+    description: row.description != null && String(row.description) ? String(row.description) : undefined,
+    price: toNum(row.price ?? row.priceCents ?? row.price_cents, 0),
+    imageUrl: row.imageUrl != null && String(row.imageUrl) ? String(row.imageUrl) : undefined,
+    status: (toStr(row.status) || 'AVAILABLE') as MenuItem['status'],
+    sortOrder: toNum(row.sortOrder ?? row.sort_order, 0),
+    isTaxable: toBool(row.isTaxable ?? row.is_taxable, true),
+    taxIds,
+    modifierIds,
+    recipeId: row.recipeId != null && String(row.recipeId) ? String(row.recipeId) : undefined,
+    scheduledAvailability: scheduled,
+    createdAt: toTs(row.createdAt ?? row.created_at),
+    updatedAt: toTs(row.updatedAt ?? row.updated_at),
+  };
+}
+
+function normModifier(row: AnyRow): MenuModifier {
+  // options may already be merged (listAll returns them merged) or be a raw array
+  const rawOpts = (row.options as AnyRow[]) ?? [];
+  const options = Array.isArray(rawOpts)
+    ? rawOpts.map((o) => ({
+        id: toId(o.id ?? o._id),
+        name: toStr(o.name),
+        priceDelta: toNum(o.priceDelta ?? o.priceDeltaCents ?? o.price_delta_cents, 0),
+        isDefault: toBool(o.isDefault ?? o.is_default, false),
+      }))
+    : [];
+  return {
+    id: toId(row.id ?? row._id),
+    name: toStr(row.name),
+    description: row.description != null && String(row.description) ? String(row.description) : undefined,
+    required: toBool(row.required ?? row.isRequired ?? row.is_required, false),
+    multiSelect: toBool(row.multiSelect ?? row.isMultiSelect ?? row.multi_select, false),
+    minSelections: toNum(row.minSelections ?? row.min_select, 0),
+    maxSelections: toNum(row.maxSelections ?? row.max_select, 1),
+    options,
+    createdAt: toTs(row.createdAt ?? row.created_at),
+    updatedAt: toTs(row.updatedAt ?? row.updated_at),
+  };
+}
+
+// Durable localStorage key used as browser-fallback read source (matches shim).
+const OFFLINE_MENU_KEY = 'pos_offline_menu_snapshot_v1';
+
+function readLocalStorageSnapshot(
+  branchId?: string,
+): { categories: AnyRow[]; items: AnyRow[]; modifiers: AnyRow[] } | null {
+  if (typeof window === 'undefined' || !window.localStorage) return null;
+  try {
+    const raw = window.localStorage.getItem(OFFLINE_MENU_KEY);
+    if (!raw) return null;
+    const store = JSON.parse(raw) as Record<string, { categories: AnyRow[]; items: AnyRow[]; modifiers: AnyRow[] }>;
+    const bid = branchId || Object.keys(store)[0];
+    if (!bid || !store[bid]) return null;
+    return store[bid];
+  } catch {
+    return null;
+  }
+}
 
 type ManagerSubTab = 'ITEMS' | 'CATEGORIES' | 'MODIFIERS';
 
@@ -43,6 +188,14 @@ interface ManagerToolsProps {
   | 'SYNCHRONIZING'
   | 'SYNC_ERROR';
   onMenuChanged: () => Promise<void> | void;
+  /**
+   * Called transparently if any admin API call returns a 401 OR at the
+   * start of a refresh cycle when no access token is available yet.
+   * Returns a fresh (non-empty) access token string. If refresh is not
+   * possible, throws and the caller renders an actionable error instead of
+   * the misleading server-returned "Invalid or expired token".
+   */
+  reauthAccessToken?: ReauthCallback;
 }
 
 // Debounced every-word (AND) search matching — user preference from memory:
@@ -71,10 +224,11 @@ function useDebounced<T>(value: T, ms = DEBOUNCE_MS): T {
 }
 
 export default function ManagerTools(props: ManagerToolsProps) {
-  const { accessToken, connectionStatus, onMenuChanged } = props;
+  const { accessToken, restaurantId, branchId, connectionStatus, onMenuChanged, reauthAccessToken } = props;
   const [subTab, setSubTab] = useState<ManagerSubTab>('ITEMS');
   const [search, setSearch] = useState('');
   const debouncedSearch = useDebounced(search);
+  const [offlineSaveToast, setOfflineSaveToast] = useState<string | null>(null);
 
   // ========== Categories state ==========
   const [categories, setCategories] = useState<MenuCategory[]>([]);
@@ -102,14 +256,116 @@ export default function ManagerTools(props: ManagerToolsProps) {
 
   const online = connectionStatus === 'ONLINE';
 
-  // ========== Data loading ==========
+  // Resolve a current access token. Kept intact for future hybrid-mode
+  // reuse (online-REST reads may be re-enabled as an opt-in overlay).
+  // Currently unused for reads/writes — all I/O is local-first SQLite.
+  const resolveToken = async (): Promise<string> => {
+    if (accessToken) return accessToken;
+    if (!reauthAccessToken) {
+      throw new Error(
+        'Manager tools requires an active network login. Please connect to the internet, log out, and log back in.'
+      );
+    }
+    return await reauthAccessToken('', 'missing access token');
+  };
+
+  // Wrap the raw reauthAccessToken callback to pass through opts.
+  // Kept intact so callers can re-enable REST calls in a future hybrid mode.
+  const callOpts = () => (reauthAccessToken ? { reauth: reauthAccessToken } : {});
+
+  // ===== Sync queue helper =====
+  // Pushes a row into the local sync_queue (SQLite via IPC / mock in memory)
+  // so sync-queue-reader can forward the op to the Admin server once online.
+  const pushSyncQueue = async (record: {
+    entity_type: 'MENU_CATEGORY' | 'MENU_ITEM' | 'MENU_MODIFIER';
+    operation: 'CREATE' | 'UPDATE' | 'DELETE';
+    entity_id: string;
+    payload: unknown;
+    local_entity_version?: number;
+  }): Promise<void> => {
+    const opId = `sync-${crypto.randomUUID()}`;
+    const ver = typeof record.local_entity_version === 'number' ? record.local_entity_version : 1;
+    const idemKey = `${record.entity_type.toLowerCase()}_${record.entity_id}_v${ver}_${Date.now()}`;
+    const item = {
+      op_id: opId,
+      entity_type: record.entity_type,
+      entity_id: record.entity_id,
+      operation: record.operation,
+      payload: JSON.stringify(record.payload),
+      idempotency_key: idemKey,
+      local_entity_version: ver,
+      direction: 'LOCAL_TO_CLOUD',
+      status: 'QUEUED',
+      attempts: 0,
+      next_retry_at: Date.now(),
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    };
+    try {
+      await (window as any).electronAPI?.db?.syncQueue?.push?.(item);
+    } catch {
+      // ignore — sync push best-effort; even if the queue is unavailable the
+      // local SQLite rows remain persisted and will be picked up on restart.
+    }
+  };
+
+  // ===== Snapshot mutator =====
+  // Apply our in-memory lists (after a local write) to the shim's snapshot
+  // so MenuGrid / cashier views reflect the edit before the next 15s parent
+  // refreshReferenceData poll. Browser-mode only (uses shim export).
+  const writeShimSnapshot = () => {
+    try {
+      applyRemoteMenuSnapshot({
+        categories: categories as any[],
+        items: items as any[],
+        modifiers: modifiers as any[],
+      });
+    } catch {
+      // ignore — shim may not be active in packaged Electron
+    }
+  };
+
+  // ===== Cross-tally helper =====
+  // Called after every successful local write:
+  //   (1) refreshAll(true) to re-read local SQLite → state updates instantly
+  //   (2) write shim snapshot (browser-mode immediate propagation)
+  //   (3) fire onMenuChanged async no-await so parent refetches public menu
+  //       from server (its 15s tick would do it anyway but this is faster).
+  const triggerCrossTally = async () => {
+    refreshAll(true);
+    setTimeout(() => writeShimSnapshot(), 0);
+    void (async () => {
+      try { await onMenuChanged(); } catch {}
+    })();
+  };
+
+  // ========== Data loading (local-only, NO REST reads) ==========
   const refreshCategories = async (silent = false) => {
     if (!silent) { setCategoriesLoading(true); setCategoriesError(null); }
     try {
-      const res = await listAdminCategories(accessToken);
-      setCategories(res);
+      let rows: AnyRow[] = [];
+      // Priority 1: Electron SQLite IPC
+      const ipc = (window as any).electronAPI?.db?.menuCategories;
+      if (ipc && typeof ipc.listAll === 'function') {
+        const res = await ipc.listAll(branchId);
+        rows = Array.isArray(res) ? res : [];
+      }
+      // Priority 2: Browser shim snapshot mirror
+      if (rows.length === 0) {
+        const mirror = readOfflineMenuSnapshotMirror(branchId);
+        if (mirror && Array.isArray(mirror.categories)) rows = mirror.categories;
+      }
+      // Priority 3: localStorage offline cache
+      if (rows.length === 0) {
+        const snap = readLocalStorageSnapshot(branchId);
+        if (snap && Array.isArray(snap.categories)) rows = snap.categories;
+      }
+      setCategories(rows.map((r) => normCategory(r)));
     } catch (e: any) {
-      if (!silent) setCategoriesError(e?.message || 'Failed to load categories');
+      if (!silent) {
+        const msg = e?.message || 'Failed to load categories from local storage';
+        setCategoriesError(msg);
+      }
     } finally {
       if (!silent) setCategoriesLoading(false);
     }
@@ -118,10 +374,26 @@ export default function ManagerTools(props: ManagerToolsProps) {
   const refreshItems = async (silent = false) => {
     if (!silent) { setItemsLoading(true); setItemsError(null); }
     try {
-      const res = await listAdminMenuItems(accessToken, { limit: 300 });
-      setItems(res);
+      let rows: AnyRow[] = [];
+      const ipc = (window as any).electronAPI?.db?.menuItems;
+      if (ipc && typeof ipc.list === 'function') {
+        const res = await ipc.list(branchId, {});
+        rows = Array.isArray(res) ? res : [];
+      }
+      if (rows.length === 0) {
+        const mirror = readOfflineMenuSnapshotMirror(branchId);
+        if (mirror && Array.isArray(mirror.items)) rows = mirror.items;
+      }
+      if (rows.length === 0) {
+        const snap = readLocalStorageSnapshot(branchId);
+        if (snap && Array.isArray(snap.items)) rows = snap.items;
+      }
+      setItems(rows.map((r) => normItem(r)));
     } catch (e: any) {
-      if (!silent) setItemsError(e?.message || 'Failed to load items');
+      if (!silent) {
+        const msg = e?.message || 'Failed to load items from local storage';
+        setItemsError(msg);
+      }
     } finally {
       if (!silent) setItemsLoading(false);
     }
@@ -130,10 +402,49 @@ export default function ManagerTools(props: ManagerToolsProps) {
   const refreshModifiers = async (silent = false) => {
     if (!silent) { setModifiersLoading(true); setModifiersError(null); }
     try {
-      const res = await listAdminModifiers(accessToken);
-      setModifiers(res);
+      let rows: AnyRow[] = [];
+      const ipc = (window as any).electronAPI?.db?.menuModifiers;
+      if (ipc && typeof ipc.listAll === 'function') {
+        const res = await ipc.listAll(branchId);
+        rows = Array.isArray(res) ? res : [];
+      }
+      // If listAll did NOT merge options, do it manually via listOptionsByModifierIds
+      if (
+        rows.length > 0 &&
+        ipc &&
+        typeof ipc.listOptionsByModifierIds === 'function' &&
+        !rows[0].options
+      ) {
+        const ids = rows.map((r) => toId(r.id ?? r._id)).filter(Boolean);
+        const opts = await ipc.listOptionsByModifierIds(ids);
+        const optsByMod = new Map<string, AnyRow[]>();
+        if (Array.isArray(opts)) {
+          for (const o of opts) {
+            const mid = toId(o.modifierId ?? o.modifier_id);
+            if (!mid) continue;
+            if (!optsByMod.has(mid)) optsByMod.set(mid, []);
+            optsByMod.get(mid)!.push(o as AnyRow);
+          }
+        }
+        rows = rows.map((r) => {
+          const mid = toId(r.id ?? r._id);
+          return { ...r, options: optsByMod.get(mid) ?? [] };
+        });
+      }
+      if (rows.length === 0) {
+        const mirror = readOfflineMenuSnapshotMirror(branchId);
+        if (mirror && Array.isArray(mirror.modifiers)) rows = mirror.modifiers;
+      }
+      if (rows.length === 0) {
+        const snap = readLocalStorageSnapshot(branchId);
+        if (snap && Array.isArray(snap.modifiers)) rows = snap.modifiers;
+      }
+      setModifiers(rows.map((r) => normModifier(r)));
     } catch (e: any) {
-      if (!silent) setModifiersError(e?.message || 'Failed to load modifiers');
+      if (!silent) {
+        const msg = e?.message || 'Failed to load modifiers from local storage';
+        setModifiersError(msg);
+      }
     } finally {
       if (!silent) setModifiersLoading(false);
     }
@@ -145,22 +456,23 @@ export default function ManagerTools(props: ManagerToolsProps) {
     refreshModifiers(silent);
   };
 
-  // Initial load + periodic 20s soft refresh while tab is open
+  // Show a soft transient info toast. Used when saving locally while offline.
+  const flashToast = (msg: string, ms = 3200) => {
+    setOfflineSaveToast(msg);
+    window.setTimeout(() => setOfflineSaveToast((cur) => (cur === msg ? null : cur)), ms);
+  };
+
+  // Initial load + periodic 15s soft refresh while tab is open.
+  // NOTE: All reads are local SQLite → 15s is cheap. Covers the case where
+  // sync-queue-reader pushed new rows from another terminal or a server
+  // snapshot landed in the meantime. No accessToken dependency since we
+  // never do REST reads.
   useEffect(() => {
     refreshAll();
-    const id = window.setInterval(() => refreshAll(true), 20_000);
+    const id = window.setInterval(() => refreshAll(true), 15_000);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accessToken]);
-
-  const triggerCrossTally = async () => {
-    // After a successful save: (1) soft-refresh local lists (2) tell parent
-    // to dual-write the public menu snapshot (in-memory + localStorage offline).
-    refreshAll(true);
-    try {
-      await onMenuChanged();
-    } catch {}
-  };
+  }, [branchId]);
 
   // ========== Filtered lists (search) ==========
   const filteredCategories = useMemo(() => {
@@ -186,19 +498,80 @@ export default function ManagerTools(props: ManagerToolsProps) {
     );
   }, [modifiers, debouncedSearch]);
 
-  // ========== Save handlers ==========
+  // ========== Save handlers (local-first SQLite + sync queue) ==========
   const handleSaveCategory = async (input: AdminCategoryInput) => {
     setCatSaving(true);
     try {
-      if (catEditing) {
-        const id = catEditing.id || (catEditing as any)._id;
-        await updateAdminCategory(accessToken, id, input);
-      } else {
-        await createAdminCategory(accessToken, input);
+      const isUpdate = !!catEditing;
+      const id = isUpdate ? String(catEditing.id || (catEditing as any)._id) : crypto.randomUUID();
+      const now = Date.now();
+
+      // Build row — camelCase shape (same as AdminCategoryInput DTO). IPC bridge
+      // inside ipc-db-bridge.ts normalises to snake_case on write.
+      const row = {
+        id,
+        branchId: branchId,
+        restaurantId: restaurantId,
+        name: input.name,
+        description: input.description ?? null,
+        imageUrl: input.imageUrl ?? null,
+        sortOrder: typeof input.sortOrder === 'number' ? input.sortOrder : 0,
+        isActive: typeof input.isActive === 'boolean' ? input.isActive : true,
+        createdAt: isUpdate ? catEditing?.createdAt ?? now : now,
+        updatedAt: now,
+      };
+
+      const ipc = (window as any).electronAPI?.db?.menuCategories;
+      if (ipc && typeof ipc.upsert === 'function') {
+        await ipc.upsert(row);
       }
+      // Browser mode: apply snapshot to shim immediately so reads reflect the write
+      if (typeof window !== 'undefined') {
+        const snap = readLocalStorageSnapshot(branchId) ?? { categories: [], items: [], modifiers: [] };
+        const idx = snap.categories.findIndex((c: any) => String(c.id ?? c._id) === id);
+        if (idx >= 0) snap.categories[idx] = { ...snap.categories[idx], ...row };
+        else snap.categories.push(row);
+        try {
+          const store: any = {};
+          const bid = branchId || Object.keys(readLocalStorageSnapshot() ?? {})[0] || 'default';
+          const all = JSON.parse(window.localStorage.getItem(OFFLINE_MENU_KEY) || '{}');
+          all[bid] = snap;
+          window.localStorage.setItem(OFFLINE_MENU_KEY, JSON.stringify(all));
+          applyRemoteMenuSnapshot({
+            categories: snap.categories,
+            items: snap.items,
+            modifiers: snap.modifiers,
+          });
+        } catch {}
+      }
+
+      // Build server-payload shape (shared-types MenuCategory, snake_case not needed —
+      // sync-queue-reader will convert). We match the exact AdminCategoryInput
+      // plus branchId/restaurantId/id fields the server endpoint expects.
+      const serverPayload = {
+        id,
+        branchId: branchId,
+        restaurantId: restaurantId,
+        ...input,
+      };
+      await pushSyncQueue({
+        entity_type: 'MENU_CATEGORY',
+        operation: isUpdate ? 'UPDATE' : 'CREATE',
+        entity_id: id,
+        payload: serverPayload,
+        local_entity_version: 1,
+      });
+
       setCatEditorOpen(false);
       setCatEditing(null);
+      if (!online) flashToast('Saved locally. Syncs to Admin when online returns.');
       await triggerCrossTally();
+    } catch (e: any) {
+      const msg = e?.message || 'Save failed';
+      // No more JWT errors (no direct REST), but keep friendly pattern:
+      alert(/expired|invalid token|logged out|not authorized|unauthorized/i.test(String(msg))
+        ? 'POS login session has expired. Log out and log back in to refresh credentials.'
+        : msg);
     } finally {
       setCatSaving(false);
     }
@@ -206,27 +579,114 @@ export default function ManagerTools(props: ManagerToolsProps) {
 
   const handleDeleteCategory = async (cat: MenuCategory) => {
     if (!window.confirm(`Delete category "${cat.name}"? (items inside will not be deleted)`)) return;
-    const id = cat.id || (cat as any)._id;
+    const id = String(cat.id || (cat as any)._id);
     try {
-      await deleteAdminCategory(accessToken, id);
+      const ipc = (window as any).electronAPI?.db?.menuCategories;
+      if (ipc && typeof ipc.deleteById === 'function') {
+        await ipc.deleteById(id);
+      }
+      // Browser mode: mutate localStorage + shim snapshot
+      if (typeof window !== 'undefined') {
+        const snap = readLocalStorageSnapshot(branchId) ?? { categories: [], items: [], modifiers: [] };
+        snap.categories = snap.categories.filter((c: any) => String(c.id ?? c._id) !== id);
+        try {
+          const bid = branchId || Object.keys(readLocalStorageSnapshot() ?? {})[0] || 'default';
+          const all = JSON.parse(window.localStorage.getItem(OFFLINE_MENU_KEY) || '{}');
+          all[bid] = snap;
+          window.localStorage.setItem(OFFLINE_MENU_KEY, JSON.stringify(all));
+          applyRemoteMenuSnapshot({
+            categories: snap.categories,
+            items: snap.items,
+            modifiers: snap.modifiers,
+          });
+        } catch {}
+      }
+      await pushSyncQueue({
+        entity_type: 'MENU_CATEGORY',
+        operation: 'DELETE',
+        entity_id: id,
+        payload: { id, branchId, restaurantId },
+        local_entity_version: 1,
+      });
+      if (!online) flashToast('Deleted locally. Syncs to Admin when online returns.');
       await triggerCrossTally();
     } catch (e: any) {
-      alert(e?.message || 'Delete failed');
+      const msg = e?.message || 'Delete failed';
+      alert(msg);
     }
   };
 
   const handleSaveItem = async (input: AdminMenuItemInput) => {
     setItemSaving(true);
     try {
-      if (itemEditing) {
-        const id = itemEditing.id || (itemEditing as any)._id;
-        await updateAdminMenuItem(accessToken, id, input);
-      } else {
-        await createAdminMenuItem(accessToken, input);
+      const isUpdate = !!itemEditing;
+      const id = isUpdate ? String(itemEditing.id || (itemEditing as any)._id) : crypto.randomUUID();
+      const now = Date.now();
+
+      const row = {
+        id,
+        branchId: branchId,
+        restaurantId: restaurantId,
+        categoryId: input.categoryId,
+        name: input.name,
+        description: input.description ?? null,
+        price: input.price,
+        imageUrl: input.imageUrl ?? null,
+        status: input.status ?? 'AVAILABLE',
+        sortOrder: typeof input.sortOrder === 'number' ? input.sortOrder : 0,
+        isTaxable: typeof input.isTaxable === 'boolean' ? input.isTaxable : true,
+        taxIds: input.taxIds ?? [],
+        modifierIds: input.modifierIds ?? [],
+        scheduledAvailability: input.scheduledAvailability ?? null,
+        createdAt: isUpdate ? itemEditing?.createdAt ?? now : now,
+        updatedAt: now,
+      };
+
+      const ipc = (window as any).electronAPI?.db?.menuItems;
+      if (ipc && typeof ipc.upsert === 'function') {
+        await ipc.upsert(row);
       }
+      if (typeof window !== 'undefined') {
+        const snap = readLocalStorageSnapshot(branchId) ?? { categories: [], items: [], modifiers: [] };
+        const idx = snap.items.findIndex((i: any) => String(i.id ?? i._id) === id);
+        if (idx >= 0) snap.items[idx] = { ...snap.items[idx], ...row };
+        else snap.items.push(row);
+        try {
+          const bid = branchId || Object.keys(readLocalStorageSnapshot() ?? {})[0] || 'default';
+          const all = JSON.parse(window.localStorage.getItem(OFFLINE_MENU_KEY) || '{}');
+          all[bid] = snap;
+          window.localStorage.setItem(OFFLINE_MENU_KEY, JSON.stringify(all));
+          applyRemoteMenuSnapshot({
+            categories: snap.categories,
+            items: snap.items,
+            modifiers: snap.modifiers,
+          });
+        } catch {}
+      }
+
+      const serverPayload = {
+        id,
+        branchId: branchId,
+        restaurantId: restaurantId,
+        ...input,
+      };
+      await pushSyncQueue({
+        entity_type: 'MENU_ITEM',
+        operation: isUpdate ? 'UPDATE' : 'CREATE',
+        entity_id: id,
+        payload: serverPayload,
+        local_entity_version: 1,
+      });
+
       setItemEditorOpen(false);
       setItemEditing(null);
+      if (!online) flashToast('Saved locally. Syncs to Admin when online returns.');
       await triggerCrossTally();
+    } catch (e: any) {
+      const msg = e?.message || 'Save failed';
+      alert(/expired|invalid token|logged out|not authorized|unauthorized/i.test(String(msg))
+        ? 'POS login session has expired. Log out and log back in to refresh credentials.'
+        : msg);
     } finally {
       setItemSaving(false);
     }
@@ -234,27 +694,126 @@ export default function ManagerTools(props: ManagerToolsProps) {
 
   const handleDeleteItem = async (it: MenuItem) => {
     if (!window.confirm(`Delete item "${it.name}"?`)) return;
-    const id = it.id || (it as any)._id;
+    const id = String(it.id || (it as any)._id);
     try {
-      await deleteAdminMenuItem(accessToken, id);
+      const ipc = (window as any).electronAPI?.db?.menuItems;
+      if (ipc && typeof ipc.deleteById === 'function') {
+        await ipc.deleteById(id);
+      }
+      if (typeof window !== 'undefined') {
+        const snap = readLocalStorageSnapshot(branchId) ?? { categories: [], items: [], modifiers: [] };
+        snap.items = snap.items.filter((i: any) => String(i.id ?? i._id) !== id);
+        try {
+          const bid = branchId || Object.keys(readLocalStorageSnapshot() ?? {})[0] || 'default';
+          const all = JSON.parse(window.localStorage.getItem(OFFLINE_MENU_KEY) || '{}');
+          all[bid] = snap;
+          window.localStorage.setItem(OFFLINE_MENU_KEY, JSON.stringify(all));
+          applyRemoteMenuSnapshot({
+            categories: snap.categories,
+            items: snap.items,
+            modifiers: snap.modifiers,
+          });
+        } catch {}
+      }
+      await pushSyncQueue({
+        entity_type: 'MENU_ITEM',
+        operation: 'DELETE',
+        entity_id: id,
+        payload: { id, branchId, restaurantId },
+        local_entity_version: 1,
+      });
+      if (!online) flashToast('Deleted locally. Syncs to Admin when online returns.');
       await triggerCrossTally();
     } catch (e: any) {
-      alert(e?.message || 'Delete failed');
+      const msg = e?.message || 'Delete failed';
+      alert(msg);
     }
   };
 
   const handleSaveModifier = async (input: AdminModifierInput) => {
     setModSaving(true);
     try {
-      if (modEditing) {
-        const id = modEditing.id || (modEditing as any)._id;
-        await updateAdminModifier(accessToken, id, input);
-      } else {
-        await createAdminModifier(accessToken, input);
+      const isUpdate = !!modEditing;
+      const id = isUpdate ? String(modEditing.id || (modEditing as any)._id) : crypto.randomUUID();
+      const now = Date.now();
+
+      const modifierRow = {
+        id,
+        branchId: branchId,
+        restaurantId: restaurantId,
+        name: input.name,
+        description: input.description ?? null,
+        required: input.required,
+        multiSelect: input.multiSelect,
+        minSelections: typeof input.minSelections === 'number' ? input.minSelections : 0,
+        maxSelections: Math.max(1, typeof input.maxSelections === 'number' ? input.maxSelections : 1),
+        createdAt: isUpdate ? modEditing?.createdAt ?? now : now,
+        updatedAt: now,
+      };
+
+      const optionRows = (input.options ?? []).map((o, i) => ({
+        id: o.id && String(o.id).length > 0 ? String(o.id) : crypto.randomUUID(),
+        modifierId: id,
+        name: o.name,
+        priceDelta: typeof o.priceDelta === 'number' ? o.priceDelta : 0,
+        isDefault: !!o.isDefault,
+        sortOrder: i,
+      }));
+
+      const ipc = (window as any).electronAPI?.db?.menuModifiers;
+      if (ipc && typeof ipc.upsert === 'function') {
+        // IPC bridge menuModifiers.upsert signature: { modifier, options }
+        await ipc.upsert({ modifier: modifierRow, options: optionRows });
       }
+      if (typeof window !== 'undefined') {
+        const snap = readLocalStorageSnapshot(branchId) ?? { categories: [], items: [], modifiers: [] };
+        const fullModifier = { ...modifierRow, options: optionRows };
+        const idx = snap.modifiers.findIndex((m: any) => String(m.id ?? m._id) === id);
+        if (idx >= 0) snap.modifiers[idx] = { ...snap.modifiers[idx], ...fullModifier };
+        else snap.modifiers.push(fullModifier);
+        try {
+          const bid = branchId || Object.keys(readLocalStorageSnapshot() ?? {})[0] || 'default';
+          const all = JSON.parse(window.localStorage.getItem(OFFLINE_MENU_KEY) || '{}');
+          all[bid] = snap;
+          window.localStorage.setItem(OFFLINE_MENU_KEY, JSON.stringify(all));
+          applyRemoteMenuSnapshot({
+            categories: snap.categories,
+            items: snap.items,
+            modifiers: snap.modifiers,
+          });
+        } catch {}
+      }
+
+      // Server payload: full shared-types MenuModifier shape with options expanded
+      const serverPayload = {
+        id,
+        branchId: branchId,
+        restaurantId: restaurantId,
+        ...input,
+        options: optionRows.map((o) => ({
+          id: o.id,
+          name: o.name,
+          priceDelta: o.priceDelta,
+          isDefault: o.isDefault,
+        })),
+      };
+      await pushSyncQueue({
+        entity_type: 'MENU_MODIFIER',
+        operation: isUpdate ? 'UPDATE' : 'CREATE',
+        entity_id: id,
+        payload: serverPayload,
+        local_entity_version: 1,
+      });
+
       setModEditorOpen(false);
       setModEditing(null);
+      if (!online) flashToast('Saved locally. Syncs to Admin when online returns.');
       await triggerCrossTally();
+    } catch (e: any) {
+      const msg = e?.message || 'Save failed';
+      alert(/expired|invalid token|logged out|not authorized|unauthorized/i.test(String(msg))
+        ? 'POS login session has expired. Log out and log back in to refresh credentials.'
+        : msg);
     } finally {
       setModSaving(false);
     }
@@ -262,18 +821,53 @@ export default function ManagerTools(props: ManagerToolsProps) {
 
   const handleDeleteModifier = async (m: MenuModifier) => {
     if (!window.confirm(`Delete modifier "${m.name}"?`)) return;
-    const id = m.id || (m as any)._id;
+    const id = String(m.id || (m as any)._id);
     try {
-      await deleteAdminModifier(accessToken, id);
+      const ipc = (window as any).electronAPI?.db?.menuModifiers;
+      if (ipc && typeof ipc.deleteById === 'function') {
+        await ipc.deleteById(id);
+      }
+      if (typeof window !== 'undefined') {
+        const snap = readLocalStorageSnapshot(branchId) ?? { categories: [], items: [], modifiers: [] };
+        snap.modifiers = snap.modifiers.filter((mm: any) => String(mm.id ?? mm._id) !== id);
+        try {
+          const bid = branchId || Object.keys(readLocalStorageSnapshot() ?? {})[0] || 'default';
+          const all = JSON.parse(window.localStorage.getItem(OFFLINE_MENU_KEY) || '{}');
+          all[bid] = snap;
+          window.localStorage.setItem(OFFLINE_MENU_KEY, JSON.stringify(all));
+          applyRemoteMenuSnapshot({
+            categories: snap.categories,
+            items: snap.items,
+            modifiers: snap.modifiers,
+          });
+        } catch {}
+      }
+      await pushSyncQueue({
+        entity_type: 'MENU_MODIFIER',
+        operation: 'DELETE',
+        entity_id: id,
+        payload: { id, branchId, restaurantId },
+        local_entity_version: 1,
+      });
+      if (!online) flashToast('Deleted locally. Syncs to Admin when online returns.');
       await triggerCrossTally();
     } catch (e: any) {
-      alert(e?.message || 'Delete failed');
+      const msg = e?.message || 'Delete failed';
+      alert(msg);
     }
   };
 
   // ===================== RENDER =====================
   return (
     <div className="flex-1 flex flex-col min-h-0 min-w-0 relative">
+      {/* Soft toast: offline save confirmation */}
+      {offlineSaveToast && (
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 z-40 px-4 py-2 rounded-xl bg-amber-500/15 ring-1 ring-amber-400/40 text-amber-200 text-xs font-bold shadow-lg animate-slide-in-up backdrop-blur-sm">
+          <span className="mr-2">💾</span>
+          {offlineSaveToast}
+        </div>
+      )}
+
       {/* Top rail: connection pill, title, search, add button */}
       <header className="shrink-0 px-6 py-4 border-b border-white/5 flex items-center gap-4 relative">
         <div className="absolute inset-0 bg-gradient-to-r from-amber-500/5 via-transparent to-cyan-500/5 pointer-events-none" />
@@ -282,21 +876,21 @@ export default function ManagerTools(props: ManagerToolsProps) {
           <div className="min-w-0">
             <h1 className="text-lg font-black text-white leading-none">Manager Tools</h1>
             <p className="text-[11px] text-ink-300 mt-1">
-              Menu editor — edits sync across POS, Admin portal and Website
+              Menu editor — edits saved locally, syncs to Admin & Website when online
             </p>
           </div>
         </div>
 
-        {/* Connection status pill — amber = not online (editing blocked) */}
+        {/* Connection status pill — informational only (never blocks edits) */}
         <div className={`ml-2 shrink-0 px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-[0.14em] ring-1 ring-inset ${
           online
             ? 'bg-emerald-500/10 text-emerald-200 ring-emerald-400/30'
-            : 'bg-amber-500/15 text-amber-200 ring-amber-400/40 animate-pulse-soft'
+            : 'bg-amber-500/15 text-amber-200 ring-amber-400/40'
         }`}>
           <span className="inline-block w-1.5 h-1.5 rounded-full mr-2 align-middle"
             style={{ background: online ? '#34d399' : '#fbbf24', boxShadow: online ? '0 0 8px rgba(52,211,153,0.6)' : '0 0 8px rgba(251,191,36,0.6)' }}
           />
-          {online ? 'Online' : connectionStatus === 'CHECKING' ? 'Checking server…' : connectionStatus === 'WAKING' ? 'Waking server…' : 'Offline'}
+          {online ? 'Online' : connectionStatus === 'CHECKING' ? 'Checking server…' : connectionStatus === 'WAKING' ? 'Waking server…' : connectionStatus === 'SYNCHRONIZING' ? 'Syncing…' : connectionStatus === 'SYNC_ERROR' ? 'Sync issue' : 'Offline'}
         </div>
 
         <div className="flex-1" />
@@ -313,20 +907,15 @@ export default function ManagerTools(props: ManagerToolsProps) {
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-400 text-lg">🔍</span>
         </div>
 
-        {/* Add button — disabled offline */}
+        {/* Add button — always enabled (offline-first local save) */}
         <button
           onClick={() => {
             if (subTab === 'ITEMS') { setItemEditing(null); setItemEditorOpen(true); }
             else if (subTab === 'CATEGORIES') { setCatEditing(null); setCatEditorOpen(true); }
             else { setModEditing(null); setModEditorOpen(true); }
           }}
-          disabled={!online}
-          className={`shrink-0 h-10 px-4 rounded-xl font-black text-sm transition-all active:scale-[0.97] ring-1 ring-inset flex items-center gap-2 ${
-            online
-              ? 'bg-gradient-to-b from-amber-500/90 to-amber-600 text-slate-900 ring-amber-400/50 shadow-[0_4px_20px_-8px_rgba(251,191,36,0.55)] hover:brightness-105'
-              : 'bg-slate-700/40 text-ink-400 ring-white/10 cursor-not-allowed'
-          }`}
-          title={online ? `Add new ${subTab.slice(0, -1).toLowerCase()}` : 'Connect to the internet to add entries'}
+          className="shrink-0 h-10 px-4 rounded-xl font-black text-sm transition-all active:scale-[0.97] ring-1 ring-inset flex items-center gap-2 bg-gradient-to-b from-amber-500/90 to-amber-600 text-slate-900 ring-amber-400/50 shadow-[0_4px_20px_-8px_rgba(251,191,36,0.55)] hover:brightness-105"
+          title={`Add new ${subTab.slice(0, -1).toLowerCase()}`}
         >
           <span className="text-base">＋</span>
           New
@@ -362,8 +951,8 @@ export default function ManagerTools(props: ManagerToolsProps) {
         <div className="flex-1" />
         {!online && (
           <p className="text-[11px] text-amber-300/80 flex items-center gap-1.5">
-            <span>⚠️</span>
-            All edits disabled until server connection returns.
+            <span>💾</span>
+            Offline mode — edits save locally & sync when back online.
           </p>
         )}
       </div>
@@ -380,7 +969,6 @@ export default function ManagerTools(props: ManagerToolsProps) {
             renderRow={(c) => (
               <CategoryRow
                 cat={c}
-                online={online}
                 onEdit={() => { setCatEditing(c); setCatEditorOpen(true); }}
                 onDelete={() => handleDeleteCategory(c)}
               />
@@ -399,7 +987,6 @@ export default function ManagerTools(props: ManagerToolsProps) {
               <ItemRow
                 item={it}
                 categories={categories}
-                online={online}
                 onEdit={() => { setItemEditing(it); setItemEditorOpen(true); }}
                 onDelete={() => handleDeleteItem(it)}
               />
@@ -417,7 +1004,6 @@ export default function ManagerTools(props: ManagerToolsProps) {
             renderRow={(m) => (
               <ModifierRow
                 mod={m}
-                online={online}
                 onEdit={() => { setModEditing(m); setModEditorOpen(true); }}
                 onDelete={() => handleDeleteModifier(m)}
               />
@@ -505,9 +1091,10 @@ function ListView<T>({
 }
 
 // =================== Category Row ===================
+// Note: offline-first means rows are always editable; no `online` gate exists
 function CategoryRow({
-  cat, online, onEdit, onDelete,
-}: { cat: MenuCategory; online: boolean; onEdit: () => void; onDelete: () => void }) {
+  cat, onEdit, onDelete,
+}: { cat: MenuCategory; onEdit: () => void; onDelete: () => void }) {
   return (
     <div className="group flex items-center gap-4 p-4 rounded-2xl bg-slate-800/20 border border-white/5 hover:border-amber-400/20 hover:bg-slate-800/35 transition-all">
       <div className="w-14 h-14 rounded-xl bg-gradient-to-br from-amber-500/20 to-orange-600/10 flex items-center justify-center text-2xl shrink-0 ring-1 ring-inset ring-amber-400/20">
@@ -524,20 +1111,15 @@ function CategoryRow({
           <p className="text-ink-300 text-xs mt-1 line-clamp-2">{cat.description}</p>
         )}
       </div>
+      {/* Always-enabled action buttons — local writes + sync queue defer push */}
       <div className="flex items-center gap-2 shrink-0 opacity-90 group-hover:opacity-100">
         <button
           onClick={onEdit}
-          disabled={!online}
-          className={`h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all ${
-            online ? 'bg-slate-700/40 hover:bg-amber-500/15 ring-white/10 hover:ring-amber-400/30 text-white' : 'bg-slate-800/40 text-ink-500 ring-white/5 cursor-not-allowed'
-          }`}
+          className="h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all bg-slate-700/40 hover:bg-amber-500/15 ring-white/10 hover:ring-amber-400/30 text-white"
         >✏️ Edit</button>
         <button
           onClick={onDelete}
-          disabled={!online}
-          className={`h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all ${
-            online ? 'bg-rose-500/10 hover:bg-rose-500/20 ring-rose-400/20 hover:ring-rose-400/40 text-rose-200' : 'bg-slate-800/40 text-ink-500 ring-white/5 cursor-not-allowed'
-          }`}
+          className="h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all bg-rose-500/10 hover:bg-rose-500/20 ring-rose-400/20 hover:ring-rose-400/40 text-rose-200"
         >🗑️ Delete</button>
       </div>
     </div>
@@ -545,10 +1127,11 @@ function CategoryRow({
 }
 
 // =================== Item Row ===================
+// Note: offline-first means rows are always editable; no `online` gate exists
 function ItemRow({
-  item, categories, online, onEdit, onDelete,
+  item, categories, onEdit, onDelete,
 }: {
-  item: MenuItem; categories: MenuCategory[]; online: boolean; onEdit: () => void; onDelete: () => void;
+  item: MenuItem; categories: MenuCategory[]; onEdit: () => void; onDelete: () => void;
 }) {
   const cat = categories.find((c) => (c.id || (c as any)._id) === item.categoryId);
   const statusTint: Record<string, { label: string; cls: string }> = {
@@ -585,20 +1168,15 @@ function ItemRow({
           <p className="text-ink-400 text-xs mt-1.5 line-clamp-1">{item.description}</p>
         )}
       </div>
+      {/* Always-enabled action buttons — local writes + sync queue defer push */}
       <div className="flex items-center gap-2 shrink-0 opacity-90 group-hover:opacity-100">
         <button
           onClick={onEdit}
-          disabled={!online}
-          className={`h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all ${
-            online ? 'bg-slate-700/40 hover:bg-amber-500/15 ring-white/10 hover:ring-amber-400/30 text-white' : 'bg-slate-800/40 text-ink-500 ring-white/5 cursor-not-allowed'
-          }`}
+          className="h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all bg-slate-700/40 hover:bg-amber-500/15 ring-white/10 hover:ring-amber-400/30 text-white"
         >✏️ Edit</button>
         <button
           onClick={onDelete}
-          disabled={!online}
-          className={`h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all ${
-            online ? 'bg-rose-500/10 hover:bg-rose-500/20 ring-rose-400/20 hover:ring-rose-400/40 text-rose-200' : 'bg-slate-800/40 text-ink-500 ring-white/5 cursor-not-allowed'
-          }`}
+          className="h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all bg-rose-500/10 hover:bg-rose-500/20 ring-rose-400/20 hover:ring-rose-400/40 text-rose-200"
         >🗑️ Delete</button>
       </div>
     </div>
@@ -606,9 +1184,10 @@ function ItemRow({
 }
 
 // =================== Modifier Row ===================
+// Note: offline-first means rows are always editable; no `online` gate exists
 function ModifierRow({
-  mod, online, onEdit, onDelete,
-}: { mod: MenuModifier; online: boolean; onEdit: () => void; onDelete: () => void }) {
+  mod, onEdit, onDelete,
+}: { mod: MenuModifier; onEdit: () => void; onDelete: () => void }) {
   const opts = (mod.options as any) ?? [];
   return (
     <div className="group flex items-center gap-4 p-4 rounded-2xl bg-slate-800/20 border border-white/5 hover:border-amber-400/20 hover:bg-slate-800/35 transition-all">
@@ -651,20 +1230,15 @@ function ModifierRow({
           )}
         </div>
       </div>
+      {/* Always-enabled action buttons — local writes + sync queue defer push */}
       <div className="flex items-center gap-2 shrink-0 opacity-90 group-hover:opacity-100">
         <button
           onClick={onEdit}
-          disabled={!online}
-          className={`h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all ${
-            online ? 'bg-slate-700/40 hover:bg-amber-500/15 ring-white/10 hover:ring-amber-400/30 text-white' : 'bg-slate-800/40 text-ink-500 ring-white/5 cursor-not-allowed'
-          }`}
+          className="h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all bg-slate-700/40 hover:bg-amber-500/15 ring-white/10 hover:ring-amber-400/30 text-white"
         >✏️ Edit</button>
         <button
           onClick={onDelete}
-          disabled={!online}
-          className={`h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all ${
-            online ? 'bg-rose-500/10 hover:bg-rose-500/20 ring-rose-400/20 hover:ring-rose-400/40 text-rose-200' : 'bg-slate-800/40 text-ink-500 ring-white/5 cursor-not-allowed'
-          }`}
+          className="h-9 px-3 rounded-xl text-xs font-black flex items-center gap-1.5 ring-1 ring-inset transition-all bg-rose-500/10 hover:bg-rose-500/20 ring-rose-400/20 hover:ring-rose-400/40 text-rose-200"
         >🗑️ Delete</button>
       </div>
     </div>

@@ -73,6 +73,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
     menuCategories: {
       listAll: () => invokeDb('db:menu-categories:listAll'),
+      upsert: (row: unknown) => invokeDb('db:menu-categories:upsert', row),
+      deleteById: (id: string) => invokeDb('db:menu-categories:deleteById', id),
     },
 
     menuItems: {
@@ -81,6 +83,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       search: (query: string) => invokeDb('db:menu-items:search', query),
       listByCategory: (categoryId: string) =>
         invokeDb('db:menu-items:listByCategory', categoryId),
+      upsert: (row: unknown) => invokeDb('db:menu-items:upsert', row),
+      deleteById: (id: string) => invokeDb('db:menu-items:deleteById', id),
     },
 
     menuModifiers: {
@@ -88,6 +92,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
         invokeDb('db:menu-modifiers:listForItemId', itemId),
       listByIds: (ids: string[]) =>
         invokeDb('db:menu-modifiers:listByIds', ids),
+      listAll: (branchId?: string) =>
+        invokeDb('db:menu-modifiers:listAll', branchId),
+      listOptionsByModifierIds: (ids: string[]) =>
+        invokeDb('db:menu-modifiers:listOptionsByModifierIds', ids),
+      upsert: (payload: { modifier: unknown; options: unknown }) =>
+        invokeDb('db:menu-modifiers:upsert', payload),
+      deleteById: (id: string) => invokeDb('db:menu-modifiers:deleteById', id),
     },
 
     menu: {
@@ -266,6 +277,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
         invokeDb('db:table-session-ledger:listForSession', sessionId),
       appendNote: (payload: unknown) =>
         invokeDb('db:table-session-ledger:appendNote', payload),
+    },
+
+    reports: {
+      periodSales: (opts: unknown) =>
+        invokeDb('db:reports:periodSales', opts),
+      availableYears: (scope?: unknown) =>
+        invokeDb('db:reports:availableYears', scope),
     },
   },
 

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { LoginMode } from './types';
+import { pinLogin } from './remote-auth';
 
 interface AuthState {
   employee: any | null;
@@ -21,6 +22,22 @@ interface AuthState {
     // employee differs from the offline one (shouldn't happen since pins are
     // unique), we fall back to full setOnlineLogin.
     promoteOnlineLogin: (payload: any) => void;
+    /**
+     * Silently refresh the access token for the current session.
+     *  - If we still have a valid unexpired access token (valid = more than
+     *    30s of TTL remaining) → return it immediately (no network round-trip).
+     *  - Otherwise:
+     *      • Prefer refreshToken if present, otherwise fall back to re-running
+     *        PIN login with the cached offlinePin (set during offline-first
+     *        entry or regular login).
+     *      • On success: promoteOnlineLogin() stores the new access/refresh
+     *        pair, returns the fresh access token string.
+     *  - THROWS if no offlinePin/refreshToken are available or the network
+     *    re-auth fails. Callers should catch this and surface "offline / no
+     *    access to server" style UX instead of the confusing server-returned
+     *    "Invalid or expired token" message.
+     */
+    refreshAccessToken: (opts?: { force?: boolean; deviceId?: string }) => Promise<string>;
     patchBranch: (branch: any) => void;
     logout: () => void;
     clear: () => void;
@@ -29,17 +46,21 @@ interface AuthState {
 
 export const useAuthStore = create<AuthState>()(
   persist(
-    (set) => ({
-      employee: null,
-      branch: null,
-      restaurant: null,
-      accessToken: undefined,
-      refreshToken: undefined,
-      expiresAt: undefined,
-      loginMode: 'ONLINE',
-      lastLoginAt: null,
-      offlinePin: undefined,
-      actions: {
+    (set) => {
+      const initialState = {
+        employee: null as any | null,
+        branch: null as any | null,
+        restaurant: null as any | null,
+        accessToken: undefined as string | undefined,
+        refreshToken: undefined as string | undefined,
+        expiresAt: undefined as number | undefined,
+        loginMode: 'ONLINE' as LoginMode,
+        lastLoginAt: null as number | null,
+        offlinePin: undefined as string | undefined,
+      };
+      const state: AuthState = {
+        ...initialState,
+        actions: {
         setOnlineLogin: (payload) => {
           const data = payload || {};
           const accessToken = data.accessToken || data.token || data?.tokens?.accessToken;
@@ -168,6 +189,94 @@ export const useAuthStore = create<AuthState>()(
         patchBranch: (branch) => {
           set({ branch: branch || null, restaurant: (branch && branch.restaurant) || null });
         },
+        refreshAccessToken: async (opts) => {
+          // Capture current auth snapshot synchronously (zustand getState is
+          // cheap) — we'll use this to decide whether to hit network at all.
+          const cur = useAuthStore.getState();
+          const force = !!opts?.force;
+          // Short-circuit: if user explicitly wants a refresh AND we already
+          // have a valid token with >30s life, return it immediately.
+          if (
+            !force &&
+            cur.accessToken &&
+            (typeof cur.expiresAt !== 'number' || cur.expiresAt - Date.now() > 30_000)
+          ) {
+            return cur.accessToken;
+          }
+
+          const deviceId = opts?.deviceId;
+          // ----------------------------------------------------------------
+          // Option A — refresh token flow: if we have a refresh token + server
+          // supports a /auth/refresh endpoint, use it (shorter payload, keeps
+          // pin out of the wire on every refresh). If the server rejects it
+          // (e.g. refresh revoked, route missing), fall through to PIN re-auth.
+          // ----------------------------------------------------------------
+          if (cur.refreshToken) {
+            try {
+              const API_BASE =
+                (typeof window !== 'undefined' &&
+                  (window as any).__PROLIFIC_API_BASE__ &&
+                  String((window as any).__PROLIFIC_API_BASE__)) ||
+                'https://prolific-api.onrender.com/api/v1';
+              // Try refreshing via POST /auth/refresh (not all builds deploy
+              // this route — if it 404s, catch and fall through to the PIN
+              // flow below so we never fail Manager page just because this
+              // endpoint is missing).
+              const body = JSON.stringify({ refreshToken: cur.refreshToken });
+              const refreshResp = await fetch(`${API_BASE}/auth/refresh`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${cur.accessToken || ''}`,
+                },
+                body,
+              });
+              if (refreshResp.ok) {
+                const refreshJson = await refreshResp.json().catch(() => null);
+                const refreshData = (refreshJson && (refreshJson.data ?? refreshJson)) || null;
+                if (refreshData && (refreshData.accessToken || refreshData.token)) {
+                  cur.actions.promoteOnlineLogin({
+                    ...refreshData,
+                    deviceId,
+                  });
+                  return (refreshData.accessToken || refreshData.token) as string;
+                }
+              }
+            } catch {
+              /* ignore — fall through to PIN re-auth */
+            }
+          }
+
+          // ----------------------------------------------------------------
+          // Option B — PIN-based re-authentication (guaranteed to exist on
+          // every build). This is the default path for pin-login sessions.
+          // offlinePin is persisted during both regular and offline-first
+          // login; if missing, we genuinely cannot re-authenticate silently
+          // and must throw.
+          // ----------------------------------------------------------------
+          if (!cur.offlinePin) {
+            throw new Error(
+              'No cached PIN for silent re-auth. Please log out and log back in to enable Manager tools.'
+            );
+          }
+          const branchId = cur.branch?.id;
+          const loginResp = await pinLogin({
+            pin: cur.offlinePin,
+            branchId: typeof branchId === 'string' ? branchId : undefined,
+            deviceId: typeof deviceId === 'string' ? deviceId : undefined,
+          });
+          const data = loginResp && typeof loginResp === 'object' ? loginResp : null;
+          const freshToken =
+            (data && (data.accessToken || data.token || data?.tokens?.accessToken)) || null;
+          if (!freshToken) {
+            throw new Error('Silent re-authentication returned no access token.');
+          }
+          // Persist the new access/refresh tokens, branch, employee snapshots
+          // so the rest of the POS (bootstrap refreshes, change PIN dialog,
+          // upcoming calls to Manager APIs) all use the fresh credentials.
+          cur.actions.promoteOnlineLogin({ ...(data || {}), deviceId });
+          return freshToken as string;
+        },
         logout: () => {
           set({
             employee: null,
@@ -198,7 +307,9 @@ export const useAuthStore = create<AuthState>()(
           });
         },
       },
-    }),
+      };
+      return state;
+    },
     {
       name: 'pos_auth_v1',
       storage: createJSONStorage(() => localStorage),

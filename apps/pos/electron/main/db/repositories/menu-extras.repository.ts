@@ -115,6 +115,45 @@ export class MenuModifiersRepository {
       if (data.options) this.upsertManyOptionRows(data.options);
     })();
   }
+
+  upsertOneWithOptions(data: {
+    modifier: Partial<MenuModifierRow>;
+    options: Partial<MenuModifierOptionRow>[];
+  }): void {
+    this.db.transaction(() => {
+      this.upsertManyModifierRows([data.modifier]);
+      this.upsertManyOptionRows(data.options);
+    })();
+  }
+
+  listAll(branchId: string): MenuModifierRow[] {
+    return this.db.all<MenuModifierRow>(
+      `SELECT * FROM menu_modifiers WHERE branch_id = ? AND is_active = 1 ORDER BY name ASC`,
+      branchId
+    );
+  }
+
+  listAllOptions(modifierIds: string[]): MenuModifierOptionRow[] {
+    if (modifierIds.length === 0) return [];
+    const placeholders = modifierIds.map(() => '?').join(',');
+    return this.db.all<MenuModifierOptionRow>(
+      `SELECT * FROM menu_modifier_options WHERE modifier_id IN (${placeholders}) AND is_active = 1 ORDER BY modifier_id ASC, sort_order ASC`,
+      ...modifierIds
+    );
+  }
+
+  deleteById(id: string): void {
+    this.db.transaction(() => {
+      this.db.run(
+        `UPDATE menu_modifiers SET is_active = 0, updated_at = unixepoch('now')*1000 WHERE id = ?`,
+        id
+      );
+      this.db.run(
+        `UPDATE menu_modifier_options SET is_active = 0, updated_at = unixepoch('now')*1000 WHERE modifier_id = ?`,
+        id
+      );
+    })();
+  }
 }
 
 export class TaxesRepository {

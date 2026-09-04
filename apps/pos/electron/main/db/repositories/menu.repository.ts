@@ -11,6 +11,10 @@ export class MenuCategoriesRepository {
     );
   }
 
+  upsertOne(row: Partial<MenuCategoryRow>): void {
+    this.upsertMany([row]);
+  }
+
   upsertMany(rows: Partial<MenuCategoryRow>[]): void {
     if (rows.length === 0) return;
     const stmt = this.db['prepare'](`
@@ -36,6 +40,13 @@ export class MenuCategoriesRepository {
     this.db.transaction(() => {
       for (const row of rows) stmt.run(row);
     })();
+  }
+
+  deleteById(id: string): void {
+    this.db.run(
+      `UPDATE menu_categories SET is_active = 0, updated_at = unixepoch('now')*1000 WHERE id = ?`,
+      id
+    );
   }
 }
 
@@ -164,6 +175,17 @@ export class MenuItemsRepository {
     this.db.run(
       `UPDATE menu_items SET status = ?, updated_at = unixepoch('now')*1000 WHERE id = ?`,
       status,
+      id
+    );
+  }
+
+  upsertOne(row: Partial<MenuItemRow>): void {
+    this.upsertMany([row]);
+  }
+
+  deleteById(id: string): void {
+    this.db.run(
+      `UPDATE menu_items SET is_active = 0, status = 'DISABLED', updated_at = unixepoch('now')*1000 WHERE id = ?`,
       id
     );
   }
