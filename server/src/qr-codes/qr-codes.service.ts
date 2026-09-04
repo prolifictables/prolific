@@ -67,13 +67,11 @@ export class QrCodesService {
       throw new NotFoundException(`Table ${tableId} not found`);
     }
 
-    await this.qrCodeModel
-      .updateMany(
-        { tableId, branchId },
-        { $set: { isActive: false, isDefault: false } }
-      )
-      .exec();
-
+    // Customer requirements #1 + #11: the DEFAULT (permanent) QR token for a
+    // physical table must NEVER change. Regenerate therefore creates an
+    // ADDITIONAL, non-default, "backup" QR code that points at the same table.
+    // This way operators can print extra stickers without invalidating the
+    // permanent stickers on the table.
     const token = generateToken();
     const qrCode = await this.qrCodeModel.create({
       restaurantId,
@@ -81,14 +79,8 @@ export class QrCodesService {
       tableId,
       token,
       isActive: true,
-      isDefault: true,
+      isDefault: false, // explicitly NOT default — keep permanent default untouched
     });
-
-    await this.tableModel
-      .findByIdAndUpdate(table._id, {
-        $set: { qrCodeId: qrCode._id.toString() },
-      })
-      .exec();
 
     return qrCode;
   }
@@ -119,16 +111,16 @@ export class QrCodesService {
 
     // Resolve the public Website surface URL that gets encoded into every
     // printable QR code. Customers scan the sticker → land here →
-    // GET /public/qr/:token takes over. Priority:
+    // GET /public/table-resolve?table= takes over. Priority chain:
     //   (1) PUBLIC_QR_BASE_URL — operator explicitly sets it (Render env override)
-    //   (2) WEBSITE_URL env + /t suffix (explicit Website surface env)
-    //   (3) APP_URL env + /t suffix (legacy generic app env)
-    //   (4) Production confirmed www.prolifictables.com/t (NEVER localhost in prod!)
+    //   (2) WEBSITE_URL env + /order suffix (explicit Website surface env)
+    //   (3) APP_URL env + /order suffix (legacy generic app env)
+    //   (4) Production confirmed www.prolifictables.com/order (NEVER localhost in prod!)
     const websiteUrl =
       process.env.PUBLIC_QR_BASE_URL ||
-      (process.env.WEBSITE_URL ? `${process.env.WEBSITE_URL.replace(/\/+$/, '')}/t` : undefined) ||
-      (process.env.APP_URL ? `${process.env.APP_URL.replace(/\/+$/, '')}/t` : undefined) ||
-      'https://www.prolifictables.com/t';
+      (process.env.WEBSITE_URL ? `${process.env.WEBSITE_URL.replace(/\/+$/, '')}/order` : undefined) ||
+      (process.env.APP_URL ? `${process.env.APP_URL.replace(/\/+$/, '')}/order` : undefined) ||
+      'https://www.prolifictables.com/order';
     const publicUrl = websiteUrl;
 
     let tableQuery: Record<string, unknown> = { branchId, isActive: true };
@@ -152,7 +144,7 @@ export class QrCodesService {
       if (!qrCode) continue;
 
       const token = qrCode.token;
-      const encodedPublicUrl = encodeURIComponent(`${publicUrl}/${token}`);
+      const encodedPublicUrl = encodeURIComponent(`${publicUrl}?table=${encodeURIComponent(token)}`);
       const downloadUrl = `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodedPublicUrl}`;
 
       qrPacks.push({

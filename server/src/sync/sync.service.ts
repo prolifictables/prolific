@@ -12,6 +12,7 @@ import { CashAdjustment } from '../shifts/schemas/cash-adjustment.schema';
 import { MenuCategory } from '../menu/schemas/menu-category.schema';
 import { MenuItem } from '../menu/schemas/menu-item.schema';
 import { MenuModifier } from '../menu/schemas/menu-modifier.schema';
+import { TableSession } from '../table-sessions/schemas/table-session.schema';
 import { AuditLogsService } from '../audit/audit-logs.service';
 
 export interface SyncCommand {
@@ -86,6 +87,7 @@ export class SyncService {
     @InjectModel(MenuCategory.name) private readonly menuCategoryModel: Model<MenuCategory>,
     @InjectModel(MenuItem.name) private readonly menuItemModel: Model<MenuItem>,
     @InjectModel(MenuModifier.name) private readonly menuModifierModel: Model<MenuModifier>,
+    @InjectModel(TableSession.name) private readonly tableSessionModel: Model<TableSession>,
     private readonly auditLogsService: AuditLogsService
   ) {}
 
@@ -323,6 +325,9 @@ export class SyncService {
 
       case 'MENU_MODIFIER':
         return this.applyMenuModifierCommand(restaurantId, branchId, cmd);
+
+      case 'TABLE_SESSION':
+        return this.applyTableSessionCommand(restaurantId, branchId, cmd);
 
       default:
         throw new Error(`Unsupported sync entityType: ${cmd.entityType}`);
@@ -774,6 +779,94 @@ export class SyncService {
     }
 
     throw new Error(`Unsupported operation for CASH_ADJUSTMENT: ${cmd.operation}`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // TABLE_SESSION handler — mirrors the local SQLite table_sessions + ledger rows
+  // synced from POS. Matches the same upsert pattern as SHIFT.
+  // ---------------------------------------------------------------------------
+  private async applyTableSessionCommand(
+    restaurantId: string | undefined,
+    branchId: string | undefined,
+    cmd: SyncCommand
+  ): Promise<{
+    entityId: string | null;
+    snapshot: Record<string, unknown> | null;
+    serverVersion: number | undefined;
+    conflictDetected: boolean;
+  }> {
+    const payload = cmd.payload;
+
+    if (!restaurantId || !branchId) {
+      throw new Error('restaurantId and branchId required for TABLE_SESSION sync');
+    }
+
+    // CREATE or UPDATE both use idempotent upsert-by-id — the POS may emit
+    // UPDATE after adding items to an open session, then finally UPDATE when paying.
+    if (cmd.operation === 'CREATE' || cmd.operation === 'UPDATE') {
+      const entityId =
+        cmd.entityId ??
+        (payload._id as string) ??
+        (payload.id as string);
+
+      if (entityId) {
+        const existing = await this.tableSessionModel.findById(entityId).exec();
+        if (existing) {
+          const updated = await this.tableSessionModel
+            .findByIdAndUpdate(
+              entityId,
+              {
+                $set: {
+                  restaurantId,
+                  branchId,
+                  ...payload,
+                },
+              },
+              { new: true, runValidators: false }
+            )
+            .exec();
+          return {
+            entityId,
+            snapshot: toPlain(updated),
+            serverVersion: 0,
+            conflictDetected: false,
+          };
+        }
+      }
+
+      const created = await this.tableSessionModel.create({
+        restaurantId,
+        branchId,
+        ...(entityId ? { _id: entityId } : {}),
+        ...payload,
+      });
+      return {
+        entityId: created._id.toString(),
+        snapshot: toPlain(created),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    if (cmd.operation === 'DELETE') {
+      const entityId =
+      cmd.entityId ??
+      (payload._id as string) ??
+      (payload.id as string);
+    if (!entityId) throw new Error('DELETE TABLE_SESSION requires entityId');
+
+      const deleted = await this.tableSessionModel
+        .findByIdAndDelete(entityId)
+        .exec();
+      return {
+        entityId,
+        snapshot: toPlain(deleted),
+        serverVersion: 0,
+        conflictDetected: false,
+      };
+    }
+
+    throw new Error(`Unsupported operation for TABLE_SESSION: ${cmd.operation}`);
   }
 
   private async applyMenuCategoryCommand(

@@ -35,57 +35,15 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
   const debounceRef = useRef<number | null>(null);
 
   const refresh = async () => {
+    // -----------------------------------------------------------------
+    // OFFLINE-FIRST: paint local SQLite menu IMMEDIATELY (< 50ms) so
+    // cashier never stares at a blank grid waiting for network. Remote
+    // fetch runs in background (non-blocking, 3s timeout) and warms
+    // the cache when online — next render cycle shows updated rows.
+    // Network failures (offline, slow 2G, server down) NEVER block UI.
+    // -----------------------------------------------------------------
     try {
-      // Resolve branch: prefer the caller-supplied branch (logged-in cashier's
-      // branch) over any default-public-branch guess. This ensures admin menu
-      // uploads made under the employee's branch are shown immediately.
-      let resolvedBranchId: string | null = branchId || null;
-      if (!resolvedBranchId) {
-        resolvedBranchId = await resolveDefaultBranchId();
-      }
-      if (resolvedBranchId) {
-        const { categories: apiCats, items: apiItems, modifiers: apiMods } =
-          await fetchPublicMenu(resolvedBranchId);
-        // Write BOTH cache layers so every POS consumer (ModifierModal,
-        // CartPanel, search, etc.) immediately sees admin-uploaded changes:
-        //  (a) mock-electron-shim in-memory snapshot (browser mode)
-        //  (b) Electron SQLite persistence (desktop mode via IPC)
-        applyRemoteMenuSnapshot({
-          categories: apiCats,
-          items: apiItems,
-          modifiers: apiMods,
-        });
-        try {
-          await window.electronAPI?.db?.menu?.applySnapshot?.({
-            categories: apiCats,
-            items: apiItems,
-            modifiers: apiMods,
-          });
-        } catch {}
-        setCategories(
-          apiCats.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)),
-        );
-        setAllItems(apiItems);
-        try {
-          const list = await listPublicBranches();
-          const current = list.find((b) => b.id === resolvedBranchId);
-          setSourceLabel(current ? `📡 ${current.name}` : '📡 Live Menu');
-        } catch {
-          setSourceLabel('📡 Live Menu');
-        }
-        return;
-      }
-    } catch (err: any) {
-      console.warn('[menu] remote menu unavailable, using local source', err?.message || err);
-    }
-
-    // Local fallback: Electron IPC on desktop or the in-memory mock shim in
-    // pure browser preview mode. Only reached when the server is truly down.
-    // Also reads the localStorage offline mirror (populated on every
-    // successful live fetch) so page refresh + full network loss still
-    // renders the admin-uploaded menu we last saw online, NEVER the SEEDED
-    // demo hardcoded data on production hostnames.
-    try {
+      // 1) LOCAL READ — always done first, no network, no auth needed.
       let cats: MenuCategory[] = [];
       let items: MenuItem[] = [];
       const [catsRes, itemsRes]: any[] = await Promise.all([
@@ -99,10 +57,10 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
         ? itemsRes
         : ((itemsRes as any)?.data as MenuItem[]) || [];
 
-      // If electronAPI returned nothing (pure browser mode and the in-memory
-      // snapshot hasn't warmed up yet, e.g. IIFE couldn't guess branchId),
-      // also try the direct localStorage offline mirror of the last
-      // successful live fetch for the provided branchId.
+      // If Electron/SQLite returned nothing (pure browser preview mode),
+      // fall back to the localStorage offline mirror of the last successful
+      // live fetch for the provided branchId. Guaranteed NEVER empty when
+      // user has logged in at least once online before.
       if (cats.length === 0 && items.length === 0) {
         const mirror = readOfflineMenuSnapshotMirror(branchId || null);
         if (mirror) {
@@ -111,8 +69,7 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
         }
       }
       // Defensive ID normalization: shim/mirror paths may contain raw
-      // Mongoose ObjectId instances or legacy _id field names from earlier
-      // writes. Guarantee plain-string id & FKs so === equality never fails.
+      // Mongoose ObjectId instances or legacy _id field names.
       const norm = <T extends Record<string, any>>(x: T): T => {
         const c: any = { ...x };
         const oid = c.id ?? c._id;
@@ -128,13 +85,96 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
       };
       cats = cats.map(norm);
       items = items.map(norm);
-
       setCategories(cats.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)));
       setAllItems(items);
-      setSourceLabel('💾 Offline Menu');
+      setSourceLabel(cats.length || items.length ? '💾 Offline Menu' : '⚠️ Unavailable');
+
+      // 2) BACKGROUND REMOTE WARM — non-blocking, hard 3s timeout, no UI block.
+      //    Updates SQLite snapshots so the NEXT render cycle shows any changes
+      //    uploaded in Admin while the POS was idle. Fails silently offline.
+      (async () => {
+        let resolvedBranchId: string | null = branchId || null;
+        try {
+          if (!resolvedBranchId) resolvedBranchId = await resolveDefaultBranchId();
+          if (!resolvedBranchId) return;
+
+          // Abort remote fetch after 3s so cashier is never stuck.
+          // setTimeout + wrapped Promise.race — native AbortSignal has
+          // inconsistent browser/Electron support for fetch(..., signal).
+          const hardTimeout = new Promise<never>((_res, rej) =>
+            setTimeout(() => rej(new Error('remote menu warm: timed out (>3s)')), 3000),
+          );
+          const fetchJob = (async () => {
+            const remote = await fetchPublicMenu(resolvedBranchId!);
+            if (!remote?.categories && !remote?.items) return null;
+            return remote;
+          })();
+          const snap: any = await Promise.race([fetchJob, hardTimeout]);
+          if (!snap) return;
+
+          // Apply to both mirrors: shim in-memory (browser) + Electron SQLite.
+          applyRemoteMenuSnapshot({
+            categories: snap.categories || [],
+            items: snap.items || [],
+            modifiers: snap.modifiers || [],
+          });
+          try {
+            await window.electronAPI?.db?.menu?.applySnapshot?.({
+              categories: snap.categories || [],
+              items: snap.items || [],
+              modifiers: snap.modifiers || [],
+            });
+          } catch {
+            /* applySnapshot not available in pure browser shim */
+          }
+
+          // Paint remote-updated rows on top of local state (they just got flushed
+          // into SQLite/mirror, but we don't want another full DB round-trip).
+          const updatedCats = Array.isArray(snap.categories)
+            ? (snap.categories as MenuCategory[]).map(norm)
+            : cats;
+          const updatedItems = Array.isArray(snap.items)
+            ? (snap.items as MenuItem[]).map(norm)
+            : items;
+          setCategories(
+            updatedCats.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)),
+          );
+          setAllItems(updatedItems);
+          try {
+            const list = await listPublicBranches();
+            const current = list.find((b) => b.id === resolvedBranchId);
+            setSourceLabel(current ? `📡 ${current.name}` : '📡 Live Menu');
+          } catch {
+            setSourceLabel('📡 Live Menu');
+          }
+        } catch (remoteErr: any) {
+          // Silently swallow — offline. The local rows we painted above
+          // remain fully valid. Only log for diagnostics.
+          if (typeof console === 'undefined') return;
+          (console.debug || console.log).call(console,
+            '[menu] background remote warm skipped (offline):',
+            remoteErr?.message || String(remoteErr).slice(0, 80),
+          );
+        }
+      })().catch(() => {});
+      return;
     } catch (e) {
-      console.warn('[menu] local refresh failed', e);
-      setSourceLabel('⚠️ Unavailable');
+      // Even the local read above threw. Last resort: localStorage mirror only.
+      console.warn('[menu] local read failed, falling back to raw mirror', e);
+      try {
+        const mirror = readOfflineMenuSnapshotMirror(branchId || null);
+        if (mirror) {
+          const cats2 = Array.isArray(mirror.categories) ? (mirror.categories as MenuCategory[]) : [];
+          const items2 = Array.isArray(mirror.items) ? (mirror.items as MenuItem[]) : [];
+          setCategories(cats2.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)));
+          setAllItems(items2);
+          setSourceLabel('💾 Offline Menu');
+        } else {
+          setSourceLabel('⚠️ Unavailable');
+        }
+      } catch {
+        setSourceLabel('⚠️ Unavailable');
+      }
     }
   };
 

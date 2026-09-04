@@ -141,10 +141,12 @@ export default function QRCodesPage() {
   };
 
   // Generate QR image URL pointing at the Website surface — NOT admin origin.
-  // Customer scans → lands on www.prolifictables.com/t/<token> → resolveQr +
-  // joinOrStartTableSession public endpoints take over (pre-wired in Nest).
+  // Customer scans → lands on www.prolifictables.com/order?table=<token> →
+  // resolveTableByIdentifier + joinOrStartTableSession public endpoints take
+  // over (pre-wired in Nest). Customer requirement #2 mandates this URL shape
+  // (NOT the legacy /t/<token> path).
   const qrDataUrl = (token: string) => {
-    const publicUrl = `${websiteBase}/t/${token}`;
+    const publicUrl = `${websiteBase}/order?table=${encodeURIComponent(token)}`;
     const size = 200;
     const base = `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&margin=10&data=`;
     return base + encodeURIComponent(publicUrl);
@@ -241,7 +243,7 @@ export default function QRCodesPage() {
         (q.table as any)?.name || '',
         (q.table as any)?.zone || '',
         q.token,
-        `${websiteBase}/t/${q.token}`,
+        `${websiteBase}/order?table=${encodeURIComponent(q.token)}`,
         q.isActive ? 'Active' : 'Inactive',
         formatDateTime(q.createdAt),
       ]);
@@ -264,7 +266,7 @@ export default function QRCodesPage() {
       tableName: (q.table as any)?.name || '',
       zone: (q.table as any)?.zone || '',
       capacity: (q.table as any)?.capacity,
-      url: `${websiteBase}/t/${q.token}`,
+      url: `${websiteBase}/order?table=${encodeURIComponent(q.token)}`,
       isActive: q.isActive,
       createdAt: q.createdAt,
     }));
@@ -343,8 +345,8 @@ export default function QRCodesPage() {
       title: 'Public URL',
       className: 'text-xs text-slate-500',
       render: (r) => (
-        <div className="font-mono truncate max-w-[220px]" title={`${websiteBase}/t/${r.token}`}>
-          {`${websiteBase}/t/${r.token}`}
+        <div className="font-mono truncate max-w-[220px]" title={`${websiteBase}/order?table=${r.token}`}>
+          {`${websiteBase}/order?table=${r.token}`}
         </div>
       ),
     },
@@ -469,7 +471,7 @@ export default function QRCodesPage() {
                       {q.token}
                     </div>
                     <div className="mt-2 text-[10px] text-slate-500 truncate font-mono">
-                      {`${websiteBase}/t/${q.token}`}
+                      {`${websiteBase}/order?table=${encodeURIComponent(q.token)}`}
                     </div>
                     {tCap !== undefined && (
                       <div className="mt-1 text-xs text-slate-500">

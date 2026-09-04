@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { subscribeApiWake, ApiWakeState } from './api-wake';
+import { subscribeApiWake, ApiWakeState } from '../lib/api-wake';
 
 // Renders FULL SCREEN polite overlay ONLY while Render wakes up.
 // Mount at root layout; children are invisible with pointer-events-none so that

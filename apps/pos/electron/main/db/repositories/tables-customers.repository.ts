@@ -23,13 +23,40 @@ export class TablesRepository {
 
   upsertMany(rows: Partial<TableRow>[]): void {
     if (rows.length === 0) return;
+    // Incoming rows come from one of two sources — each uses a different
+    // naming convention, so we normalize to SQLite's snake_case columns here:
+    //   (1) POS-side local creation: already snake_case.
+    //   (2) Cloud sync / pull-worker from Mongo: camelCase from Mongoose
+    //       .lean() (id, branchId, name, zone, capacity, status, qrCodeId,
+    //       permanentQrId, restaurantId, createdAt, updatedAt).
+    // After normalization we also keep both forms on the row object so any
+    // downstream consumer is unaffected.
+    const normalized = rows.map((raw) => {
+      const r: any = { ...(raw as any) };
+      r.id = String(r.id ?? r._id ?? '');
+      r.branch_id = r.branch_id ?? r.branchId ?? null;
+      r.restaurant_id = r.restaurant_id ?? r.restaurantId ?? null;
+      r.name = r.name ?? null;
+      r.zone = r.zone ?? null;
+      r.capacity = typeof r.capacity === 'number' ? r.capacity : null;
+      r.status = r.status ?? 'AVAILABLE';
+      r.qr_code_id = r.qr_code_id ?? r.qrCodeId ?? null;
+      r.permanent_qr_id = r.permanent_qr_id ?? r.permanentQrId ?? null;
+      r.created_at = typeof r.created_at === 'number' ? r.created_at
+        : (typeof r.createdAt === 'number' ? r.createdAt
+        : (r.createdAt instanceof Date ? r.createdAt.getTime() : Date.now()));
+      r.updated_at = typeof r.updated_at === 'number' ? r.updated_at
+        : (typeof r.updatedAt === 'number' ? r.updatedAt
+        : (r.updatedAt instanceof Date ? r.updatedAt.getTime() : Date.now()));
+      return r as Partial<TableRow>;
+    });
     const stmt = this.db['prepare'](`
       INSERT INTO tables (
         id, branch_id, restaurant_id, name, zone, capacity, status,
-        qr_code_id, created_at, updated_at
+        qr_code_id, permanent_qr_id, created_at, updated_at
       ) VALUES (
         @id, @branch_id, @restaurant_id, @name, @zone, @capacity, @status,
-        @qr_code_id,
+        @qr_code_id, @permanent_qr_id,
         COALESCE(@created_at, unixepoch('now')*1000),
         COALESCE(@updated_at, unixepoch('now')*1000)
       )
@@ -41,10 +68,11 @@ export class TablesRepository {
         capacity = excluded.capacity,
         status = excluded.status,
         qr_code_id = excluded.qr_code_id,
+        permanent_qr_id = excluded.permanent_qr_id,
         updated_at = unixepoch('now')*1000
     `);
     this.db.transaction(() => {
-      for (const row of rows) stmt.run(row);
+      for (const row of normalized) stmt.run(row as any);
     })();
   }
 

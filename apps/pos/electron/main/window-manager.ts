@@ -78,6 +78,12 @@ export class WindowManager {
 
     const preload = isDev ? 'cashier.js' : 'cashier.js';
 
+    // Hide the native title bar so we can render our own branded one in the
+    // React <Header/> component (including custom min/max/close/add buttons).
+    // On macOS we still mount the traffic-light buttons in the standard
+    // position — Windows/Linux rely entirely on the rendered React controls.
+    const useCustomFrame = true;
+
     const win = new BrowserWindow({
       title: 'Prolific POS · Cashier',
       backgroundColor: '#0B1220',
@@ -89,6 +95,13 @@ export class WindowManager {
       x: isDev ? undefined : primary.workArea.x,
       y: isDev ? undefined : primary.workArea.y,
       show: false,
+      frame: !useCustomFrame,
+      titleBarStyle: useCustomFrame
+        ? (process.platform === 'darwin' ? 'hiddenInset' : 'hidden')
+        : ('default' as any),
+      ...(useCustomFrame && process.platform === 'darwin'
+        ? { trafficLightPosition: { x: 14, y: 14 } }
+        : {}),
       webPreferences: secureWebPreferences(preload),
     });
 

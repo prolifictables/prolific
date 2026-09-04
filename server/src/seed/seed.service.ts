@@ -580,26 +580,63 @@ export class SeedService implements OnModuleInit {
     for (const plan of SEVEN_TABLE_PLAN) {
       const { name: tableName, capacity, zone } = plan;
 
+      // Derive the permanent, never-changing token for this physical table.
+      // The same (restaurant, branch, tableName) triple always yields the
+      // same 10-char token across seed runs, deployments, and reboots.
+      const permanentInput = `${restaurantId}:${branchId}:${tableName}`;
+      const permanentToken = this.generatePermanentQrToken(permanentInput);
+
       const existingTable = await this.tableModel
         .findOne({ branchId, name: tableName })
         .exec();
 
       if (existingTable) {
-        const existingQr = await this.qrCodeModel
+        let existingQr = await this.qrCodeModel
           .findOne({ tableId: existingTable._id.toString(), isDefault: true })
           .exec();
+
+        // Backfill: ensure the default QR uses the permanent token.
+        // Old deployments have randomly-generated tokens from generateRandomToken.
+        // We rewrite the token ONCE to pin it permanently, then re-use the same
+        // document on every subsequent seed run so QR sticker URLs stay stable.
+        if (existingQr && existingQr.token !== permanentToken) {
+          await this.qrCodeModel
+            .findByIdAndUpdate(existingQr._id, { $set: { token: permanentToken, isActive: true } })
+            .exec();
+          existingQr.token = permanentToken;
+          this.logger.log(
+            `  Branch "${branchId}": Table ${tableName} pinned permanent QR token ${permanentToken} (was ${existingQr.token})`
+          );
+        } else if (!existingQr) {
+          const created = await this.qrCodeModel.create({
+            restaurantId,
+            branchId,
+            tableId: existingTable._id.toString(),
+            token: permanentToken,
+            isActive: true,
+            isDefault: true,
+          });
+          existingQr = created;
+          await this.tableModel
+            .findByIdAndUpdate(existingTable._id, {
+              $set: { qrCodeId: created._id.toString() },
+            })
+            .exec();
+          this.logger.log(
+            `  Branch "${branchId}": Table ${tableName} created missing default QR token=${permanentToken}`
+          );
+        }
+
         tables.push(existingTable);
         if (existingQr) qrCodes.push(existingQr);
         continue;
       }
-
-      const qrToken = this.generateRandomToken(6);
       const tableIdStub = `pending-${branchId}-${tableName}`;
       const qr = await this.qrCodeModel.create({
         restaurantId,
         branchId,
         tableId: tableIdStub,
-        token: qrToken,
+        token: permanentToken,
         isActive: true,
         isDefault: true,
       });
@@ -857,6 +894,22 @@ export class SeedService implements OnModuleInit {
     let result = '';
     for (let i = 0; i < length; i++) {
       result += chars.charAt(bytes[i] % chars.length);
+    }
+    return result;
+  }
+
+  // Deterministic permanent QR token generator.
+  // Given a stable input (restaurantId:branchId:tableName) it always returns
+  // the same 10-character token using SHA-256 → base32-like alphabet.
+  // Unlike random tokens, this output never changes between seed runs or
+  // deploys, so printed QR stickers for a physical table stay valid forever.
+  private generatePermanentQrToken(seedInput: string): string {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I confusables
+    const digest = crypto.createHash('sha256').update(seedInput).digest();
+    const TOKEN_LEN = 10;
+    let result = '';
+    for (let i = 0; i < TOKEN_LEN; i++) {
+      result += chars.charAt(digest[i] % chars.length);
     }
     return result;
   }

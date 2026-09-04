@@ -253,6 +253,90 @@ safeHandle('window:pos-exit-fullscreen', () => {
   return true;
 });
 
+// Custom renderer-controlled window chrome.
+// Hiding the native frame lets us paint a branded, unified title bar
+// (Header.tsx) that carries the same Prolific neon-dark aesthetic across
+// Windows, macOS, and Linux. The Header renders these 4 controls:
+//   [＋ Add]  — POS-domain shortcut (triggers `pos:quick-new-cart` event)
+//   [－]     — minimize
+//   [☐/▣]    — toggle maximize (with live maximized-state label)
+//   [✕]      — close (macOS still keeps native traffic-light; this is
+//              the primary trigger on Windows/Linux, secondary on macOS).
+safeHandle('window:pos-minimize', () => {
+  if (posWin && !posWin.isDestroyed()) {
+    posWin.minimize();
+  }
+  return true;
+});
+
+safeHandle('window:pos-toggle-maximize', () => {
+  if (!posWin || posWin.isDestroyed()) {
+    return { maximized: false, isMaximizable: false };
+  }
+  const canMaximize = posWin.isMaximizable();
+  // Toggle. Unmaximize when already maximized; maximize otherwise.
+  if (posWin.isMaximized()) {
+    posWin.unmaximize();
+  } else if (canMaximize) {
+    posWin.maximize();
+  }
+  return {
+    maximized: posWin.isMaximized(),
+    isMaximizable: canMaximize,
+  };
+});
+
+safeHandle('window:pos-is-maximized', () => ({
+  maximized: posWin && !posWin.isDestroyed() ? posWin.isMaximized() : false,
+  isMaximizable: posWin && !posWin.isDestroyed() ? posWin.isMaximizable() : true,
+  platform: process.platform,
+}));
+
+safeHandle('window:pos-close', () => {
+  if (posWin && !posWin.isDestroyed()) {
+    posWin.close();
+  }
+  return true;
+});
+
+// Broadcasts POS window state changes to the renderer so the
+// custom chrome icons (☐/▣) stay in sync with native chrome actions
+// (dragging title bar off the top, Windows/Mac keyboard shortcuts, etc).
+function broadcastWindowState(): void {
+  if (!posWin || posWin.isDestroyed()) return;
+  const payload = {
+    maximized: posWin.isMaximized(),
+    minimizable: posWin.minimizable,
+    maximizable: posWin.isMaximizable(),
+    fullscreen: posWin.isFullScreen(),
+  };
+  try {
+    posWin.webContents.send('pos:window-state-changed', payload);
+  } catch { /* ignore during teardown */ }
+}
+// Register once after app.ready so posWin exists; guard against duplicates
+// since app.on('activate') may re-create posWin but our singleton pattern
+// in WindowManager will keep the function below idempotent.
+let windowStateListenersRegistered = false;
+function registerWindowStateBroadcast(): void {
+  if (windowStateListenersRegistered) return;
+  windowStateListenersRegistered = true;
+  const rebindWhenAvailable = () => {
+    if (!posWin || posWin.isDestroyed()) {
+      // Try again after app.ready if posWin was still null.
+      setTimeout(rebindWhenAvailable, 250);
+      return;
+    }
+    posWin.on('maximize', broadcastWindowState);
+    posWin.on('unmaximize', broadcastWindowState);
+    posWin.on('enter-full-screen', broadcastWindowState);
+    posWin.on('leave-full-screen', broadcastWindowState);
+    posWin.on('minimize', broadcastWindowState);
+    posWin.on('restore', broadcastWindowState);
+  };
+  rebindWhenAvailable();
+}
+
 safeHandle('device:get-device-id', () => {
   const { deviceId, deviceKey } = ensureDeviceId();
   return { deviceId, deviceKey };
@@ -1037,6 +1121,9 @@ function setupAutoUpdater(): void {
 app.on('ready', async () => {
   setupAutoUpdater();
   const { deviceId } = ensureDeviceId();
+  // Wire up maximize/minimize/restore broadcasts so the custom chrome
+  // icon stays in sync with OS-level window actions.
+  registerWindowStateBroadcast();
 
   const session = (await import('electron')).session.defaultSession;
   registerSecurityHandlers(app, session);

@@ -317,6 +317,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
     closeShift: (data: unknown) => ipcRenderer.invoke('shift:close', data),
     getOpenShift: () => ipcRenderer.invoke('shift:get-open'),
   },
+
+  // Custom renderer-controlled window chrome. Used by <Header/> to render
+  // branded min/max/close controls that match the POS neon-dark theme.
+  // The native frame is disabled in createCashierWindow (window-manager.ts).
+  window: {
+    minimize: () => ipcRenderer.invoke('window:pos-minimize'),
+    toggleMaximize: () =>
+      ipcRenderer.invoke('window:pos-toggle-maximize'),
+    isMaximized: () => ipcRenderer.invoke('window:pos-is-maximized'),
+    close: () => ipcRenderer.invoke('window:pos-close'),
+    subscribeState: (cb: (state: unknown) => void) => {
+      const listener = (_e: Electron.IpcRendererEvent, s: unknown) => cb(s);
+      ipcRenderer.on('pos:window-state-changed', listener);
+      return () => ipcRenderer.removeListener('pos:window-state-changed', listener);
+    },
+  },
 });
 
 export type ElectronAPI = typeof window.electronAPI;

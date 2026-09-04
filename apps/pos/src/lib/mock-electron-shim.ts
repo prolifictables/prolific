@@ -3462,6 +3462,82 @@ export function installMockElectronAPI() {
       listPrinters: async () => ({ printers: [] }),
       getQueueStatus: async () => ({ queued: 0, inProgress: 0, failed: 0 }),
     },
+
+    // Browser-mode polyfill for the custom window chrome.
+    // In Vite browser/dev mode there's no Electron frame, so we degrade
+    // gracefully: Close maps to window.close(), toggle Maximize maps to
+    // the browser Fullscreen API, Minimize is a no-op (browsers don't
+    // expose it). The UI still renders the 4 chrome buttons so the
+    // Header looks consistent when developing in-browser.
+    window: (() => {
+      const listeners = new Set<(state: unknown) => void>();
+      const isFullscreen = () =>
+        typeof document !== 'undefined' && !!document.fullscreenElement;
+      const notify = () => {
+        const state = {
+          maximized: isFullscreen(),
+          maximizable: true,
+          minimizable: true,
+          fullscreen: isFullscreen(),
+          platform: typeof navigator !== 'undefined'
+            ? (navigator as any).platform || navigator.userAgent
+            : 'browser',
+        };
+        listeners.forEach((l) => {
+          try { l(state); } catch { /* ignore */ }
+        });
+      };
+      if (typeof document !== 'undefined') {
+        document.addEventListener('fullscreenchange', notify, { passive: true });
+      }
+      return {
+        minimize: async () => {
+          // Browser JS cannot minimize; best-effort blur the tab so the
+          // user sees a confirmation of the click event.
+          try { window.blur?.(); } catch { /* noop */ }
+          return true;
+        },
+        toggleMaximize: async () => {
+          if (typeof document === 'undefined') {
+            return { maximized: false, isMaximizable: false };
+          }
+          try {
+            if (document.fullscreenElement) {
+              await document.exitFullscreen();
+            } else {
+              await document.documentElement.requestFullscreen();
+            }
+            return { maximized: isFullscreen(), isMaximizable: true };
+          } catch {
+            return { maximized: isFullscreen(), isMaximizable: false };
+          }
+        },
+        isMaximized: async () => ({
+          maximized: isFullscreen(),
+          isMaximizable: true,
+          platform: 'browser',
+        }),
+        close: async () => {
+          // window.close() is usually restricted to windows opened by JS.
+          try { window.close(); } catch { /* noop */ }
+          return true;
+        },
+        subscribeState: (cb: (state: unknown) => void) => {
+          listeners.add(cb);
+          // Deliver current state on-subscribe so icons initialize correctly.
+          try {
+            cb({
+              maximized: isFullscreen(),
+              maximizable: true,
+              minimizable: true,
+              fullscreen: isFullscreen(),
+              platform: 'browser',
+            });
+          } catch { /* noop */ }
+          return () => { listeners.delete(cb); };
+        },
+      };
+    })(),
   };
 
   window.electronAPI = api;

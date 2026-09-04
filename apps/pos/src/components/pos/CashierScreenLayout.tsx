@@ -2,6 +2,13 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+// Socket.IO realtime client: wired up so NEW external QR/website orders that
+// arrive at the server via HTTP POST -> socketGateway.broadcast(server:order:new)
+// are pushed to this POS instantly (no need to wait up to 30s for pull + 8s
+// for interval tick = 38s worst case before cashier sees QR order online).
+// Falls back gracefully when socket can't connect (offline, server asleep) —
+// the 8s interval + 30s pull worker continue to work as before.
+import { io, Socket } from 'socket.io-client';
 import { useAuthStore } from '../../lib/auth-store';
 import { useCartStore } from '../../lib/cart-store';
 import { APP_FOOTER_COPYRIGHT } from '../../lib/app-meta';
@@ -419,14 +426,41 @@ export default function CashierScreenLayout() {
       }
     })();
 
-    const t = setInterval(async () => {
+    // ---------------------------------------------------------------
+    // Reusable tick body: reads local SQLite for tables / orders /
+    // running-tabs, then updates React state + incoming rail. Runs
+    // on the 8-second interval, on startup (after init), and when
+    // Socket.IO pushes notify us of a new QR/website order so the
+    // cashier sees incoming orders instantly rather than waiting up
+    // to 30s (pull) + 8s (interval tick) = 38s worst case.
+    // ---------------------------------------------------------------
+    async function doTick() {
+      if (!alive) return;
       try {
+        // Refresh tables from local SQLite every tick so any Admin offline
+        // edits or PULL-worker-delivered new tables appear without a
+        // logout/login cycle. Never blocks; silent catch on failure.
+        try {
+          const tblRefresh: any =
+            (await window.electronAPI?.db?.tables?.list?.()) || [];
+          if (Array.isArray(tblRefresh) || (tblRefresh as any)?.data) {
+            const arr: any[] = Array.isArray(tblRefresh)
+              ? tblRefresh
+              : ((tblRefresh as any)?.data as any[]) || [];
+            if (alive) setTables(arr);
+          }
+        } catch {
+          /* ignore — tables loaded from init render are still valid */
+        }
+
         const counts: any = (await window.electronAPI?.db?.syncQueue?.getCounts?.()) || {};
-        setConnection((prev) => ({
-          ...prev,
-          pendingCount: counts?.pending ?? prev.pendingCount,
-          failedCount: counts?.failed ?? prev.failedCount,
-        }));
+        if (alive) {
+          setConnection((prev) => ({
+            ...prev,
+            pendingCount: counts?.pending ?? prev.pendingCount,
+            failedCount: counts?.failed ?? prev.failedCount,
+          }));
+        }
         const ord =
           (await window.electronAPI?.db?.orders?.listRecent?.(200)) ??
           (await window.electronAPI?.db?.orders?.list?.());
@@ -447,8 +481,10 @@ export default function CashierScreenLayout() {
             const isOwn = eidCamel2 ? String(o.employeeId || '') === eidCamel2 : true;
             return isExternal || isOwn;
           });
-          detectAndQueueExternalOrders(filteredCamel2);
-          setOrders(filteredCamel2);
+          if (alive) {
+            detectAndQueueExternalOrders(filteredCamel2);
+            setOrders(filteredCamel2);
+          }
         } else {
           const itemsByOrderId = new Map<string, any[]>();
           await Promise.all(
@@ -502,26 +538,120 @@ export default function CashierScreenLayout() {
             const isOwn = eid ? String(o.employeeId || '') === eid : true;
             return isExternal || isOwn;
           });
-          detectAndQueueExternalOrders(filtered);
-          setOrders(filtered);
+          if (alive) {
+            detectAndQueueExternalOrders(filtered);
+            setOrders(filtered);
+          }
         }
 
         // Also refresh open running tabs so floor-plan badges stay live
         try {
           const sessions =
             (await window.electronAPI?.db?.tableSessions?.listOpen?.()) ?? [];
-          if (Array.isArray(sessions)) setTableSessions(sessions);
+          if (Array.isArray(sessions) && alive) setTableSessions(sessions);
         } catch {
           /* ignore */
         }
       } catch {
         /* ignore */
       }
-    }, 8000);
+    }
+
+    // Debounce-coalesced handler for Socket.IO push events. Multiple rapid
+    // server:order:new broadcasts (e.g. 5 customers submitting at once)
+    // collapse into exactly ONE pull-request + ONE local SQLite tick,
+    // separated by enough delay for the pull worker to finish writing to
+    // SQLite before we re-read the local DB.
+    let pendingTickHandle: ReturnType<typeof setTimeout> | null = null;
+    function schedulePullAndTick(reason: string) {
+      if (!alive) return;
+      // Request on-demand cloud→local pull so Electron packaged POS grabs
+      // the freshly-written server order immediately instead of waiting up
+      // to 30s. Browser mock shim ignores this (no-op).
+      try { window.electronAPI?.sync?.requestNow?.(); } catch {}
+      if (pendingTickHandle) clearTimeout(pendingTickHandle);
+      pendingTickHandle = setTimeout(() => {
+        pendingTickHandle = null;
+        void doTick();
+      }, 1800);
+    }
+
+    const t = setInterval(() => { void doTick(); }, 8000);
+
+    // ---------------------------------------------------------------
+    // Socket.IO realtime client — optional, best-effort. If the server
+    // is reachable and authenticates, we get instant server:order:new
+    // pushes so QR/website orders pop up ~2s after submit instead of
+    // ~38s worst case. On any failure (network, JWT, cold-start, etc.)
+    // the socket falls back silently and the 8s tick + 30s pull worker
+    // continue to function exactly as before — no regressions.
+    // ---------------------------------------------------------------
+    let socket: Socket | null = null;
+    try {
+      const serverBase =
+        ((window as any).__APP_ENV__?.VITE_API_URL as string | undefined) ||
+        import.meta.env.VITE_API_URL as string | undefined ||
+        'http://localhost:4000';
+      const jwt = useAuthStore.getState().accessToken;
+      const branchId = branch?.id;
+      if (jwt && branchId) {
+        socket = io(serverBase, {
+          transports: ['websocket', 'polling'],
+          reconnectionDelay: 5000,
+          reconnectionDelayMax: 30000,
+          timeout: 15000,
+          auth: { token: `Bearer ${jwt}` },
+          query: { branchId: String(branchId) },
+        });
+
+        socket.on('connect', () => {
+          // Explicitly join the branch room on connect. Server-side
+          // socket.gateway.ts already extracts branchId from JWT claims,
+          // but sending a client:join event ensures we get the broadcasts
+          // even if JWT extraction is delayed.
+          try {
+            socket?.emit('client:join', {
+              rooms: [`branch:${branchId}`, 'role:CASHIER'],
+            });
+          } catch {}
+        });
+
+        socket.on('server:order:new', () => {
+          schedulePullAndTick('socket:server:order:new');
+        });
+        socket.on('server:order:status', () => {
+          schedulePullAndTick('socket:server:order:status');
+        });
+        socket.on('server:order:status:changed', () => {
+          schedulePullAndTick('socket:server:order:status:changed');
+        });
+        socket.on('server:kitchen:order:new', () => {
+          schedulePullAndTick('socket:server:kitchen:order:new');
+        });
+        socket.on('server:order:updated', () => {
+          schedulePullAndTick('socket:server:order:updated');
+        });
+        socket.on('connect_error', () => {
+          // Silent: no toast/logs. The interval-based fallback keeps working.
+        });
+        socket.on('disconnect', () => {
+          // Silent: next reconnect will try again.
+        });
+      }
+    } catch (e) {
+      // Socket is purely additive — never break the POS over a socket failure.
+      socket = null;
+    }
 
     return () => {
       alive = false;
       clearInterval(t);
+      if (pendingTickHandle) clearTimeout(pendingTickHandle);
+      pendingTickHandle = null;
+      if (socket) {
+        try { socket.disconnect(); } catch {}
+        socket = null;
+      }
       window.electronAPI?.sync?.unsubscribeStatus?.();
       // Reset notification-diffing refs on unmount. In development, React 18
       // StrictMode runs effect -> cleanup -> effect on every mount, simulating

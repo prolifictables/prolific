@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Controller,
   Get,
   Post,
@@ -61,6 +62,17 @@ export class PublicController {
   @Get('qr/:token')
   async resolveQr(@Param('token') token: string) {
     return this.publicService.resolveQr(token);
+  }
+
+  // New resolve endpoint: accepts ?table=TABLE_ID (for /order?table=X QR URL format).
+  // Validation flow is identical to resolveQr — server verifies TABLE_ID is an active
+  // QR token linked to a real table before returning anything.
+  @Get('table-resolve')
+  async resolveTableByIdentifier(@Query('table') tableIdentifier: string) {
+    if (!tableIdentifier) {
+      throw new BadRequestException('table identifier query param is required');
+    }
+    return this.publicService.resolveQr(tableIdentifier);
   }
 
   @Get('menu')

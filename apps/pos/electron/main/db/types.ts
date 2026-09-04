@@ -126,6 +126,12 @@ export interface TableRow {
   capacity: number | null;
   status: string | null;
   qr_code_id: string | null;
+  // Permanent, never-changing QR identifier on the Table entity itself.
+  // Server always validates this server-side (never trusts browser-supplied
+  // table number). Electron POS stores it here purely for future
+  // "print/regenerate QR from POS" scenarios; order→table lookups still
+  // use the stable table_id foreign key.
+  permanent_qr_id: string | null;
   created_at: number;
   updated_at: number;
 }

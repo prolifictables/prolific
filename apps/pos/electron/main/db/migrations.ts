@@ -262,6 +262,7 @@ export const migrations: Migration[] = [
           capacity INTEGER,
           status TEXT,
           qr_code_id TEXT,
+          permanent_qr_id TEXT,
           created_at INTEGER NOT NULL DEFAULT (unixepoch('now')*1000),
           updated_at INTEGER NOT NULL DEFAULT (unixepoch('now')*1000)
         );
@@ -912,6 +913,20 @@ export const migrations: Migration[] = [
       };
       addIfMissing('customer_phone', 'TEXT');
       addIfMissing('customer_email', 'TEXT');
+    },
+  },
+  {
+    version: 35,
+    up: (db: Database) => {
+      const existingCols = new Set(
+        db
+          .prepare("PRAGMA table_info(tables)")
+          .all()
+          .map((r: any) => String(r.name || ''))
+      );
+      if (!existingCols.has('permanent_qr_id')) {
+        db.exec('ALTER TABLE tables ADD COLUMN permanent_qr_id TEXT');
+      }
     },
   },
 ];

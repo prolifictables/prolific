@@ -30,6 +30,42 @@ function toEpochMillis(value: unknown): number | undefined {
   return undefined;
 }
 
+// Convert a SQLite table-sessions row (snake_case, cents) to the server Mongo
+// TableSession document payload (camelCase, same numeric units as client-side
+// numeric fields, matching the server applyTableSessionCommand $set passthrough).
+function buildTableSessionSyncPayload(sess: any): Record<string, unknown> {
+  const now = new Date();
+  const openedAt = typeof (sess as any).opened_at === 'number'
+    ? new Date((sess as any).opened_at)
+    : now;
+  const closedAt = typeof (sess as any).closed_at === 'number'
+    ? new Date((sess as any).closed_at)
+    : undefined;
+  const currentOrderId = (sess as any).current_order_id
+    ? String((sess as any).current_order_id)
+    : null;
+  return {
+    restaurantId: String((sess as any).restaurant_id ?? ''),
+    branchId: String((sess as any).branch_id ?? ''),
+    tableId: String((sess as any).table_id ?? ''),
+    qrCodeId: String((sess as any).table_id ?? ''),
+    status: String((sess as any).status ?? 'OPEN'),
+    openedAt,
+    openedBy: (sess as any).opened_by ? String((sess as any).opened_by) : undefined,
+    customerIds: [],
+    orderIds: currentOrderId ? [currentOrderId] : [],
+    totalAmount: Number((sess as any).total_cents ?? 0),
+    paidAmount: Number((sess as any).paid_amount_cents ?? 0),
+    balanceDue: Number((sess as any).balance_due_cents ?? 0),
+    closedAt,
+    closedBy: (sess as any).closed_by ? String((sess as any).closed_by) : undefined,
+    orderRefs: currentOrderId
+      ? [{ orderId: currentOrderId, addedAt: openedAt, addedBy: (sess as any).opened_by ? String((sess as any).opened_by) : undefined }]
+      : [],
+    splitGroups: [],
+  };
+}
+
 function wrap(channel: string, fn: HandlerFn) {
   return async (_e: Electron.IpcMainInvokeEvent, ...args: unknown[]) => {
     try {
@@ -1360,7 +1396,7 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
           ? p.restaurantId
           : getActiveRestaurantId(repos);
       const auth = repos.meta.getLastAuth();
-      return repos.tableSessionService.openOrGet({
+      const result = repos.tableSessionService.openOrGet({
         tableId: String(p.tableId ?? ''),
         tableName: typeof p.tableName === 'string' ? p.tableName : undefined,
         branchId,
@@ -1383,6 +1419,26 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
           typeof p.serverName === 'string' ? p.serverName : undefined,
         covers: typeof p.covers === 'number' ? p.covers : undefined,
       });
+      // Sync to server: push CREATE (new session) or UPDATE (re-opened existing)
+      // into sync_queue so reconnect sync picks it up. Non-blocking best-effort.
+      try {
+        const sess = result.session;
+        if (sess?.id) {
+          const op = result.wasCreated ? 'CREATE' : 'UPDATE';
+          repos.syncQueue.push({
+            op_id: `tablesess_${sess.id}_${Date.now()}`,
+            entity_type: 'TABLE_SESSION',
+            operation: op,
+            entity_id: String(sess.id),
+            payload: JSON.stringify(buildTableSessionSyncPayload(sess)),
+            idempotency_key: `tablesess_${sess.id}_${op}`,
+            local_entity_version: Number((sess as any).local_version ?? 1),
+          });
+        }
+      } catch (syncErr) {
+        console.warn('[IPC DB] openOrGet sync_queue push failed:', syncErr);
+      }
+      return result;
     })
   );
 
@@ -1431,7 +1487,7 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
       const p = (payload ?? {}) as Record<string, unknown>;
       const items = Array.isArray(p.items) ? p.items : [];
       const auth = repos.meta.getLastAuth();
-      return repos.tableSessionService.replaceAllItems({
+      const sessUpdated = repos.tableSessionService.replaceAllItems({
         sessionId: String(p.sessionId ?? ''),
         items: items.map((it: any) => ({
           id: String(it.id ?? it.lineId ?? ''),
@@ -1457,6 +1513,24 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
               undefined,
         taxRates: Array.isArray(p.taxRates) ? p.taxRates : [],
       });
+      // Push an UPDATE row to sync_queue so Admin sees running tab totals
+      // even when offline -> back online.
+      try {
+        if (sessUpdated?.id) {
+          repos.syncQueue.push({
+            op_id: `tablesess_${sessUpdated.id}_cart_${Date.now()}`,
+            entity_type: 'TABLE_SESSION',
+            operation: 'UPDATE',
+            entity_id: String(sessUpdated.id),
+            payload: JSON.stringify(buildTableSessionSyncPayload(sessUpdated)),
+            idempotency_key: `tablesess_${sessUpdated.id}_UPDATE`,
+            local_entity_version: Number((sessUpdated as any).local_version ?? 1),
+          });
+        }
+      } catch (syncErr) {
+        console.warn('[IPC DB] replaceCartItems sync_queue push failed:', syncErr);
+      }
+      return sessUpdated;
     })
   );
 
@@ -1500,6 +1574,24 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
           amount_after_cents: Number(sess.total_cents ?? 0),
           note: ledgerNote ?? null,
         });
+        // Sync status change (e.g. PAID/CLOSED) so Admin sees settlement
+        // on the floor plan revenue dashboard.
+        try {
+          const finalSess = repos.tableSessions.getById(sess.id);
+          if (finalSess?.id) {
+            repos.syncQueue.push({
+              op_id: `tablesess_${finalSess.id}_status_${Date.now()}`,
+              entity_type: 'TABLE_SESSION',
+              operation: 'UPDATE',
+              entity_id: String(finalSess.id),
+              payload: JSON.stringify(buildTableSessionSyncPayload(finalSess)),
+              idempotency_key: `tablesess_${finalSess.id}_status_${String(p.status ?? '')}`,
+              local_entity_version: Number((finalSess as any).local_version ?? 1),
+            });
+          }
+        } catch (syncErr) {
+          console.warn('[IPC DB] updateStatus sync_queue push failed:', syncErr);
+        }
       }
       return true;
     })

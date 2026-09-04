@@ -297,6 +297,20 @@ declare global {
         closeShift: (data: unknown) => Promise<unknown>;
         getOpenShift: () => Promise<unknown>;
       };
+      // Custom window chrome. Rendered in Header.tsx above the shift pill.
+      // Always present (Electron = real IPC; browser = polyfill that falls
+      // back to window.close / browser fullscreen APIs where possible).
+      window: {
+        minimize: () => Promise<unknown>;
+        toggleMaximize: () => Promise<{ maximized: boolean; isMaximizable: boolean }>;
+        isMaximized: () => Promise<{
+          maximized: boolean;
+          isMaximizable: boolean;
+          platform?: string;
+        }>;
+        close: () => Promise<unknown>;
+        subscribeState: (cb: (state: unknown) => void) => () => void;
+      };
     };
     customerWindowAPI: {
       getVersions: () => Promise<{
