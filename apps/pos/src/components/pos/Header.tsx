@@ -37,15 +37,15 @@ function ConnectionPill({ state }: { state: ConnectionPillState }) {
           : 'No successful sync yet'
       }
     >
-      <span className={`h-2.5 w-2.5 rounded-full ${v.dot}`} />
+      <span className={`h-2 w-2 rounded-full ${v.dot}`} />
       <span className="font-semibold">{v.label}</span>
       {state.pendingCount > 0 && (
-        <span className="rounded-full bg-white/10 px-2 py-0.5 text-xs font-bold tabular-nums">
+        <span className="rounded-full bg-white/10 px-1.5 py-px text-[10px] font-bold tabular-nums">
           {state.pendingCount}
         </span>
       )}
       {state.failedCount > 0 && (
-        <span className="rounded-full bg-rose-500/30 text-rose-200 px-2 py-0.5 text-xs font-bold tabular-nums">
+        <span className="rounded-full bg-rose-500/30 text-rose-200 px-1.5 py-px text-[10px] font-bold tabular-nums">
           {state.failedCount}✕
         </span>
       )}
@@ -57,17 +57,17 @@ function OpenShiftPill({ shift }: { shift: OpenShiftState }) {
   if (!shift.shiftId) {
     return (
       <div className="chip bg-rose-500/10 text-rose-300 ring-rose-500/20 ring-1 ring-inset">
-        <span className="h-2.5 w-2.5 rounded-full bg-rose-400" />
-        <span className="font-semibold">No Open Shift</span>
+        <span className="h-2 w-2 rounded-full bg-rose-400" />
+        <span className="font-semibold text-xs">No Shift</span>
       </div>
     );
   }
   return (
     <div className="chip-neon">
-      <span className="h-2.5 w-2.5 rounded-full bg-amber-400 animate-neon-pulse" />
-      <span className="font-semibold">Shift Open</span>
-      <span className="text-amber-300/80 text-xs">
-        {formatCentsToNgn(shift.openingCashCents || 0)} opening ·{' '}
+      <span className="h-2 w-2 rounded-full bg-amber-400 animate-neon-pulse" />
+      <span className="font-semibold text-xs">Shift</span>
+      <span className="text-amber-300/80 text-[10px] tabular-nums">
+        {formatCentsToNgn(shift.openingCashCents || 0)} ·{' '}
         {shift.openedAt ? formatTime(shift.openedAt) : '--:--'}
       </span>
     </div>
@@ -83,7 +83,7 @@ function LiveClock() {
   const hh = padZero(now.getHours());
   const mm = padZero(now.getMinutes());
   return (
-    <div className="font-mono text-2xl font-bold tabular-nums text-white tracking-wider">
+    <div className="font-mono text-lg font-bold tabular-nums text-white tracking-wider">
       {hh}
       <span className="text-slate-500 animate-pulse-soft">:</span>
       {mm}
@@ -142,18 +142,18 @@ function NewCartAddButton(): JSX.Element {
             : `New cart — has ${lineCount} item${lineCount === 1 ? '' : 's'} in the current cart`
       }
       className={[
-        'inline-flex items-center gap-2 h-9 px-3 rounded-xl font-black text-[11px] uppercase tracking-[0.16em] transition-all',
-        'ring-1 ring-inset shadow-[0_0_24px_-10px_rgba(251,191,36,0.7)]',
+        'inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg font-black text-[10px] uppercase tracking-[0.14em] transition-all',
+        'ring-1 ring-inset shadow-[0_0_20px_-10px_rgba(251,191,36,0.65)]',
         armed && lineCount > 0
           ? 'bg-gradient-radial from-rose-500/40 via-orange-500/30 to-amber-500/40 text-white ring-rose-400/50 animate-shake-soft'
           : lineCount === 0
             ? 'bg-white/5 text-slate-400 ring-white/10 hover:text-white hover:ring-white/20'
-            : 'bg-gradient-radial from-amber-500/30 via-yellow-500/20 to-transparent text-amber-100 ring-amber-400/40 hover:text-white hover:ring-amber-300/60 hover:shadow-[0_0_32px_-6px_rgba(251,191,36,0.85)] active:scale-95',
+            : 'bg-gradient-radial from-amber-500/30 via-yellow-500/20 to-transparent text-amber-100 ring-amber-400/40 hover:text-white hover:ring-amber-300/60 hover:shadow-[0_0_28px_-8px_rgba(251,191,36,0.8)] active:scale-95',
       ].join(' ')}
     >
-      <span className="text-[15px] leading-none">{armed ? '✖' : '＋'}</span>
+      <span className="text-[13px] leading-none">{armed ? '✖' : '＋'}</span>
       <span className="hidden sm:inline">
-        {armed ? (lineCount === 0 ? 'Empty' : 'Confirm') : 'Add'}
+        {armed ? (lineCount === 0 ? 'Empty' : 'Confirm') : 'New'}
       </span>
     </button>
   );
@@ -223,16 +223,13 @@ function WindowChromeControls(): JSX.Element {
   return (
     <div
       className={`flex shrink-0 items-center gap-1 ${trafficLightPad}`}
-      // Mark the entire group as non-stealing for the OS drag-region
-      // in frameless windows (via -webkit-app-region:drag on the header row
-      // itself; we mark the controls as no-drag so clicks land cleanly).
       style={dragRegion('no-drag')}
     >
       <button
         onClick={() => api?.minimize?.().catch(() => {})}
         disabled={disabled}
         className={[
-          'group relative h-9 w-9 inline-flex items-center justify-center rounded-lg',
+          'group relative h-7 w-7 inline-flex items-center justify-center rounded-md',
           'ring-1 ring-inset ring-white/10 bg-white/5 text-slate-300 transition-colors',
           'disabled:opacity-40 disabled:cursor-not-allowed',
           hoverBg(false),
@@ -240,7 +237,7 @@ function WindowChromeControls(): JSX.Element {
         title="Minimize"
         aria-label="Minimize window"
       >
-        <svg viewBox="0 0 12 12" className="h-3.5 w-3.5" aria-hidden>
+        <svg viewBox="0 0 12 12" className="h-3 w-3" aria-hidden>
           <rect x="1.5" y="5.5" width="9" height="1.5" rx="0.75" fill="currentColor" />
         </svg>
       </button>
@@ -257,7 +254,7 @@ function WindowChromeControls(): JSX.Element {
         }}
         disabled={disabled}
         className={[
-          'group relative h-9 w-9 inline-flex items-center justify-center rounded-lg',
+          'group relative h-7 w-7 inline-flex items-center justify-center rounded-md',
           'ring-1 ring-inset ring-white/10 bg-white/5 text-slate-300 transition-colors',
           'disabled:opacity-40 disabled:cursor-not-allowed',
           hoverBg(false),
@@ -266,7 +263,7 @@ function WindowChromeControls(): JSX.Element {
         aria-label={maximized ? 'Restore window' : 'Maximize window'}
       >
         {maximized ? (
-          <svg viewBox="0 0 12 12" className="h-3.5 w-3.5" aria-hidden>
+          <svg viewBox="0 0 12 12" className="h-3 w-3" aria-hidden>
             <path
               d="M3 2.5h5.25a.75.75 0 0 1 .75.75V8.5a.25.25 0 0 1-.25.25H8.5V5a.5.5 0 0 0-.5-.5H4.75V3.25A.75.75 0 0 1 5.5 2.5H3zM2 4.75c0-.69.56-1.25 1.25-1.25H3v4.5c0 .69.56 1.25 1.25 1.25h4.5v.25c0 .69-.56 1.25-1.25 1.25h-4.5A1.25 1.25 0 0 1 2 9.25v-4.5z"
               fill="currentColor"
@@ -274,7 +271,7 @@ function WindowChromeControls(): JSX.Element {
             />
           </svg>
         ) : (
-          <svg viewBox="0 0 12 12" className="h-3.5 w-3.5" aria-hidden>
+          <svg viewBox="0 0 12 12" className="h-3 w-3" aria-hidden>
             <rect
               x="1.75"
               y="1.75"
@@ -293,7 +290,7 @@ function WindowChromeControls(): JSX.Element {
         onClick={() => api?.close?.().catch(() => {})}
         disabled={disabled}
         className={[
-          'group relative h-9 w-9 inline-flex items-center justify-center rounded-lg',
+          'group relative h-7 w-7 inline-flex items-center justify-center rounded-md',
           'ring-1 ring-inset ring-white/10 bg-white/5 text-slate-300 transition-colors',
           'disabled:opacity-40 disabled:cursor-not-allowed',
           hoverBg(true),
@@ -301,7 +298,7 @@ function WindowChromeControls(): JSX.Element {
         title="Close"
         aria-label="Close window"
       >
-        <svg viewBox="0 0 12 12" className="h-3.5 w-3.5" aria-hidden>
+        <svg viewBox="0 0 12 12" className="h-3 w-3" aria-hidden>
           <path
             d="M2.28 2.28a.75.75 0 0 1 1.06 0L6 4.94l2.66-2.66a.75.75 0 1 1 1.06 1.06L7.06 6l2.66 2.66a.75.75 0 1 1-1.06 1.06L6 7.06l-2.66 2.66a.75.75 0 0 1-1.06-1.06L4.94 6 2.28 3.34a.75.75 0 0 1 0-1.06z"
             fill="currentColor"
@@ -414,30 +411,27 @@ export default function Header({
 
   return (
     <header
-      className="h-20 shrink-0 border-b border-white/5 bg-slate-900/60 backdrop-blur sticky top-0 z-30"
-      // Make the header an OS-level drag region for frameless windows.
-      // Child interactive controls opt-out with dragRegion('no-drag').
+      className="h-14 shrink-0 border-b border-white/5 bg-slate-900/60 backdrop-blur sticky top-0 z-30"
       style={dragRegion('drag')}
     >
-      <div className="h-full px-6 flex items-center justify-between gap-6">
-        <div className="flex items-center gap-4 min-w-0">
-          <div className="flex items-center gap-3 px-4 py-2 rounded-2xl glass-neon">
-            <div className="h-10 w-10 rounded-xl bg-gradient-neon flex items-center justify-center shadow-glow-restaurant animate-neon-pulse">
-              <span className="text-black text-xl font-black">P</span>
+      <div className="h-full px-3 flex items-center justify-between gap-3">
+        {/* Left column: brand + sync status, tightly packed so small
+            resolutions still keep everything on a single row. */}
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-2 px-2.5 py-1 rounded-xl glass-neon">
+            <div className="h-7 w-7 rounded-lg bg-gradient-neon flex items-center justify-center shadow-glow-restaurant animate-neon-pulse">
+              <span className="text-black text-sm font-black leading-none">P</span>
             </div>
-            <div className="leading-tight min-w-0">
-              <div className="text-white font-bold tracking-tight text-sm">
+            <div className="leading-tight min-w-0 max-w-[160px] lg:max-w-[240px]">
+              <div className="text-white font-bold tracking-tight text-[12px] truncate">
                 {restaurant?.name || 'Prolific POS'}
               </div>
-              <div className="text-xs text-amber-300/80 truncate">
+              <div className="text-[10px] text-amber-300/80 truncate">
                 {branch?.name || 'Main Branch'} · Cashier
               </div>
             </div>
           </div>
           <ConnectionPill state={connectionState} />
-        </div>
-
-        <div className="flex items-center gap-3">
           <button
             onClick={openShift.shiftId ? onRequestCloseShift : onRequestOpenShift}
             className="transition-transform active:scale-[0.98]"
@@ -447,49 +441,50 @@ export default function Header({
           </button>
         </div>
 
-        <div className="flex items-center gap-4 min-w-0">
-          <div className="hidden md:flex items-center gap-2">
-            <LiveClock />
-            <span className="text-slate-500 text-xl" title="Weather placeholder">
-              🌤️
-            </span>
-          </div>
+        {/* Centre column: clock — compact and out of the way */}
+        <div className="hidden md:flex items-center gap-2">
+          <LiveClock />
+        </div>
 
+        {/* Right column: employee + actions + window chrome. Left-to-right
+            priority so on narrow widths the most important items (logout,
+            New cart, close) are the last to clip. */}
+        <div className="flex items-center gap-2 min-w-0">
           <div
-            className="flex items-center gap-3 pl-4 border-l border-white/5 min-w-0"
+            className="flex items-center gap-2 pl-2 border-l border-white/5 min-w-0"
             style={dragRegion('no-drag')}
           >
-            <div className="h-11 w-11 rounded-full bg-gradient-neon flex items-center justify-center text-black font-bold shrink-0 ring-2 ring-amber-400/30 shadow-glow-restaurant">
+            <div className="h-8 w-8 rounded-full bg-gradient-neon flex items-center justify-center text-black text-xs font-bold shrink-0 ring-1 ring-amber-400/30 shadow-glow-restaurant">
               {(employee?.firstName || employee?.name || 'U').charAt(0).toUpperCase()}
             </div>
-            <div className="leading-tight min-w-0 hidden sm:block">
-              <div className="text-white font-semibold truncate">
+            <div className="leading-tight min-w-0 hidden lg:block max-w-[170px]">
+              <div className="text-white font-semibold text-[12px] truncate">
                 {employee?.firstName
                   ? `${employee.firstName} ${employee.lastName || ''}`.trim()
                   : employee?.name || 'Unnamed Cashier'}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5">
                 <span
-                  className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${
+                  className={`text-[9px] font-bold uppercase tracking-wider px-1 py-px rounded ${
                     loginMode === 'OFFLINE_PIN'
                       ? 'bg-amber-500/20 text-amber-200 ring-1 ring-inset ring-amber-400/25'
                       : 'bg-emerald-500/20 text-emerald-200 ring-1 ring-inset ring-emerald-400/25'
                   }`}
                 >
-                  {loginMode === 'OFFLINE_PIN' ? 'Offline Login' : 'Online'}
+                  {loginMode === 'OFFLINE_PIN' ? 'Offline' : 'Online'}
                 </span>
-                <span className="text-xs text-slate-400 truncate">{roleName}</span>
+                <span className="text-[10px] text-slate-400 truncate">{roleName}</span>
               </div>
             </div>
           </div>
 
           <div
-            className="flex items-center gap-2"
+            className="flex items-center gap-1.5"
             style={dragRegion('no-drag')}
           >
             <button
               onClick={toggleFullscreen}
-              className="btn-ghost !px-3 !min-h-11"
+              className="btn-ghost !px-2 !min-h-8 !text-[11px]"
               title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
             >
               {isFullscreen ? '🗗' : '⛶'}
@@ -503,24 +498,19 @@ export default function Header({
                 setNewPin('');
                 setConfirmPin('');
               }}
-              className="btn-ghost !min-h-11 !px-4"
+              className="btn-ghost !min-h-8 !px-2.5 !text-[11px]"
               title="Change PIN"
             >
-              Change PIN
+              PIN
             </button>
 
-            <button onClick={handleLogout} className="btn-secondary !min-h-11 !px-4">
+            <button onClick={handleLogout} className="btn-secondary !min-h-8 !px-3 !text-[11px]">
               <span>Logout</span>
             </button>
           </div>
 
-          {/* --- Custom window chrome: [＋ Add] [－] [☐/▣] [✕] -----------
-                Rendered as the rightmost strip so it mirrors where the native
-                title bar would have them. Controls + Add button are fully
-                keyboard accessible (aria-label, disabled state) and visually
-                match the Prolific neon-dark aesthetic. */}
           <div
-            className="flex items-center gap-2 border-l border-white/5 pl-4"
+            className="flex items-center gap-1.5 border-l border-white/5 pl-2"
             style={dragRegion('no-drag')}
           >
             <NewCartAddButton />

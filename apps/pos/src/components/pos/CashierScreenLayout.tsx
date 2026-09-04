@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 // Socket.IO realtime client: wired up so NEW external QR/website orders that
 // arrive at the server via HTTP POST -> socketGateway.broadcast(server:order:new)
@@ -57,13 +57,22 @@ const ALL_SIDEBAR_TABS_META = [...SIDEBAR_TABS_BASE, SIDEBAR_TABS_MANAGER];
 
 const ORDER_STATUS_STYLES: Record<string, { bg: string; text: string; dot: string; label: string }> = {
   NEW: { bg: 'bg-[linear-gradient(120deg,rgba(34,211,238,0.20),rgba(251,191,36,0.14))]', text: 'text-cyan-200', dot: 'status-dot-new', label: 'New' },
+  RECEIVED: { bg: 'bg-[linear-gradient(120deg,rgba(34,211,238,0.20),rgba(251,191,36,0.14))]', text: 'text-cyan-200', dot: 'status-dot-new', label: 'New' },
+  PENDING: { bg: 'bg-[linear-gradient(120deg,rgba(34,211,238,0.20),rgba(251,191,36,0.14))]', text: 'text-cyan-200', dot: 'status-dot-new', label: 'Pending' },
+  ACCEPTED: { bg: 'bg-[linear-gradient(120deg,rgba(56,189,248,0.20),rgba(59,130,246,0.14))]', text: 'text-sky-200', dot: 'status-dot-delivered', label: 'Accepted' },
   PREPARING: { bg: 'bg-[linear-gradient(120deg,rgba(251,191,36,0.20),rgba(234,88,12,0.14))]', text: 'text-amber-200', dot: 'status-dot-preparing', label: 'Preparing' },
   READY: { bg: 'bg-[linear-gradient(120deg,rgba(167,139,250,0.20),rgba(212,175,55,0.14))]', text: 'text-violet-200', dot: 'status-dot-ready', label: 'Ready' },
+  SERVED: { bg: 'bg-[linear-gradient(120deg,rgba(16,185,129,0.20),rgba(212,175,55,0.14))]', text: 'text-emerald-200', dot: 'status-dot-delivered', label: 'Served' },
   DELIVERED: { bg: 'bg-[linear-gradient(120deg,rgba(16,185,129,0.20),rgba(212,175,55,0.14))]', text: 'text-emerald-200', dot: 'status-dot-delivered', label: 'Delivered' },
-  CLOSED: { bg: 'bg-slate-700/30', text: 'text-slate-300', dot: 'status-dot-closed', label: 'Closed' },
+  AWAITING_PAYMENT: { bg: 'bg-[linear-gradient(120deg,rgba(251,191,36,0.20),rgba(250,204,21,0.12))]', text: 'text-amber-200', dot: 'status-dot-hold', label: 'Awaiting Pay' },
+  PARTIALLY_PAID: { bg: 'bg-[linear-gradient(120deg,rgba(251,191,36,0.20),rgba(234,88,12,0.16))]', text: 'text-amber-200', dot: 'status-dot-hold', label: 'Partial' },
+  PAID: { bg: 'bg-emerald-500/15', text: 'text-emerald-200', dot: 'bg-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.7)] rounded-full h-2.5 w-2.5 inline-block', label: 'Paid' },
   COMPLETED: { bg: 'bg-slate-700/30', text: 'text-slate-300', dot: 'status-dot-closed', label: 'Completed' },
+  CLOSED: { bg: 'bg-slate-700/30', text: 'text-slate-300', dot: 'status-dot-closed', label: 'Closed' },
   ON_HOLD: { bg: 'bg-[linear-gradient(120deg,rgba(205,127,50,0.22),rgba(234,88,12,0.16))]', text: 'text-amber-200', dot: 'status-dot-hold', label: 'On Hold' },
   CANCELLED: { bg: 'bg-rose-500/15', text: 'text-rose-200', dot: 'bg-rose-400 shadow-[0_0_10px_rgba(251,113,133,0.7)] rounded-full h-2.5 w-2.5 inline-block', label: 'Cancelled' },
+  REFUNDED: { bg: 'bg-rose-500/15', text: 'text-rose-200', dot: 'bg-rose-400 shadow-[0_0_10px_rgba(251,113,133,0.7)] rounded-full h-2.5 w-2.5 inline-block', label: 'Refunded' },
+  VOIDED: { bg: 'bg-slate-600/25', text: 'text-slate-300', dot: 'bg-slate-400 rounded-full h-2.5 w-2.5 inline-block', label: 'Voided' },
 };
 
 const TABLE_STATUS_TINTS: Record<string, { ring: string; bg: string; label: string; dot: string; text: string }> = {
@@ -162,6 +171,104 @@ export default function CashierScreenLayout() {
   const notifSoundOnRef = useRef<boolean>(true);
   // Keep the ref mirror 1:1 with state every render (cheap assignment).
   notifSoundOnRef.current = notifSoundOn;
+
+  // -------------------------------------------------------------------------
+  // Shared order hydration helper.
+  //
+  // Used in THREE places where the POS re-reads local order rows:
+  //   (1) on-mount initial load,
+  //   (2) the recurring 8-second tick, and
+  //   (3) Socket.IO push -> on-demand pull+tick.
+  //
+  // Keeping a SINGLE source of truth for row-shaping means the HISTORY tab
+  // always shows the exact same fields regardless of which code-path last
+  // wrote `orders` to state. Sales-history visibility rule:
+  //   * NO per-employee filtering. A cashier needs to see every order
+  //     written for this branch (theirs + co-workers' + external QR/web
+  //     orders). Historically the filter dropped rows where
+  //     `employeeId !== currentEmployeeId`, which was the root cause of
+  //     "sales history not showing" when logging in as a different user.
+  //   * Tables JOINed in-memory are sourced from the freshly-read tables
+  //     array passed as an argument (NOT the stale `tables` React state
+  //     captured in an old effect closure), so table name badges resolve
+  //     correctly even on the very first render.
+  //   * Electron SQLite rows (snake_case) AND browser mock-shim rows
+  //     (camelCase) are both accepted.
+  // -------------------------------------------------------------------------
+  const hydrateOrders = useCallback(
+    async (raw: any[], tablesLoaded: any[]): Promise<any[]> => {
+      if (!Array.isArray(raw) || raw.length === 0) return [];
+      const isSnake =
+        Object.prototype.hasOwnProperty.call(raw[0], 'order_number') ||
+        Object.prototype.hasOwnProperty.call(raw[0], 'total_cents');
+
+      // ------- Camel path: browser mock shim already returns hydrated rows
+      if (!isSnake) {
+        return raw.map((o: any) => {
+          if (!o.sourceChannel && o.source) o.sourceChannel = o.source;
+          return o;
+        });
+      }
+
+      // ------- Snake path: Electron SQLite rows -> hydrate items + tables
+      const itemsByOrderId = new Map<string, any[]>();
+      for (const r of raw) itemsByOrderId.set(String(r.id), []);
+
+      const itemLoads: Promise<void>[] = raw.map(async (r: any) => {
+        const id = String(r.id);
+        try {
+          const items: any =
+            (await window.electronAPI?.db?.orderItems?.listForOrderId?.(id)) ||
+            [];
+          itemsByOrderId.set(id, Array.isArray(items) ? items : []);
+        } catch {
+          itemsByOrderId.set(id, []);
+        }
+      });
+      await Promise.all(itemLoads);
+
+      const tableById = new Map<string, any>();
+      for (const t of tablesLoaded) tableById.set(String(t.id), t);
+
+      return raw.map((r: any) => {
+        const tbl = r.table_id ? tableById.get(String(r.table_id)) : null;
+        const items = itemsByOrderId.get(String(r.id)) || [];
+        return {
+          id: String(r.id),
+          orderNumber: String(r.order_number || ''),
+          orderType: r.order_type || undefined,
+          sourceChannel: r.source || 'POS',
+          tableId: r.table_id || undefined,
+          tableName: tbl?.name || r.table_name || undefined,
+          employeeId: r.employee_id || undefined,
+          customerName: r.customer_name || undefined,
+          customerPhone: r.customer_phone || undefined,
+          customerEmail: r.customer_email || undefined,
+          status: r.status || 'NEW',
+          paymentStatus: r.payment_status || 'UNPAID',
+          paymentMethod: r.payment_method || undefined,
+          totalAmount: typeof r.total_cents === 'number' ? r.total_cents / 100 : 0,
+          paidAmount: typeof r.paid_amount_cents === 'number' ? r.paid_amount_cents / 100 : 0,
+          balanceDue: typeof r.balance_due_cents === 'number' ? r.balance_due_cents / 100 : 0,
+          notes: r.note || undefined,
+          createdAt: typeof r.created_at === 'number' ? r.created_at : Date.now(),
+          updatedAt: typeof r.updated_at === 'number' ? r.updated_at : Date.now(),
+          items: items.map((it: any) => ({
+            menuItemId: it.menu_item_id,
+            name: it.name_snapshot,
+            unitPrice:
+              typeof it.price_snapshot_cents === 'number'
+                ? it.price_snapshot_cents / 100
+                : 0,
+            quantity: it.quantity,
+            selectedModifiers: [],
+            notes: it.special_instructions || undefined,
+          })),
+        };
+      });
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!accessToken || !branch?.id) return;
@@ -317,100 +424,25 @@ export default function CashierScreenLayout() {
         }
 
         // Load panels data (tables + orders) independently of shift.
+        let freshTables: any[] = [];
         try {
           const tbl: any = (await window.electronAPI?.db?.tables?.list?.()) || [];
-          if (alive) setTables(Array.isArray(tbl) ? tbl : (tbl?.data as any[]) || []);
+          freshTables = Array.isArray(tbl) ? tbl : ((tbl as any)?.data as any[]) || [];
+          if (alive) setTables(freshTables);
         } catch { /* ignore */ }
         try {
           const ord =
             (await window.electronAPI?.db?.orders?.listRecent?.(200)) ??
             (await window.electronAPI?.db?.orders?.list?.());
           const list = Array.isArray(ord) ? ord : ((ord as any)?.data as any[]) || [];
-          const isRowShape =
-            list.length > 0 &&
-            (Object.prototype.hasOwnProperty.call(list[0] as any, 'order_number') ||
-              Object.prototype.hasOwnProperty.call(list[0] as any, 'total_cents'));
-          if (!isRowShape) {
-            // Browser mock-shim returns pure camelCase already: no conversion
-            // needed. But we MUST still apply the same visibility + diffing
-            // pipeline as the snake→camel path: employee filter (show external
-            // OR own orders) and detectAndQueueExternalOrders for the rail.
-            // Otherwise the notification rail stays empty in browser demo.
-            const eidCamel = employee?.id ? String(employee.id) : '';
-            const filteredCamel = list.filter((o: any) => {
-              const src = String(o.source || o.sourceChannel || 'POS').toUpperCase();
-              const isExternal = src !== 'POS';
-              // Normalize the source key to sourceChannel so downstream code
-              // (rail cards, HistoryPanel chips) sees a consistent shape.
-              if (!o.sourceChannel && o.source) o.sourceChannel = o.source;
-              const isOwn = eidCamel ? String(o.employeeId || '') === eidCamel : true;
-              return isExternal || isOwn;
-            });
-            if (alive) {
-              detectAndQueueExternalOrders(filteredCamel);
-              setOrders(filteredCamel);
-            }
-          } else {
-            const itemsByOrderId = new Map<string, any[]>();
-            await Promise.all(
-              list.map(async (r: any) => {
-                const items: any =
-                  (await window.electronAPI?.db?.orderItems?.listForOrderId?.(String(r.id))) ||
-                  [];
-                itemsByOrderId.set(String(r.id), Array.isArray(items) ? items : []);
-              })
-            );
-            const tableById = new Map<string, any>();
-            for (const t of tables) tableById.set(String(t.id), t);
-            const hydrated = list.map((r: any) => {
-              const tbl = r.table_id ? tableById.get(String(r.table_id)) : null;
-              const items = itemsByOrderId.get(String(r.id)) || [];
-              return {
-                id: String(r.id),
-                orderNumber: String(r.order_number || ''),
-                orderType: r.order_type || undefined,
-                sourceChannel: r.source || 'POS',
-                tableId: r.table_id || undefined,
-                tableName: tbl?.name || r.table_name || undefined,
-                employeeId: r.employee_id || undefined,
-                customerName: r.customer_name || undefined,
-                customerPhone: r.customer_phone || undefined,
-                customerEmail: r.customer_email || undefined,
-                status: r.status || 'NEW',
-                paymentStatus: r.payment_status || 'UNPAID',
-                paymentMethod: r.payment_method || undefined,
-                totalAmount: typeof r.total_cents === 'number' ? r.total_cents / 100 : 0,
-                paidAmount: typeof r.paid_amount_cents === 'number' ? r.paid_amount_cents / 100 : 0,
-                balanceDue: typeof r.balance_due_cents === 'number' ? r.balance_due_cents / 100 : 0,
-                notes: r.note || undefined,
-                createdAt: typeof r.created_at === 'number' ? r.created_at : Date.now(),
-                updatedAt: typeof r.updated_at === 'number' ? r.updated_at : Date.now(),
-                items: items.map((it: any) => ({
-                  menuItemId: it.menu_item_id,
-                  name: it.name_snapshot,
-                  unitPrice:
-                    typeof it.price_snapshot_cents === 'number' ? it.price_snapshot_cents / 100 : 0,
-                  quantity: it.quantity,
-                  selectedModifiers: [],
-                  notes: it.special_instructions || undefined,
-                })),
-              };
-            });
-            const eid = employee?.id ? String(employee.id) : '';
-            // Show this employee's own POS orders, PLUS ANY external-order from
-            // web/QR/phone/app regardless of which employee (or null) attached.
-            // External orders come through with sourceChannel !== POS and must
-            // be visible to ALL logged-in POS attendants, not hidden behind
-            // the employee-scoped filter.
-            const filtered = hydrated.filter((o: any) => {
-              const isExternal = String(o.sourceChannel || 'POS').toUpperCase() !== 'POS';
-              const isOwn = eid ? String(o.employeeId || '') === eid : true;
-              return isExternal || isOwn;
-            });
-            if (alive) {
-              detectAndQueueExternalOrders(filtered);
-              setOrders(filtered);
-            }
+          // Use the shared hydration helper so history shows ALL branch
+          // orders regardless of employeeId, uses the tables array just
+          // read above for name joins (never stale state closure), and
+          // consistently hydrates items.
+          const hydrated = await hydrateOrders(list, freshTables);
+          if (alive) {
+            detectAndQueueExternalOrders(hydrated);
+            setOrders(hydrated);
           }
         } catch { /* ignore */ }
 
@@ -437,20 +469,19 @@ export default function CashierScreenLayout() {
     async function doTick() {
       if (!alive) return;
       try {
-        // Refresh tables from local SQLite every tick so any Admin offline
-        // edits or PULL-worker-delivered new tables appear without a
-        // logout/login cycle. Never blocks; silent catch on failure.
+        // Read FRESH tables this tick, then pass into hydrateOrders so
+        // table-name badges resolve correctly (never built from stale
+        // `tables` state captured at effect mount).
+        let tickTables: any[] = [];
         try {
           const tblRefresh: any =
             (await window.electronAPI?.db?.tables?.list?.()) || [];
-          if (Array.isArray(tblRefresh) || (tblRefresh as any)?.data) {
-            const arr: any[] = Array.isArray(tblRefresh)
-              ? tblRefresh
-              : ((tblRefresh as any)?.data as any[]) || [];
-            if (alive) setTables(arr);
-          }
+          tickTables = Array.isArray(tblRefresh)
+            ? tblRefresh
+            : ((tblRefresh as any)?.data as any[]) || [];
+          if (alive) setTables(tickTables);
         } catch {
-          /* ignore — tables loaded from init render are still valid */
+          /* ignore — fall back to tables from init */
         }
 
         const counts: any = (await window.electronAPI?.db?.syncQueue?.getCounts?.()) || {};
@@ -465,83 +496,10 @@ export default function CashierScreenLayout() {
           (await window.electronAPI?.db?.orders?.listRecent?.(200)) ??
           (await window.electronAPI?.db?.orders?.list?.());
         const list = Array.isArray(ord) ? ord : ((ord as any)?.data as any[]) || [];
-        const isRowShape =
-          list.length > 0 &&
-          (Object.prototype.hasOwnProperty.call(list[0] as any, 'order_number') ||
-            Object.prototype.hasOwnProperty.call(list[0] as any, 'total_cents'));
-        if (!isRowShape) {
-          // Mirror of the init camelCase branch. Apply the same employee
-          // filter + detect diffing so 8-second interval ticks continue to
-          // surface new external orders in browser mock mode.
-          const eidCamel2 = employee?.id ? String(employee.id) : '';
-          const filteredCamel2 = list.filter((o: any) => {
-            const src = String(o.source || o.sourceChannel || 'POS').toUpperCase();
-            const isExternal = src !== 'POS';
-            if (!o.sourceChannel && o.source) o.sourceChannel = o.source;
-            const isOwn = eidCamel2 ? String(o.employeeId || '') === eidCamel2 : true;
-            return isExternal || isOwn;
-          });
-          if (alive) {
-            detectAndQueueExternalOrders(filteredCamel2);
-            setOrders(filteredCamel2);
-          }
-        } else {
-          const itemsByOrderId = new Map<string, any[]>();
-          await Promise.all(
-            list.map(async (r: any) => {
-              const items: any =
-                (await window.electronAPI?.db?.orderItems?.listForOrderId?.(String(r.id))) || [];
-              itemsByOrderId.set(String(r.id), Array.isArray(items) ? items : []);
-            })
-          );
-          const tableById = new Map<string, any>();
-          for (const t of tables) tableById.set(String(t.id), t);
-          const hydrated = list.map((r: any) => {
-            const tbl = r.table_id ? tableById.get(String(r.table_id)) : null;
-            const items = itemsByOrderId.get(String(r.id)) || [];
-            return {
-              id: String(r.id),
-              orderNumber: String(r.order_number || ''),
-              orderType: r.order_type || undefined,
-              sourceChannel: r.source || 'POS',
-              tableId: r.table_id || undefined,
-              tableName: tbl?.name || r.table_name || undefined,
-              employeeId: r.employee_id || undefined,
-              customerName: r.customer_name || undefined,
-              customerPhone: r.customer_phone || undefined,
-              customerEmail: r.customer_email || undefined,
-              status: r.status || 'NEW',
-              paymentStatus: r.payment_status || 'UNPAID',
-              paymentMethod: r.payment_method || undefined,
-              totalAmount: typeof r.total_cents === 'number' ? r.total_cents / 100 : 0,
-              paidAmount: typeof r.paid_amount_cents === 'number' ? r.paid_amount_cents / 100 : 0,
-              balanceDue: typeof r.balance_due_cents === 'number' ? r.balance_due_cents / 100 : 0,
-              notes: r.note || undefined,
-              createdAt: typeof r.created_at === 'number' ? r.created_at : Date.now(),
-              updatedAt: typeof r.updated_at === 'number' ? r.updated_at : Date.now(),
-              items: items.map((it: any) => ({
-                menuItemId: it.menu_item_id,
-                name: it.name_snapshot,
-                unitPrice:
-                  typeof it.price_snapshot_cents === 'number' ? it.price_snapshot_cents / 100 : 0,
-                quantity: it.quantity,
-                selectedModifiers: [],
-                notes: it.special_instructions || undefined,
-              })),
-            };
-          });
-          const eid = employee?.id ? String(employee.id) : '';
-          // Mirror of init hydration: own POS orders + ALL external orders from
-          // web/QR/phone/app are visible regardless of employeeId.
-          const filtered = hydrated.filter((o: any) => {
-            const isExternal = String(o.sourceChannel || 'POS').toUpperCase() !== 'POS';
-            const isOwn = eid ? String(o.employeeId || '') === eid : true;
-            return isExternal || isOwn;
-          });
-          if (alive) {
-            detectAndQueueExternalOrders(filtered);
-            setOrders(filtered);
-          }
+        const hydrated = await hydrateOrders(list, tickTables);
+        if (alive) {
+          detectAndQueueExternalOrders(hydrated);
+          setOrders(hydrated);
         }
 
         // Also refresh open running tabs so floor-plan badges stay live
@@ -1412,10 +1370,15 @@ export default function CashierScreenLayout() {
       )}
 
       <div className="flex-1 flex min-h-0 relative">
-        {/* Sidebar */}
-        <aside className="w-24 shrink-0 border-r border-white/5 bg-slate-900/40 backdrop-blur-xl flex flex-col py-4 relative overflow-hidden">
-          <div className="absolute inset-0 opacity-50 pointer-events-none bg-gradient-mesh-warm" />
-          <nav className="flex-1 flex flex-col items-center gap-2 px-2 relative">
+        {/* Professional POS sidebar rail. Shrink width + tab heights so all
+            6 primary tabs (Menu / Tables / History / Shift / Reports / Manager)
+            AND the 2 secondary action buttons (Customer Display + Test Print)
+            at the bottom ALWAYS fit vertically without clipping, even on
+            720p/1366×768 POS terminals. overflow-y-auto as a last-resort
+            guard if the viewport is ever smaller than our minimum target. */}
+        <aside className="w-20 shrink-0 border-r border-white/5 bg-slate-900/40 backdrop-blur-xl flex flex-col py-2.5 relative overflow-y-auto">
+          <div className="absolute inset-0 opacity-40 pointer-events-none bg-gradient-mesh-warm" />
+          <nav className="flex-1 flex flex-col items-center gap-1.5 px-1.5 relative">
             {sidebarTabs.map((t) => {
               const active = activeTab === t.id;
               return (
@@ -1428,15 +1391,15 @@ export default function CashierScreenLayout() {
                       else setShowShiftModal('OPEN');
                     }
                   }}
-                  className={`w-full min-h-[5.25rem] flex flex-col items-center justify-center gap-1.5 rounded-2xl transition-all active:scale-[0.97] ring-1 ring-inset group relative overflow-hidden ${
+                  className={`w-full min-h-[3.5rem] flex flex-col items-center justify-center gap-1 rounded-xl transition-all active:scale-[0.97] ring-1 ring-inset group relative overflow-hidden ${
                     active
-                      ? 'text-white ring-amber-400/40 animate-neon-pulse'
+                      ? 'text-white ring-amber-400/40'
                       : 'text-ink-300 hover:text-white hover:ring-white/15'
                   }`}
                   style={active
                     ? {
-                        background: 'linear-gradient(180deg, rgba(255,215,0,0.18) 0%, rgba(212,175,55,0.12) 45%, rgba(205,127,50,0.10) 100%)',
-                        boxShadow: '0 0 28px -8px rgba(212, 175, 55, 0.55), inset 0 1px 0 rgba(255,215,0,0.18)',
+                        background: 'linear-gradient(180deg, rgba(255,215,0,0.16) 0%, rgba(212,175,55,0.10) 45%, rgba(205,127,50,0.08) 100%)',
+                        boxShadow: '0 0 22px -10px rgba(212, 175, 55, 0.55), inset 0 1px 0 rgba(255,215,0,0.15)',
                       }
                     : { background: 'rgba(255,255,255,0.02)' }}
                   title={`${t.label} — ${t.desc}`}
@@ -1446,67 +1409,41 @@ export default function CashierScreenLayout() {
                       style={{ background: 'linear-gradient(90deg, transparent, #FFD700 30%, #CD7F32 70%, transparent)' }}
                     />
                   )}
-                  <span className={`text-3xl leading-none relative ${active ? 'animate-float-slow' : ''}`}>{t.icon}</span>
-                  <span className={`text-[10px] font-black uppercase tracking-[0.16em] relative ${active ? 'text-amber-200' : ''}`}>
+                  <span className={`text-2xl leading-none relative ${active ? '' : ''}`}>{t.icon}</span>
+                  <span className={`text-[9px] font-black uppercase tracking-[0.14em] relative leading-none ${active ? 'text-amber-200' : ''}`}>
                     {t.label}
                   </span>
                 </button>
               );
             })}
           </nav>
-          <div className="mt-auto px-2 space-y-2 relative">
+          <div className="mt-2 px-1.5 space-y-1.5 relative">
             <button
               onClick={() => {
-                // Open or re-focus the customer-facing popup window. In a
-                // real Electron build a secondary BrowserWindow would be
-                // created; in browser/Vite mode we open a classic popup that
-                // mounts the same SPA at the /#/customer-display hash route.
-                // The popup has its own installMockElectronAPI() call in
-                // main.tsx, so it connects back to this POS window via the
-                // BroadcastChannel state bus and hydrates the latest state
-                // immediately (including any live cart already being rung).
                 const existing = _customerDisplayWindow;
                 if (existing && !existing.closed) {
-                  try {
-                    existing.focus();
-                  } catch (_) {
-                    /* popup may be cross-origin / in another browser context */
-                  }
-                  // Always re-push idle/order state so refocus recovers the UI
-                  // even if the popup had been refreshed and lost its state.
+                  try { existing.focus(); } catch {}
                   window.electronAPI?.customerDisplay?.showIdle?.().catch(() => {});
                   flashToast('🖥️ Customer display: Refocused');
                   return;
                 }
-
-                // 1280×800 landscape matches the typical customer-facing
-                // 15.6"/21.5" monitor hung above the POS terminal. Centre on
-                // whatever screen the browser window reports so launching
-                // from a laptop doesn't dump the popup off-screen.
                 const w = 1280;
                 const h = 800;
                 const left = Math.max(
                   0,
                   Math.floor(
-                    (typeof screen !== 'undefined' ? screen.width : window.innerWidth) / 2 -
-                      w / 2,
+                    (typeof screen !== 'undefined' ? screen.width : window.innerWidth) / 2 - w / 2,
                   ),
                 );
                 const top = Math.max(
                   0,
                   Math.floor(
-                    (typeof screen !== 'undefined' ? screen.height : window.innerHeight) / 2 -
-                      h / 2,
+                    (typeof screen !== 'undefined' ? screen.height : window.innerHeight) / 2 - h / 2,
                   ),
                 );
                 const features = [
-                  `width=${w}`,
-                  `height=${h}`,
-                  `left=${left}`,
-                  `top=${top}`,
-                  'menubar=no',
-                  'toolbar=no',
-                  // modern browsers may still show URL bar for security; text is informational
+                  `width=${w}`, `height=${h}`, `left=${left}`, `top=${top}`,
+                  'menubar=no', 'toolbar=no',
                 ].join(',');
                 const popup = window.open(
                   '/#/customer-display',
@@ -1518,8 +1455,6 @@ export default function CashierScreenLayout() {
                   return;
                 }
                 _customerDisplayWindow = popup;
-                // Clear ref if user manually closes the popup so the next
-                // click re-opens it cleanly instead of trying to focus a dead ref.
                 const closePoll = window.setInterval(() => {
                   if (_customerDisplayWindow && _customerDisplayWindow.closed) {
                     _customerDisplayWindow = null;
@@ -1529,26 +1464,23 @@ export default function CashierScreenLayout() {
                 popup.addEventListener?.('beforeunload', () => {
                   if (_customerDisplayWindow === popup) _customerDisplayWindow = null;
                 });
-                // Prime the channel so the popup gets idle state the moment
-                // its React tree mounts (its subscriber issues a
-                // customer-latest-request, but pushing eagerly avoids a flash).
                 window.electronAPI?.customerDisplay?.showIdle?.().catch(() => {});
                 flashToast('🖥️ Customer display: Launched on second monitor');
               }}
               className={[
-                'w-full min-h-[4.5rem] flex flex-col items-center justify-center gap-1 rounded-2xl transition-all relative group',
+                'w-full min-h-[3rem] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-all relative group',
                 displayAlive
-                  ? 'text-amber-200 bg-white/5 ring-1 ring-amber-400/40 shadow-[0_0_0_1px_rgba(251,191,36,0.10),0_0_24px_rgba(251,191,36,0.08)]'
+                  ? 'text-amber-200 bg-white/5 ring-1 ring-amber-400/40 shadow-[0_0_0_1px_rgba(251,191,36,0.10),0_0_20px_rgba(251,191,36,0.08)]'
                   : 'text-ink-300 hover:text-amber-200 hover:bg-white/5',
               ].join(' ')}
               title="Customer Display"
             >
-              <span className="text-2xl relative">🖥️</span>
-              <span className="text-[9px] font-black uppercase tracking-[0.18em] relative">
+              <span className="text-xl relative leading-none">🖥️</span>
+              <span className="text-[8px] font-black uppercase tracking-[0.16em] relative leading-none">
                 Display
               </span>
               {displayAlive && (
-                <span className="absolute top-2 right-2 h-2 w-2 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]" />
+                <span className="absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.8)]" />
               )}
             </button>
             <button
@@ -1557,11 +1489,13 @@ export default function CashierScreenLayout() {
                 window.electronAPI?.print?.testPage?.().catch(() => {});
                 flashToast('🖨️ Test print queued');
               }}
-              className="w-full min-h-[4.5rem] flex flex-col items-center justify-center gap-1 rounded-2xl text-ink-300 hover:text-amber-200 hover:bg-white/5 transition-all relative group"
+              className="w-full min-h-[3rem] flex flex-col items-center justify-center gap-0.5 rounded-xl text-ink-300 hover:text-amber-200 hover:bg-white/5 transition-all relative group"
               title="Test Print"
             >
-              <span className="text-2xl relative">🖨️</span>
-              <span className="text-[9px] font-black uppercase tracking-[0.18em] relative">Print</span>
+              <span className="text-xl relative leading-none">🖨️</span>
+              <span className="text-[8px] font-black uppercase tracking-[0.16em] relative leading-none">
+                Print
+              </span>
             </button>
           </div>
         </aside>
@@ -2428,7 +2362,22 @@ function HistoryPanel({
   };
   const todayIso = toIsoDate(new Date());
 
-  const filters = ['ALL', 'NEW', 'PREPARING', 'READY', 'DELIVERED', 'ON_HOLD', 'CLOSED'];
+  const filters = [
+    'ALL',
+    'NEW',
+    'ACCEPTED',
+    'PREPARING',
+    'READY',
+    'SERVED',
+    'AWAITING_PAYMENT',
+    'PARTIALLY_PAID',
+    'PAID',
+    'COMPLETED',
+    'ON_HOLD',
+    'CANCELLED',
+    'REFUNDED',
+    'VOIDED',
+  ];
 
   // Preset chips — click sets start/end to a range
   const DATE_PRESETS: { id: string; label: string; apply: () => void }[] = [
@@ -2490,9 +2439,35 @@ function HistoryPanel({
     const startTs = startOfDayTs(dateStart);
     const endTs = endOfDayTs(dateEnd);
     const list = orders.filter((o) => {
-      const statusOk = filter === 'ALL'
-        ? true
-        : (o.status || '') === filter || (filter === 'CLOSED' && ['CLOSED', 'COMPLETED'].includes(o.status || ''));
+      const status = String(o.status || '').toUpperCase();
+      const ps = String(o.paymentStatus || '').toUpperCase();
+      let statusOk = false;
+      if (filter === 'ALL') {
+        statusOk = true;
+      } else if (filter === 'COMPLETED') {
+        // Convenience alias: COMPLETED tab shows both server enum values
+        // that mean "order finished", so history doesn't hide rows just
+        // because one was marked COMPLETED vs PAID.
+        statusOk = status === 'COMPLETED' || status === 'PAID' || status === 'CLOSED';
+      } else if (filter === 'PARTIALLY_PAID') {
+        statusOk =
+          status === 'PARTIALLY_PAID' ||
+          (ps === 'PARTIALLY_PAID' && status !== 'CANCELLED' && status !== 'VOIDED' && status !== 'REFUNDED');
+      } else if (filter === 'AWAITING_PAYMENT') {
+        statusOk =
+          status === 'AWAITING_PAYMENT' ||
+          status === 'SERVED' ||
+          status === 'PARTIALLY_PAID' ||
+          (ps !== 'PAID' &&
+            ps !== 'REFUNDED' &&
+            ps !== 'PARTIALLY_REFUNDED' &&
+            ps !== 'FAILED' &&
+            (status === 'COMPLETED' || status === 'READY' || status === 'PREPARING' || status === 'ACCEPTED' || status === 'NEW'));
+      } else {
+        // Strict match on any other filter value. Also accept the
+        // legacy CLOSE alias for rows that store COMPLETED/CLOSED.
+        statusOk = status === filter;
+      }
       if (!statusOk) return false;
       const ts = o.createdAt || 0;
       if (startTs != null && ts < startTs) return false;
@@ -2504,15 +2479,41 @@ function HistoryPanel({
 
   const totals = useMemo(() => {
     const m: Record<string, number> = {};
-    for (const o of orders) m[o.status || 'NEW'] = (m[o.status || 'NEW'] || 0) + 1;
-    m.CLOSED = (m.CLOSED || 0) + (m.COMPLETED || 0);
+    for (const o of orders) {
+      const s = String(o.status || '').toUpperCase();
+      const ps = String(o.paymentStatus || '').toUpperCase();
+      m[s] = (m[s] || 0) + 1;
+      // Aggregate a separate payment-status-only bucketing too so tab
+      // counts reflect the real pipeline even when rows share a status.
+      if (ps === 'PARTIALLY_PAID') m.PARTIALLY_PAID = (m.PARTIALLY_PAID || 0) + 1;
+      if (ps === 'PAID' || s === 'PAID') m.PAID = (m.PAID || 0) + 1;
+    }
+    m.COMPLETED =
+      (m.COMPLETED || 0) +
+      (m.PAID || 0) +
+      (m.CLOSED || 0);
+    m.AWAITING_PAYMENT =
+      (m.AWAITING_PAYMENT || 0) +
+      (m.SERVED || 0) +
+      (m.PARTIALLY_PAID || 0);
     return m;
   }, [orders]);
 
-  // Sales total respects the date + status filters
+  // Sales total respects the date + status filters.
   const salesTotalCents = useMemo(
     () => filtered
-      .filter((o) => ['DELIVERED', 'CLOSED', 'COMPLETED', 'PAID'].includes(o.status || '') || o.paymentStatus === 'PAID')
+      .filter((o) => {
+        const s = String(o.status || '').toUpperCase();
+        const ps = String(o.paymentStatus || '').toUpperCase();
+        const closedSale =
+          s === 'COMPLETED' ||
+          s === 'PAID' ||
+          s === 'CLOSED' ||
+          ps === 'PAID' ||
+          s === 'REFUNDED' || // refunded sales still show on the day's ledger
+          s === 'VOIDED';
+        return closedSale;
+      })
       .reduce((s, o) => s + Math.round((o.totalAmount || 0) * 100), 0),
     [filtered],
   );

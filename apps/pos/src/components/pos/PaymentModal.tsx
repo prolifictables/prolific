@@ -132,6 +132,21 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         held_at: null,
         status: method === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
         payment_status: method === 'CASH' ? 'PAID' : 'PENDING',
+        payment_method:
+          method === 'PHYSICAL_POS'
+            ? 'CARD'
+            : method === 'BANK_TRANSFER'
+              ? 'BANK_TRANSFER'
+              : method === 'ONLINE'
+                ? 'ONLINE_PAYSTACK'
+                : 'CASH',
+        // Set paid / balance columns so downstream chips and Shift totals
+        // read the correct numbers immediately, without waiting for the
+        // payments-list aggregation. CASH is paid in full on the spot; any
+        // non-CASH method (card terminal, bank transfer, Paystack link) is
+        // confirmed later via the "Mark Paid" counter workflow.
+        paid_amount_cents: method === 'CASH' ? totals.total : 0,
+        balance_due_cents: method === 'CASH' ? 0 : totals.total,
         subtotal_cents: totals.subtotal,
         discount_cents: totals.discount,
         tax_cents: totals.tax,
@@ -360,7 +375,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           completedAt: method === 'CASH' ? new Date(now) : undefined,
         };
 
-        await window.electronAPI.db.syncQueue.push({
+        await window.electronAPI?.db?.syncQueue?.push?.({
           op_id: `order_${orderId}`,
           entity_type: 'ORDER',
           operation: 'CREATE',
@@ -369,7 +384,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           idempotency_key: orderId,
           local_entity_version: 1,
         });
-        await window.electronAPI.db.syncQueue.push({
+        await window.electronAPI?.db?.syncQueue?.push?.({
           op_id: `payment_${paymentId}`,
           entity_type: 'PAYMENT',
           operation: 'CREATE',

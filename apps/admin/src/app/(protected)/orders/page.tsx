@@ -150,10 +150,6 @@ const PAYMENT_METHOD_OPTIONS: Array<{
   { value: 'OTHER', label: 'Other', hint: 'Voucher / Wallet / Gift / Comp' },
 ];
 
-// Refresh cadence per project conventions: 15s general layout, 8s active
-// surfaces. Orders page is an "active surface" during service so use 12s.
-const REFRESH_MS = 12_000;
-
 interface PaymentFormState {
   method: PaymentMethodOptions;
   amountNgn: string;
@@ -207,6 +203,7 @@ export default function OrdersPage() {
   );
   const [actionLoading, setActionLoading] = useState(false);
   const [voidReason, setVoidReason] = useState('');
+  const [lastFetchedAt, setLastFetchedAt] = useState<Date | null>(null);
 
   const role = getRole();
   const canVoidRefund =
@@ -251,6 +248,7 @@ export default function OrdersPage() {
         qrCodeId: o.qrCodeId ? sid(o.qrCodeId) : '',
       }));
       setOrders(normalized);
+      setLastFetchedAt(new Date());
     } catch (err: any) {
       toast('Failed to load orders', {
         description: err.message,
@@ -275,19 +273,11 @@ export default function OrdersPage() {
     }
   };
 
-  // Initial + filter-change fetch
+  // Initial + filter-change fetch. Network refresh is ONLY triggered by
+  // (a) filter-state changes handled here, or (b) explicit user click on the
+  // Refresh button. No background polling every 12s.
   useEffect(() => {
     fetchOrders();
-  }, [branch?.id, statusFilter, source, dateFrom, dateTo, debouncedSearch]);
-
-  // Polled refresh keeps KPI counters live during service without a page
-  // reload. Matches project convention.
-  useEffect(() => {
-    const id = setInterval(() => {
-      void fetchOrders();
-    }, REFRESH_MS);
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [branch?.id, statusFilter, source, dateFrom, dateTo, debouncedSearch]);
 
   // When the selected order changes, refresh its payment history.
@@ -810,8 +800,14 @@ export default function OrdersPage() {
             variant="soft"
             className="text-[11px] inline-flex items-center gap-1.5"
           >
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            Live · refreshes every {Math.round(REFRESH_MS / 1000)}s
+            <span className="h-1.5 w-1.5 rounded-full bg-slate-400" />
+            Manual refresh
+            {lastFetchedAt && (
+              <>
+                <span className="text-slate-300 mx-0.5">·</span>
+                <span>Updated {formatRelativeTime(lastFetchedAt)}</span>
+              </>
+            )}
           </Badge>
           <Button variant="outline" size="sm" onClick={fetchOrders}>
             <svg
@@ -821,7 +817,7 @@ export default function OrdersPage() {
               strokeWidth="2"
               strokeLinecap="round"
               strokeLinejoin="round"
-              className="h-4 w-4"
+              className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`}
             >
               <path d="M23 4v6h-6M1 20v-6h6" />
               <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
