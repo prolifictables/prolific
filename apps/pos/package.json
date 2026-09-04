@@ -1,6 +1,6 @@
 {
   "name": "@prolific/pos",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "private": true,
   "main": "dist-electron/main/index.js",
   "scripts": {
