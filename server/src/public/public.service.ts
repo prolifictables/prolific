@@ -186,6 +186,12 @@ export class PublicService {
     wifi?: string;
     openingHours?: string;
     branchName?: string;
+    bankDetails?: {
+      bankName?: string;
+      accountName?: string;
+      accountNumber?: string;
+      caption?: string;
+    } | null;
   }> {
     const branchId = opts.branchId || null;
     // Without a branchId we can't resolve branch-scoped settings — return empty
@@ -216,8 +222,34 @@ export class PublicService {
       .exec();
 
     const full = row?.value && typeof row.value === 'object' ? (row.value as Record<string, unknown>) : {};
-    const sub = full[this.CUSTOMER_DISPLAY_SUBKEY];
-    return sub && typeof sub === 'object' ? (sub as any) : {};
+    const subAny = full[this.CUSTOMER_DISPLAY_SUBKEY];
+    const sub = subAny && typeof subAny === 'object' ? (subAny as Record<string, any>) : {};
+    // Destructure known top-level branding keys (promos/specials/etc) plus the
+    // newly added bankDetails (with legacy snake_case fallback for documents
+    // written by older admin builds). Explicit null is preserved so downstream
+    // caches (POS localStorage / Electron settings table) correctly clear the
+    // prior snapshot when a manager blanks out all 4 fields.
+    const {
+      promos,
+      specials,
+      tagline,
+      wifi,
+      openingHours,
+      branchName,
+      bankDetails,
+    } = sub;
+    const legacyBankDetails = sub.bank_details;
+    const normalizedBankDetails =
+      bankDetails !== undefined ? bankDetails : legacyBankDetails !== undefined ? legacyBankDetails : null;
+    return {
+      promos: promos as unknown[] | undefined,
+      specials: specials as unknown[] | undefined,
+      tagline: tagline as string | undefined,
+      wifi: wifi as string | undefined,
+      openingHours: openingHours as string | undefined,
+      branchName: branchName as string | undefined,
+      bankDetails: normalizedBankDetails as any,
+    };
   }
 
   async resolveQr(token: string): Promise<ResolvedQr> {

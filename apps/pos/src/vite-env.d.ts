@@ -26,6 +26,21 @@ export interface CustomerBranding {
   wifi?: string;
   openingHours?: string;
   branchName?: string;
+  // Manager-editable bank account details for this branch/restaurant. Stored
+  // in admin portal (Settings → Branch → Bank Details) and synced to both
+  // Electron SQLite (settings `bank_details:<branchId>`) and server public
+  // endpoint (merged into /public/customer-display-settings as `bankDetails`).
+  // Rendered on customer display NO MATTER the payment method (customer
+  // requirement: bank info always visible for transfers & awareness).
+  bankDetails?: CustomerBankDetails;
+}
+
+export interface CustomerBankDetails {
+  bankName?: string;
+  accountName?: string;
+  accountNumber?: string;
+  // Optional: short "Pay to: X" caption shown above the table.
+  caption?: string;
 }
 
 export interface CustomerOrderLine {
@@ -49,6 +64,16 @@ export interface CustomerOrderPreview {
   paymentStatus?: 'PAID' | 'AWAITING_PAYMENT' | 'REFUNDED' | string;
   orderStatus?: 'RECEIVED' | 'ACCEPTED' | 'PREPARING' | 'READY' | 'SERVED' | string;
   paidAt?: number;
+  // Optional: latest bank details for the branch, copied from branding at emit
+  // time. Customer display renders these regardless of payment method.
+  bankDetails?: CustomerBankDetails;
+  // Optional: label "Paid with Cash / POS Terminal / Transfer …" so the
+  // thank-you screen and active order reflect the actual selected method.
+  paymentMethodLabel?: string;
+  // Cash tender and change lines for when the method == CASH so customer can
+  // verify the change amount from the 2nd screen.
+  tenderedCents?: number;
+  changeDueCents?: number;
 }
 
 export interface CustomerStatePayload {

@@ -237,15 +237,11 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         }
       }
 
-      // Auto-print a kitchen ticket immediately after the order is written. Failures
-      // are non-blocking: we don't fail the payment.
-      try {
-        await window.electronAPI?.print?.kitchenTicket?.(realOrderId);
-        setToast && setToast('🖨️ Kitchen ticket printed');
-        setTimeout(() => setToast && setToast(null), 2000);
-      } catch (e) {
-        console.warn('[pay] kitchen ticket print error (ok to ignore)', e);
-      }
+      // Note: kitchen ticket printing moved below with the 2-copy customer +
+      // cashier receipt print — we only issue a single kitchen ticket AFTER
+      // the payment row is written, not before. This avoids double prints on
+      // confirm when the earlier kitchen-ticket block and the later block
+      // both fire for the same order.
 
       const paymentId =
         (crypto.randomUUID && crypto.randomUUID()) || `pay_${now}_${Math.random()}`;
@@ -470,8 +466,79 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       }
 
       try {
+        // Resolve latest cached bank details (manager-editable via Admin portal,
+        // branch-scoped, stored offline in SQLite settings `bank_details:<id>`
+        // and mirrored to localStorage for browser mock shim. Strict user rule:
+        // bank details MUST render on customer display NO MATTER the payment
+        // method (CASH, card terminal, transfer all show it).
+        let cachedBank: any = null;
+        try {
+          if (branch?.id && window.electronAPI?.db?.settings?.get) {
+            const key = `bank_details:${branch.id}`;
+            cachedBank = (await window.electronAPI.db.settings.get(key, 'BRANCH')) || null;
+          }
+        } catch (_bankErr) {
+          cachedBank = null;
+        }
+
+        // Human-readable payment-method label shown on ThankYou and ActiveOrder
+        // (e.g. "💵 Cash Paid" vs "💳 POS Terminal").
+        const METHOD_LABEL = METHODS.find((m) => m.id === method)?.label || method;
+        const paymentMethodLabel =
+          method === 'CASH'
+            ? `💵 ${METHOD_LABEL}`
+            : method === 'PHYSICAL_POS'
+              ? `💳 ${METHOD_LABEL}`
+              : method === 'BANK_TRANSFER'
+                ? `🏦 ${METHOD_LABEL}`
+                : `🌐 ${METHOD_LABEL}`;
+
+        // Build CustomerOrderPreview-compatible lines array (matches CartPanel's
+        // existing showOrder preview shape so ThankYouScreen and ActiveOrder
+        // screens reuse the same line-item renderer with modifiers).
+        // Build a one-off modifier option-name lookup for this cart: we re-read
+        // item modifiers from the local menu to avoid depending on outer scope.
+        const previewLines: any[] = [];
+        for (const l of lines) {
+          const modDisplayNames: string[] = [];
+          if (Array.isArray(l.modifiers) && l.modifiers.length) {
+            let itemModDefs: any[] = [];
+            try {
+              const fetched =
+                (await window.electronAPI?.db?.menuModifiers?.listForItemId?.(l.menuItem.id)) || [];
+              itemModDefs = Array.isArray(fetched) ? fetched : [];
+            } catch {
+              itemModDefs = [];
+            }
+            for (const sel of l.modifiers) {
+              const mod = itemModDefs.find((m: any) => String(m.id) === String(sel.modifierId));
+              const optionNameById = new Map<string, string>();
+              for (const o of mod?.options || []) {
+                optionNameById.set(String(o.id), o.name || o.label || String(o.id));
+              }
+              for (const oid of sel.optionIds || []) {
+                modDisplayNames.push(optionNameById.get(String(oid)) || String(oid));
+              }
+            }
+          }
+          previewLines.push({
+            qty: l.quantity,
+            name: l.menuItem?.name ?? 'Item',
+            modifiers: modDisplayNames,
+            unitPriceCents: l.perUnitPriceCents,
+            totalCents: l.subtotalCents,
+          });
+        }
+
         await window.electronAPI?.customerDisplay?.showPaid?.({
           orderNumber,
+          table: tableName || undefined,
+          orderType: normalizedOrderType,
+          lines: previewLines,
+          subtotalCents: totals.subtotal,
+          discountCents: totals.discount,
+          taxCents: totals.tax,
+          totalCents: totals.total,
           totalAmount: totals.total / 100,
           items: lines.map((l) => ({
             id: l.lineId,
@@ -486,8 +553,12 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
             kitchenStatus: 'NEW',
           })),
           paymentMethod: method,
+          paymentMethodLabel,
           tendered: tenderedCents / 100,
+          tenderedCents: method === 'CASH' ? tenderedCents : undefined,
           change: changeCents / 100,
+          changeDueCents: method === 'CASH' ? changeCents : undefined,
+          bankDetails: cachedBank || undefined,
         });
       } catch (e) {
         console.warn('[pay] customer display error', e);
@@ -496,6 +567,14 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       // Auto-print receipts as soon as the payment is recorded. For cash +
       // confirmed card/transfer methods we print immediately; any printer
       // errors are logged but don't interrupt the payment flow.
+      //
+      // STRICT PRINT RULE (user requirement — do NOT re-add kitchen tickets):
+      // The confirm flow must print EXACTLY 2 spool pages in total:
+      //   1) Customer receipt copy
+      //   2) Cashier receipt copy
+      // Kitchen tickets and any other supplementary prints are DISABLED in
+      // this build. Adding a kitchen ticket here would make 3 pages and
+      // violate the rule that was explicitly requested.
       try {
         await window.electronAPI?.print?.receipt?.(realOrderId, 2);
         setToast && setToast(`🧾 Receipt ${orderNumber || '#'} printed`);
@@ -503,14 +582,6 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       } catch (e) {
         console.warn('[pay] print receipt error', e);
       }
-      // Auto-print kitchen ticket so the bar/kitchen gets notified of the new PAID
-      // order immediately. Best-effort: never blocks the cashier flow.
-      try {
-        await window.electronAPI?.print?.kitchenTicket?.(realOrderId);
-      } catch (ktErr) {
-        console.warn('[pay] print kitchen ticket error (non-fatal):', ktErr);
-      }
-
       setTimeout(
         () =>
           onPaid({

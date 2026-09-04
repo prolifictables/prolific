@@ -111,37 +111,65 @@ export default function CartPanel() {
       ? `${customer.firstName} ${customer.lastName || ''}`.trim()
       : undefined;
 
-    const preview = {
-      orderNumber: orderNumberRef.current,
-      table: tableName || undefined,
-      orderType: normalizedOrderType,
-      customerName,
-      lines: lines.map((l) => {
-        const modifiers = (l.modifiers || []).flatMap((m) => {
-          const dict = modifierMap[m.modifierId] || {};
-          return (m.optionIds || []).map((oid) => dict[String(oid)] || String(oid));
-        });
-        return {
-          qty: l.quantity,
-          name: l.menuItem?.name ?? 'Item',
-          modifiers,
-          unitPriceCents: l.perUnitPriceCents,
-          totalCents: l.subtotalCents,
-        };
-      }),
-      subtotalCents: subtotal,
-      discountCents: discount,
-      taxCents: tax,
-      totalCents: total,
-      paymentStatus: 'AWAITING_PAYMENT',
+    // Resolve bank details offline first: stored in SQLite settings
+    // `bank_details:<branchId>` (manager editable via Admin portal → synced via
+    // /public/customer-display-settings poller every 30s, and written locally
+    // as soon as it's received so the POS always has a cached copy for the
+    // customer display popup even if the server becomes unreachable mid-shift).
+    let cancelPreview = false;
+    const buildAndEmit = async () => {
+      let cachedBank: any = null;
+      try {
+        if (branch?.id && window.electronAPI?.db?.settings?.get) {
+          const key = `bank_details:${branch.id}`;
+          cachedBank = (await window.electronAPI.db.settings.get(key, 'BRANCH')) || null;
+        }
+      } catch (_bankErr) {
+        cachedBank = null;
+      }
+
+      if (cancelPreview) return;
+
+      const preview = {
+        orderNumber: orderNumberRef.current,
+        table: tableName || undefined,
+        orderType: normalizedOrderType,
+        customerName,
+        lines: lines.map((l) => {
+          const modifiers = (l.modifiers || []).flatMap((m) => {
+            const dict = modifierMap[m.modifierId] || {};
+            return (m.optionIds || []).map((oid) => dict[String(oid)] || String(oid));
+          });
+          return {
+            qty: l.quantity,
+            name: l.menuItem?.name ?? 'Item',
+            modifiers,
+            unitPriceCents: l.perUnitPriceCents,
+            totalCents: l.subtotalCents,
+          };
+        }),
+        subtotalCents: subtotal,
+        discountCents: discount,
+        taxCents: tax,
+        totalCents: total,
+        paymentStatus: 'AWAITING_PAYMENT',
+        // Inject bank details so the ActiveOrder sidebar ALWAYS shows them,
+        // even for cash or card-terminal payment methods.
+        bankDetails: cachedBank || undefined,
+      };
+
+      window.electronAPI?.customerDisplay?.showOrder?.(preview).catch(() => {});
     };
 
     const t = setTimeout(() => {
-      window.electronAPI?.customerDisplay?.showOrder?.(preview).catch(() => {});
+      buildAndEmit();
     }, 120);
 
-    return () => clearTimeout(t);
-  }, [customer, discount, lines, modifierMap, orderType, subtotal, tableName, tax, total]);
+    return () => {
+      cancelPreview = true;
+      clearTimeout(t);
+    };
+  }, [branch, customer, discount, lines, modifierMap, orderType, subtotal, tableName, tax, total]);
 
   const handleHold = async () => {
     if (lines.length === 0) return;

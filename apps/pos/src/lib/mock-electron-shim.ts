@@ -377,6 +377,31 @@ function applyCustomerDisplayPayload(cd: any) {
       if (v) _latestCustomerState.branding.wifi = v;
       dirty = true;
     }
+    // Manager-editable bank details for this branch: Customer display renders
+    // them NO MATTER the selected payment method (cashier user strict rule,
+    // non-negotiable). Merge into branding so any screen without explicit
+    // order-level bankDetails falls back to the branch-level copy.
+    if (Object.prototype.hasOwnProperty.call(cd, 'bankDetails')) {
+      const rawBank = cd.bankDetails;
+      if (rawBank && typeof rawBank === 'object' && (
+        typeof (rawBank as any).bankName === 'string' ||
+        typeof (rawBank as any).accountName === 'string' ||
+        typeof (rawBank as any).accountNumber === 'string'
+      )) {
+        _latestCustomerState.branding.bankDetails = {
+          bankName: typeof (rawBank as any).bankName === 'string' ? (rawBank as any).bankName : undefined,
+          accountName: typeof (rawBank as any).accountName === 'string' ? (rawBank as any).accountName : undefined,
+          accountNumber: typeof (rawBank as any).accountNumber === 'string' ? (rawBank as any).accountNumber : undefined,
+          caption: typeof (rawBank as any).caption === 'string' ? (rawBank as any).caption : undefined,
+        };
+        dirty = true;
+      } else if (rawBank === null || rawBank === undefined ||
+                 (typeof rawBank === 'object' && !Array.isArray(rawBank))) {
+        // Explicitly cleared
+        delete (_latestCustomerState.branding as any).bankDetails;
+        dirty = true;
+      }
+    }
   }
 
   if (dirty) emitCustomerState({});
@@ -393,9 +418,40 @@ async function fetchCustomerDisplayForBranch(branchId: string): Promise<any | nu
     const raw = await resp.json().catch(() => null);
     // Envelope shape: the NestJS interceptor wraps everything as {success, data, meta}.
     // Unwrap raw.data if present, else return raw (endpoint may return direct object).
-    return raw && typeof raw === 'object' && 'data' in raw && raw.data && typeof raw.data === 'object'
+    const payload = raw && typeof raw === 'object' && 'data' in raw && raw.data && typeof raw.data === 'object'
       ? raw.data
       : raw || {};
+
+    // Offline cache: persist the bank details snapshot into localStorage so
+    // CartPanel/PaymentModal settings.get() calls resolve the latest cached
+    // copy even if the network goes down mid-shift. The key format matches
+    // the Electron SQLite settings table: "bank_details:<branchId>" with
+    // scope='BRANCH'.
+    if (payload && typeof payload === 'object') {
+      try {
+        const storageKey = `settings:BRANCH:bank_details:${branchId}`;
+        const bankInPayload = Object.prototype.hasOwnProperty.call(payload, 'bankDetails')
+          ? (payload as any).bankDetails
+          : undefined;
+        // Also support legacy snake_case server response just in case.
+        const bankLegacy = !bankInPayload && Object.prototype.hasOwnProperty.call(payload, 'bank_details')
+          ? (payload as any).bank_details
+          : undefined;
+        const bank = bankInPayload ?? bankLegacy;
+        if (bank && typeof bank === 'object') {
+          localStorage.setItem(storageKey, JSON.stringify(bank));
+        } else if (Object.prototype.hasOwnProperty.call(payload, 'bankDetails') ||
+                   Object.prototype.hasOwnProperty.call(payload, 'bank_details')) {
+          // Explicitly cleared server-side → drop the cached copy so POS
+          // shows nothing until manager re-enters the account details.
+          localStorage.removeItem(storageKey);
+        }
+      } catch (_storageErr) {
+        /* localStorage unavailable or quota exhausted → keep runtime copy only */
+      }
+    }
+
+    return payload;
   } catch {
     return null;
   }
@@ -2918,6 +2974,69 @@ export function installMockElectronAPI() {
         },
       },
 
+      // Branch-scoped settings (mirrors Electron SQLite settings table).
+      // Bank details for transfers live here so the POS always has a cached
+      // offline copy even when the Render backend is cold or the internet
+      // drops mid-shift.
+      settings: {
+        get: async (key: string, scope?: string) => {
+          await delay(5);
+          const safeScope = typeof scope === 'string' && scope.trim().length > 0
+            ? scope.trim()
+            : 'GLOBAL';
+          const storageKey = `settings:${safeScope}:${key}`;
+          try {
+            const raw = localStorage.getItem(storageKey);
+            if (!raw || raw === 'null' || raw === 'undefined') {
+              return null;
+            }
+            return JSON.parse(raw);
+          } catch {
+            return null;
+          }
+        },
+        set: async (key: string, value: unknown, scope?: string) => {
+          await delay(5);
+          const safeScope = typeof scope === 'string' && scope.trim().length > 0
+            ? scope.trim()
+            : 'GLOBAL';
+          const storageKey = `settings:${safeScope}:${key}`;
+          try {
+            if (value === null || value === undefined) {
+              localStorage.removeItem(storageKey);
+            } else {
+              localStorage.setItem(storageKey, JSON.stringify(value));
+            }
+          } catch {
+            /* ignore quota */
+          }
+          return true;
+        },
+        getAllByScope: async (scope: string) => {
+          await delay(5);
+          const safeScope = typeof scope === 'string' && scope.trim().length > 0
+            ? scope.trim()
+            : 'GLOBAL';
+          const prefix = `settings:${safeScope}:`;
+          const out: Record<string, unknown> = {};
+          try {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              if (k && k.startsWith(prefix)) {
+                const raw = localStorage.getItem(k);
+                if (raw) {
+                  try {
+                    const parsed = JSON.parse(raw);
+                    out[k.slice(prefix.length)] = parsed;
+                  } catch { /* ignore */ }
+                }
+              }
+            }
+          } catch { /* ignore */ }
+          return out;
+        },
+      },
+
       syncQueue: {
         getCounts: async () => {
           await delay(8);
@@ -2927,6 +3046,18 @@ export function installMockElectronAPI() {
           };
         },
         push: async (item: any) => {
+          const opId =
+            typeof item?.op_id === 'string' && item.op_id
+              ? String(item.op_id)
+              : (typeof item?.opId === 'string' && item.opId ? String(item.opId) : null);
+          if (opId) {
+            const idx = mockSyncQueue.findIndex((q) => {
+              const k = typeof (q as any).op_id === 'string' ? String((q as any).op_id) :
+                typeof (q as any).opId === 'string' ? String((q as any).opId) : null;
+              return k && k === opId;
+            });
+            if (idx >= 0) return true;
+          }
           mockSyncQueue.push({ ...item, status: 'PENDING', createdAt: Date.now() });
           return true;
         },
@@ -3702,47 +3833,91 @@ export function installMockElectronAPI() {
       // Payment just recorded: show thank-you confetti screen with total paid
       showPaid: async (raw: any) => {
         await bootstrapCustomerBranding();
-        // PaymentModal sends raw Payment data (dollars/NAIRA as floats).
-        // Normalize to integer cents + CustomerOrderPreview shape so the
-        // ThankYouScreen can share data structures with ActiveOrderScreen.
-        const items: any[] = Array.isArray(raw?.items) ? raw.items : [];
-        const totalCents = Math.round(Number(raw?.totalAmount ?? 0) * 100);
-        const lines: CustomerOrderLine[] = items.map((it) => {
-          const modifiers: string[] = [];
-          (it?.selectedModifiers || []).forEach((m: any) => {
-            if (Array.isArray(m?.optionIds)) {
-              modifiers.push(...m.optionIds.map((oid: any) => String(oid)));
-            } else if (typeof m?.name === 'string') {
-              modifiers.push(m.name);
-            } else if (typeof m === 'string') {
-              modifiers.push(m);
-            }
+        // PaymentModal sends new-style normalized preview payload:
+        //   { lines:[CustomerOrderLine], totalCents, subtotalCents, ...,
+        //     paymentMethodLabel, tenderedCents, changeDueCents, bankDetails, table, orderType }
+        // It ALSO sends legacy dollar raw.items for compatibility. Prefer the
+        // new lines array when available (already has integer cents & modifier
+        // names that ThankYouScreen renders directly), else fall back to
+        // converting raw.items dollar scalars.
+        const rawLines = Array.isArray(raw?.lines) && raw.lines.length > 0
+          ? raw.lines
+          : null;
+        const rawItems: any[] = !rawLines && Array.isArray(raw?.items) ? raw.items : [];
+        const totalCents = typeof raw?.totalCents === 'number' && raw.totalCents > 0
+          ? raw.totalCents
+          : Math.round(Number(raw?.totalAmount ?? 0) * 100);
+        let lines: CustomerOrderLine[];
+        if (rawLines) {
+          // Already CustomerOrderPreview.lines shape (qty, name, modifiers[],
+          // unitPriceCents, totalCents). Trim modifiers if malformed so the
+          // ThankYouScreen renderer never crashes.
+          lines = (rawLines as any[]).map((l) => ({
+            qty: Number(l?.qty ?? l?.quantity ?? 1) || 1,
+            name: String(l?.name ?? 'Item'),
+            modifiers: Array.isArray(l?.modifiers)
+              ? l.modifiers.map((m: any) => (typeof m === 'string' ? m : String(m?.name ?? m ?? ''))).filter(Boolean)
+              : [],
+            unitPriceCents: Number(l?.unitPriceCents ?? 0),
+            totalCents: Number(l?.totalCents ?? 0),
+          }));
+        } else {
+          lines = rawItems.map((it) => {
+            const modifiers: string[] = [];
+            (it?.selectedModifiers || []).forEach((m: any) => {
+              if (Array.isArray(m?.optionIds)) {
+                modifiers.push(...m.optionIds.map((oid: any) => String(oid)));
+              } else if (typeof m?.name === 'string') {
+                modifiers.push(m.name);
+              } else if (typeof m === 'string') {
+                modifiers.push(m);
+              }
+            });
+            const unitCents = Math.round(Number(it?.unitPrice ?? 0) * 100);
+            const qty = Number(it?.quantity ?? 1) || 1;
+            return {
+              qty,
+              name: String(it?.name ?? 'Item'),
+              modifiers,
+              unitPriceCents: unitCents,
+              totalCents: Math.round(Number(it?.totalAmount ?? it?.subtotal ?? unitCents * qty) * 100),
+            };
           });
-          const unitCents = Math.round(Number(it?.unitPrice ?? 0) * 100);
-          const qty = Number(it?.quantity ?? 1) || 1;
-          return {
-            qty,
-            name: String(it?.name ?? 'Item'),
-            modifiers,
-            unitPriceCents: unitCents,
-            totalCents: Math.round(Number(it?.totalAmount ?? it?.subtotal ?? unitCents * qty) * 100),
-          };
-        });
-        // Derive a 5%-ish pseudo-tax if totals weren't supplied, just so the
-        // thank-you screen always has meaningful breakdown lines.
-        let subtotalCents = 0;
-        lines.forEach((l) => (subtotalCents += l.totalCents));
-        const taxCents = totalCents >= subtotalCents ? totalCents - subtotalCents : 0;
+        }
+        // Derive subtotal + discount + tax from passed cents or from lines sum.
+        const subtotalCents = typeof raw?.subtotalCents === 'number'
+          ? raw.subtotalCents
+          : lines.reduce((s, l) => s + l.totalCents, 0);
+        const discountCents = typeof raw?.discountCents === 'number' ? raw.discountCents : 0;
+        const taxCents = typeof raw?.taxCents === 'number'
+          ? raw.taxCents
+          : totalCents >= subtotalCents - discountCents
+            ? totalCents - (subtotalCents - discountCents)
+            : 0;
         const preview: CustomerOrderPreview = {
           orderNumber: String(raw?.orderNumber ?? '#00000'),
+          table: typeof raw?.table === 'string' ? raw.table : undefined,
+          orderType: typeof raw?.orderType === 'string' ? raw.orderType : undefined,
           lines,
           subtotalCents,
-          discountCents: 0,
+          discountCents,
           taxCents,
           totalCents,
           paymentStatus: 'PAID',
           orderStatus: 'RECEIVED',
           paidAt: Date.now(),
+          paymentMethodLabel: typeof raw?.paymentMethodLabel === 'string'
+            ? raw.paymentMethodLabel
+            : undefined,
+          tenderedCents: typeof raw?.tenderedCents === 'number'
+            ? raw.tenderedCents
+            : undefined,
+          changeDueCents: typeof raw?.changeDueCents === 'number'
+            ? raw.changeDueCents
+            : undefined,
+          bankDetails: raw?.bankDetails && typeof raw.bankDetails === 'object'
+            ? raw.bankDetails
+            : undefined,
         };
         emitCustomerState({ screen: 'thankyou', orderPreview: preview });
         return true;

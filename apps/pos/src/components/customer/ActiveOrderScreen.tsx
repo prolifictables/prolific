@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import type { CustomerBranding, CustomerOrderPreview } from '../../vite-env';
+import type { CustomerBranding, CustomerOrderPreview, CustomerBankDetails } from '../../vite-env';
 import { formatCentsToNgn } from '../../lib/ui-helpers';
 import { POWERED_BY_LABEL, APP_VERSION } from '../../lib/app-meta';
 
@@ -102,6 +102,36 @@ function StatusPillar({ orderStatus }: { orderStatus?: string }) {
 interface Props {
   branding: CustomerBranding;
   order: CustomerOrderPreview;
+}
+
+// Manager-editable bank details block: shown ALWAYS (user strict requirement).
+// Reuses the same layout as ThankYouScreen so both screens print identical
+// bank details regardless of the active payment method.
+function BankDetailsPanel({ bank }: { bank?: CustomerBankDetails }) {
+  if (!bank) return null;
+  const rows: { label: string; value?: string }[] = [
+    { label: 'Bank', value: bank.bankName },
+    { label: 'Account name', value: bank.accountName },
+    { label: 'Account number', value: bank.accountNumber },
+  ].filter((r) => typeof r.value === 'string' && r.value.trim().length > 0);
+  if (rows.length === 0) return null;
+  return (
+    <div className="rounded-3xl bg-emerald-500/10 ring-1 ring-emerald-400/40 p-6">
+      <div className="text-xs uppercase tracking-widest text-emerald-300/70 font-black mb-3">
+        {bank.caption || 'Bank details — always available'}
+      </div>
+      <div className="space-y-2.5">
+        {rows.map((r) => (
+          <div key={r.label} className="flex items-center justify-between gap-6">
+            <div className="text-sm font-semibold text-white/60">{r.label}</div>
+            <div className="text-lg font-black text-white tabular-nums tracking-tight">
+              {r.value}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 export default function ActiveOrderScreen({ branding, order }: Props) {
@@ -318,14 +348,22 @@ export default function ActiveOrderScreen({ branding, order }: Props) {
               <StatusPillar orderStatus={order.orderStatus} />
             </div>
 
-            <div className="rounded-3xl bg-gradient-to-br from-navy-800/80 to-navy-900/80 ring-1 ring-white/10 p-7 flex-1 flex flex-col">
-              <div className="text-xs uppercase tracking-widest text-navy-300/60 font-bold mb-2">
-                Receipt Ref
+            <div className="rounded-3xl bg-gradient-to-br from-navy-800/80 to-navy-900/80 ring-1 ring-white/10 p-7 flex-1 flex flex-col gap-5">
+              <div>
+                <div className="text-xs uppercase tracking-widest text-navy-300/60 font-bold mb-2">
+                  Receipt Ref
+                </div>
+                <div className="text-2xl font-black text-amber-400 font-mono">
+                  R-{order.orderNumber}-{now.getDate()}
+                  {String(now.getMonth() + 1).padStart(2, '0')}
+                </div>
               </div>
-              <div className="text-2xl font-black text-amber-400 font-mono mb-6">
-                R-{order.orderNumber}-{now.getDate()}
-                {String(now.getMonth() + 1).padStart(2, '0')}
-              </div>
+
+              {/* User strict rule: bank details ALWAYS visible, no matter the
+                  selected payment method. Pulls from CustomerBranding.bankDetails
+                  (manager-editable via admin portal settings → branch → bank
+                  details, stored offline on POS via settings row). */}
+              <BankDetailsPanel bank={order.bankDetails || branding.bankDetails} />
 
               <div className="mt-auto">
                 <div className="text-xs uppercase tracking-widest text-navy-300/60 font-bold mb-3">

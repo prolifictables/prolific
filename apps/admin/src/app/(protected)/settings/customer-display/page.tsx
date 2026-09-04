@@ -45,6 +45,25 @@ const DEFAULT_BRANDING = {
   branchName: '',
 };
 
+// Manager-editable bank details. Customer display always renders these NO
+// MATTER the payment method (user strict rule). Saved under the same
+// branch.customerDisplay settings object so the public unauthenticated
+// endpoint (GET /public/customer-display-settings) returns them without a
+// new route and the 30-second live poller pushes updates to open POS popups.
+interface BankDetailsForm {
+  bankName: string;
+  accountName: string;
+  accountNumber: string;
+  caption: string;
+}
+
+const DEFAULT_BANK_DETAILS: BankDetailsForm = {
+  bankName: '',
+  accountName: '',
+  accountNumber: '',
+  caption: 'Bank details for transfers',
+};
+
 // ============================================================================
 // Form state shape
 // ============================================================================
@@ -56,12 +75,14 @@ interface PromoForm {
   wifi: string;
   openingHours: string;
   branchName: string;
+  bankDetails: BankDetailsForm;
 }
 
 const DEFAULT_FORM: PromoForm = {
   promos: DEFAULT_PROMOS.map((p) => ({ ...p })),
   specials: DEFAULT_SPECIALS.map((s) => ({ ...s })),
   ...DEFAULT_BRANDING,
+  bankDetails: { ...DEFAULT_BANK_DETAILS },
 };
 
 const EMOJI_SUGGESTIONS: Record<string, string[]> = {
@@ -80,7 +101,7 @@ export default function CustomerDisplaySettingsPage() {
   const { branch } = useAuthStore();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [activeSection, setActiveSection] = useState<'promos' | 'specials' | 'branding'>('promos');
+  const [activeSection, setActiveSection] = useState<'promos' | 'specials' | 'branding' | 'banking'>('promos');
   const [form, setForm] = useState<PromoForm>(DEFAULT_FORM);
   const [previewPromoIdx, setPreviewPromoIdx] = useState(0);
 
@@ -96,6 +117,12 @@ export default function CustomerDisplaySettingsPage() {
       if (!branch?.id) throw new Error('Select a branch to manage settings');
       const raw: any = await apiGet(`/settings?branchId=${encodeURIComponent(branch.id)}`);
       const saved = raw?.data?.customerDisplay || raw?.customerDisplay || {};
+      const savedBank =
+        saved.bankDetails && typeof saved.bankDetails === 'object'
+          ? saved.bankDetails
+          : saved.bank_details && typeof saved.bank_details === 'object'
+            ? saved.bank_details
+            : null;
       setForm({
         promos: Array.isArray(saved.promos) && saved.promos.length ? saved.promos : DEFAULT_FORM.promos.map((p) => ({ ...p })),
         specials: Array.isArray(saved.specials) && saved.specials.length ? saved.specials : DEFAULT_FORM.specials.map((s) => ({ ...s })),
@@ -103,6 +130,14 @@ export default function CustomerDisplaySettingsPage() {
         wifi: typeof saved.wifi === 'string' && saved.wifi.trim() ? saved.wifi : DEFAULT_BRANDING.wifi,
         openingHours: typeof saved.openingHours === 'string' && saved.openingHours.trim() ? saved.openingHours : DEFAULT_BRANDING.openingHours,
         branchName: typeof saved.branchName === 'string' ? saved.branchName : DEFAULT_BRANDING.branchName,
+        bankDetails: {
+          bankName: typeof savedBank?.bankName === 'string' ? savedBank.bankName : DEFAULT_BANK_DETAILS.bankName,
+          accountName: typeof savedBank?.accountName === 'string' ? savedBank.accountName : DEFAULT_BANK_DETAILS.accountName,
+          accountNumber: typeof savedBank?.accountNumber === 'string' ? savedBank.accountNumber : DEFAULT_BANK_DETAILS.accountNumber,
+          caption: typeof savedBank?.caption === 'string' && savedBank.caption.trim()
+            ? savedBank.caption
+            : DEFAULT_BANK_DETAILS.caption,
+        },
       });
     } catch (err: any) {
       toast('Failed to load customer display settings', { description: err.message, variant: 'error' });
@@ -117,7 +152,15 @@ export default function CustomerDisplaySettingsPage() {
     setSaving(true);
     try {
       if (!branch?.id) throw new Error('Select a branch to save settings');
-      const customerDisplay = {
+      // Only include bankDetails in the write payload if at least one of the
+      // three core fields was filled. An all-empty object means "no bank info
+      // configured yet" → explicitly write null so the POS cache clears any
+      // previously saved copy on next poller tick.
+      const hasBank =
+        form.bankDetails.bankName.trim().length > 0 ||
+        form.bankDetails.accountName.trim().length > 0 ||
+        form.bankDetails.accountNumber.trim().length > 0;
+      const customerDisplay: any = {
         promos: form.promos,
         specials: form.specials,
         tagline: form.tagline,
@@ -125,6 +168,14 @@ export default function CustomerDisplaySettingsPage() {
         openingHours: form.openingHours,
         branchName: form.branchName || undefined,
       };
+      customerDisplay.bankDetails = hasBank
+        ? {
+            bankName: form.bankDetails.bankName.trim() || undefined,
+            accountName: form.bankDetails.accountName.trim() || undefined,
+            accountNumber: form.bankDetails.accountNumber.trim() || undefined,
+            caption: form.bankDetails.caption.trim() || undefined,
+          }
+        : null;
       // SettingsService.patchBranchSettings performs SHALLOW MERGE so this
       // replaces only the customerDisplay key, preserving other settings untouched.
       await apiPatch(`/settings?branchId=${encodeURIComponent(branch.id)}`, { customerDisplay });
@@ -140,13 +191,20 @@ export default function CustomerDisplaySettingsPage() {
     { id: 'promos' as const, label: 'Promo Carousel', icon: '🎞️', hint: `${form.promos.length} slides` },
     { id: 'specials' as const, label: "Today's Specials", icon: '⭐', hint: `${form.specials.length} items` },
     { id: 'branding' as const, label: 'Branding & Text', icon: '🏷️', hint: 'Tagline, Wi-Fi, hours' },
-  ]), [form.promos.length, form.specials.length]);
+    { id: 'banking' as const, label: 'Bank Account Details', icon: '🏦', hint: (
+      form.bankDetails.accountNumber.trim() ? 'Configured' : 'Not set'
+    ) },
+  ]), [form.promos.length, form.specials.length, form.bankDetails.accountNumber]);
 
-  const SectionHeader = ({ title, description, badge }: { title: string; description?: string; badge?: string }) => (
+  const SectionHeader = ({ title, description, badge }: { title: string; description?: React.ReactNode; badge?: string }) => (
     <div className="flex items-start justify-between gap-3 mb-4">
       <div>
         <h3 className="text-base font-bold text-slate-900">{title}</h3>
-        {description && <p className="text-sm text-slate-500 mt-0.5">{description}</p>}
+        {description && typeof description === 'string' ? (
+          <p className="text-sm text-slate-500 mt-0.5">{description}</p>
+        ) : description ? (
+          <div className="text-sm text-slate-500 mt-0.5">{description}</div>
+        ) : null}
       </div>
       {badge && <Badge variant="soft">{badge}</Badge>}
     </div>
@@ -427,6 +485,120 @@ export default function CustomerDisplaySettingsPage() {
                     onChange={(e) => setForm({ ...form, wifi: e.target.value })}
                     placeholder="Free Wi-Fi: ProlificTables_Guest"
                   />
+                </div>
+              </Card>
+            </div>
+          )}
+
+          {/* ============================================================
+              BANK DETAILS SECTION
+          ============================================================ */}
+          {activeSection === 'banking' && (
+            <div className="space-y-4">
+              <Card>
+                <CardHeader padded>
+                  <CardTitle>
+                    <SectionHeader
+                      title="Bank Account Details"
+                      description={
+                        <>
+                          Customer display ALWAYS shows these regardless of the selected payment method
+                          (CASH, card terminal, or bank transfer). Visible on both the live cart preview
+                          and the post-payment thank-you screen so customers always know how to pay.
+                        </>
+                      }
+                      badge={
+                        form.bankDetails.bankName.trim() ||
+                        form.bankDetails.accountName.trim() ||
+                        form.bankDetails.accountNumber.trim()
+                          ? 'Active'
+                          : 'Not configured'
+                      }
+                    />
+                  </CardTitle>
+                </CardHeader>
+                <div className="px-5 pb-5 space-y-4">
+                  <Input
+                    label="Bank name"
+                    value={form.bankDetails.bankName}
+                    onChange={(e) => setForm({
+                      ...form,
+                      bankDetails: { ...form.bankDetails, bankName: e.target.value },
+                    })}
+                    placeholder="e.g. Access Bank, UBA, First Bank, Fidelity, Zenith"
+                    maxLength={80}
+                    description="Shown on customer display as the destination bank for transfers."
+                  />
+                  <Input
+                    label="Account name"
+                    value={form.bankDetails.accountName}
+                    onChange={(e) => setForm({
+                      ...form,
+                      bankDetails: { ...form.bankDetails, accountName: e.target.value },
+                    })}
+                    placeholder="e.g. Prolific Tables Limited"
+                    maxLength={120}
+                    description="Legal account holder name that appears on the bank statement."
+                  />
+                  <Input
+                    label="Account number"
+                    value={form.bankDetails.accountNumber}
+                    onChange={(e) => setForm({
+                      ...form,
+                      bankDetails: { ...form.bankDetails, accountNumber: e.target.value },
+                    })}
+                    placeholder="e.g. 1234567890"
+                    maxLength={20}
+                    description="Shown prominently in tabular-nums font so customers can easily transcribe it."
+                  />
+                  <Textarea
+                    label="Caption (optional)"
+                    rows={1}
+                    maxLength={80}
+                    value={form.bankDetails.caption}
+                    onChange={(e) => setForm({
+                      ...form,
+                      bankDetails: { ...form.bankDetails, caption: e.target.value },
+                    })}
+                    placeholder="Bank details for transfers"
+                    description="Short label shown above the bank details block (e.g. 'Bank details — always available')."
+                  />
+
+                  {/* Live preview of how it looks on the customer display thank-you screen */}
+                  <div className="mt-5">
+                    <div className="text-xs uppercase tracking-widest text-slate-400 font-black mb-2">
+                      Preview — Thank-You Screen Block
+                    </div>
+                    <div className="rounded-3xl bg-white shadow-2xl p-6 text-left ring-1 ring-slate-200">
+                      <div className="text-xs uppercase tracking-widest text-slate-400 font-black mb-3">
+                        {form.bankDetails.caption.trim() || 'Bank details for transfers'}
+                      </div>
+                      {(form.bankDetails.bankName.trim() ||
+                        form.bankDetails.accountName.trim() ||
+                        form.bankDetails.accountNumber.trim()) ? (
+                        <div className="space-y-2.5">
+                          {[
+                            { label: 'Bank', value: form.bankDetails.bankName.trim() || undefined },
+                            { label: 'Account name', value: form.bankDetails.accountName.trim() || undefined },
+                            { label: 'Account number', value: form.bankDetails.accountNumber.trim() || undefined },
+                          ]
+                            .filter((r) => typeof r.value === 'string')
+                            .map((r) => (
+                              <div key={r.label} className="flex items-center justify-between gap-6">
+                                <div className="text-sm font-semibold text-slate-500">{r.label}</div>
+                                <div className="text-base font-black text-slate-900 tabular-nums tracking-tight">
+                                  {r.value}
+                                </div>
+                              </div>
+                            ))}
+                        </div>
+                      ) : (
+                        <div className="text-sm text-slate-400 italic">
+                          No bank details configured yet — fill in the fields above to see a preview.
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </Card>
             </div>

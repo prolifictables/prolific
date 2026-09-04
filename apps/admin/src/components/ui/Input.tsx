@@ -60,10 +60,11 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
 export interface TextareaProps extends TextareaHTMLAttributes<HTMLTextAreaElement> {
   label?: string;
   error?: string;
+  description?: string;
 }
 
 export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(function Textarea(
-  { className, label, error, id, rows = 4, ...rest },
+  { className, label, error, id, rows = 4, description, ...rest },
   ref
 ) {
   const inputId = id || rest.name;
@@ -89,6 +90,9 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(function 
         )}
         {...rest}
       />
+      {description && !error && (
+        <p className="mt-1.5 text-xs text-slate-500">{description}</p>
+      )}
       {error && <p className="mt-1.5 text-xs text-red-500">{error}</p>}
     </div>
   );

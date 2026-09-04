@@ -14,8 +14,23 @@ export class SyncQueueRepository {
 
   push(row: Partial<SyncQueueRow> & { op_id: string }): number {
     const now = Date.now();
+    // Pre-check: if the same op_id already exists in sync_queue, treat the
+    // push as idempotent and return the existing row's INTEGER id instead of
+    // throwing. Why: migrations v24 L634 declares op_id TEXT UNIQUE. The
+    // PaymentModal handler always pushes `op_id: order_${orderId}`. If this
+    // handler runs twice (StrictMode double-invoke, user double-click on
+    // confirm button, restarted POS while the offline queue still holds the
+    // row as QUEUED), the plain INSERT throws SQLITE_CONSTRAINT_UNIQUE →
+    // PaymentModal's catch block fires the generic toast "Payment not
+    // recorded. Try again." even though the order + payments rows were
+    // already persisted successfully.
+    const exists = this.db.get<{ id: number }>(
+      'SELECT id FROM sync_queue WHERE op_id = ? LIMIT 1',
+      row.op_id
+    );
+    if (exists && typeof exists.id === 'number') return exists.id;
     const result = this.db.run(
-      `INSERT INTO sync_queue (
+      `INSERT OR IGNORE INTO sync_queue (
         op_id, entity_type, operation, entity_id, payload, idempotency_key,
         local_entity_version, status, attempts, error_message, next_attempt_at,
         created_at, claimed_at, completed_at
@@ -33,7 +48,18 @@ export class SyncQueueRepository {
       row.next_attempt_at ?? null,
       now
     );
-    return result.lastInsertRowid as number;
+    // Fallthrough: INSERT OR IGNORE inserted 0 rows because op_id arrived
+    // after our pre-check SELECT but before the insert (race). Re-read the
+    // existing row so we always return a valid integer id regardless.
+    if (result && typeof result.lastInsertRowid === 'number' && (result.changes ?? 1) > 0) {
+      return result.lastInsertRowid as number;
+    }
+    const fallback = this.db.get<{ id: number }>(
+      'SELECT id FROM sync_queue WHERE op_id = ? LIMIT 1',
+      row.op_id
+    );
+    if (fallback && typeof fallback.id === 'number') return fallback.id;
+    return 0;
   }
 
   peek(status = 'QUEUED', limit = 10): SyncQueueRow[] {

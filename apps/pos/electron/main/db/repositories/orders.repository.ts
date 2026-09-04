@@ -149,8 +149,12 @@ export class OrdersRepository {
   }
 
   addItem(orderId: string, itemRow: Partial<OrderItemRow> & { id: string }): void {
+    // INSERT OR IGNORE so repeated calls for the same lineId are safe (double
+    // click on confirm, StrictMode double-invoke, …). order_items.id is the
+    // PRIMARY KEY (migrations.ts L460) so a duplicate INSERT used to throw a
+    // "NOT NULL constraint" → PaymentModal catch fires "Payment not recorded".
     this.db.run(
-      `INSERT INTO order_items (
+      `INSERT OR IGNORE INTO order_items (
         id, order_id, menu_item_id, name_snapshot, price_snapshot_cents,
         quantity, subtotal_cents, tax_cents, discount_cents, total_cents,
         special_instructions, preparation_status
@@ -311,17 +315,39 @@ export class OrderItemModifierOptionsRepository {
 
   bulkInsert(items: (Partial<OrderItemModifierOptionRow> & { id: string })[]): void {
     if (items.length === 0) return;
-    const stmt = this.db['prepare'](`
-      INSERT INTO order_item_modifier_options (
+    // INSERT OR IGNORE: the primary key idempotency (same pattern as orders +
+    // payments + sync_queue: if PaymentModal runs twice the rows were already
+    // written, skip silently. Without this, a double click would throw a
+    // SQLite PRIMARY KEY constraint "UNIQUE" → generic PaymentModal toast.
+    const stmt = this.db['prepare'] ? this.db['prepare'](`
+      INSERT OR IGNORE INTO order_item_modifier_options (
         id, order_item_id, modifier_id, modifier_name, option_id,
         option_name, price_delta_cents
       ) VALUES (
         @id, @order_item_id, @modifier_id, @modifier_name, @option_id,
         @option_name, @price_delta_cents
       )
-    `);
+    `) : null;
     this.db.transaction(() => {
-      for (const item of items) stmt.run(item);
+      if (stmt) {
+        for (const item of items) stmt.run(item);
+      } else {
+        for (const item of items) {
+          this.db.run(
+            `INSERT OR IGNORE INTO order_item_modifier_options (
+              id, order_item_id, modifier_id, modifier_name, option_id,
+              option_name, price_delta_cents
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            item.id,
+            item.order_item_id,
+            item.modifier_id,
+            item.modifier_name,
+            item.option_id,
+            item.option_name,
+            item.price_delta_cents
+          );
+        }
+      }
     })();
   }
 }
