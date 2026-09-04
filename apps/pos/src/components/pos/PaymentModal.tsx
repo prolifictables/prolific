@@ -127,6 +127,20 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         customer_phone: customer?.phone ? String(customer.phone) : null,
         customer_email: customer?.email ? String(customer.email) : null,
         employee_id: employee?.id ?? null,
+        // Denormalized cashier name snapshot so every printed receipt shows
+        // "Cashier: …" in the header even when viewed offline or on a
+        // different device. Builds from employee.name first, falling back to
+        // firstName + lastName if name isn't provided.
+        cashier_name:
+          (employee?.name && String(employee.name).trim()) ||
+          (employee?.firstName || employee?.lastName
+            ? `${String(employee.firstName || '')} ${String(employee.lastName || '')}`.trim()
+            : null),
+        employee_name:
+          (employee?.name && String(employee.name).trim()) ||
+          (employee?.firstName || employee?.lastName
+            ? `${String(employee.firstName || '')} ${String(employee.lastName || '')}`.trim()
+            : null),
         shift_id: shiftId,
         held_by: null,
         held_at: null,

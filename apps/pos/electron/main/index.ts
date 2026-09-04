@@ -546,39 +546,58 @@ function registerPrintHandlers(): void {
       const itemMods = modifiers.filter((m: any) => String(m.order_item_id) === String(it.id));
       const special = (it?.special_instructions ?? it?.specialInstructions ?? '').toString().trim();
       let rows = `
-        <div class="row">
-          <div class="left">${escapeHtml(name)} × ${qty}</div>
-          <div class="right">${escapeHtml(ngn(total))}</div>
+        <div class="grid item">
+          <div class="cell qty center">${escapeHtml(String(qty))}</div>
+          <div class="cell name">${escapeHtml(name)}</div>
+          <div class="cell price right">${escapeHtml(ngn(total))}</div>
         </div>`;
       if (unitCents > 0 && qty > 1) {
-        rows += `<div class="small left pad4 muted">@ ${escapeHtml(ngn(unitCents))} each</div>`;
+        rows += `<div class="grid small muted">
+          <div class="cell qty"></div>
+          <div class="cell name">@ ${escapeHtml(ngn(unitCents))} each</div>
+          <div class="cell price right"></div>
+        </div>`;
       }
       if (itemMods && itemMods.length) {
         for (const m of itemMods) {
-          rows += `<div class="small left pad4 muted">+ ${escapeHtml((m.modifier_name || '') + ': ' + (m.option_name || ''))}</div>`;
+          rows += `<div class="grid small muted">
+            <div class="cell qty"></div>
+            <div class="cell name">+ ${escapeHtml((m.modifier_name || '') + ': ' + (m.option_name || ''))}</div>
+            <div class="cell price right"></div>
+          </div>`;
         }
       }
       if (special) {
-        rows += `<div class="small left pad4 muted note">Note: ${escapeHtml(special)}</div>`;
+        rows += `<div class="grid small note">
+          <div class="cell qty"></div>
+          <div class="cell name">※ ${escapeHtml(special)}</div>
+          <div class="cell price right"></div>
+        </div>`;
       }
       return rows;
     };
 
     const header = `
-      <div class="center">${escapeHtml(hdr.line1)}</div>
+      <div class="center brand">${escapeHtml(hdr.line1)}</div>
       <div class="center small muted">${escapeHtml(hdr.line2)}</div>
       <div class="line"></div>
       <div class="center title">${escapeHtml(meta.title)}</div>
       <div class="center small muted">Copy ${meta.copyIndex + 1} of ${meta.totalCopies}</div>
-      <div class="row small">
-        <div class="left muted">Date</div>
-        <div class="right">${escapeHtml(createdAt.toLocaleString())}</div>
+      <div class="grid">
+        <div class="cell muted">Date</div><div class="cell right">${escapeHtml(createdAt.toLocaleString())}</div>
+        ${orderNo ? `<div class="cell muted">Order</div><div class="cell right mono">${escapeHtml(orderNo)}</div>` : ''}
+        ${order?.order_type ? `<div class="cell muted">Type</div><div class="cell right">${escapeHtml(String(order.order_type).replace(/_/g, ' '))}</div>` : ''}
+        ${order?.customer_name ? `<div class="cell muted">Customer</div><div class="cell right">${escapeHtml(order.customer_name)}</div>` : ''}
+        ${order?.table_id && order?.table_name ? `<div class="cell muted">Table</div><div class="cell right">${escapeHtml(order.table_name)}</div>` : ''}
+        ${order?.cashier_name ? `<div class="cell muted">Cashier</div><div class="cell right">${escapeHtml(order.cashier_name)}</div>` : (order?.employee_name ? `<div class="cell muted">Cashier</div><div class="cell right">${escapeHtml(order.employee_name)}</div>` : '')}
       </div>
-      ${orderNo ? `<div class="row small"><div class="left muted">Order</div><div class="right">${escapeHtml(orderNo)}</div></div>` : ''}
-      ${order?.order_type ? `<div class="row small"><div class="left muted">Type</div><div class="right">${escapeHtml(String(order.order_type).replace(/_/g, ' '))}</div></div>` : ''}
-      ${order?.customer_name ? `<div class="row small"><div class="left muted">Customer</div><div class="right">${escapeHtml(order.customer_name)}</div></div>` : ''}
-      ${order?.table_id && order?.table_name ? `<div class="row small"><div class="left muted">Table</div><div class="right">${escapeHtml(order.table_name)}</div></div>` : ''}
       <div class="line"></div>
+      <div class="grid head small muted">
+        <div class="cell qty">Qty</div>
+        <div class="cell name">Item</div>
+        <div class="cell price right">Price</div>
+      </div>
+      <div class="line thin"></div>
     `;
 
     const bodyLines = items.length
@@ -586,35 +605,35 @@ function registerPrintHandlers(): void {
       : `<div class="center small muted">No item details available</div>`;
 
     // Totals block: subtotal → discounts → taxes → tips → total.
-    const totalsParts: string[] = [];
-    totalsParts.push(`<div class="row"><div class="left">Subtotal</div><div class="right">${escapeHtml(ngn(subtotalCents))}</div></div>`);
+    const totalsParts: string[] = [`<div class="line thin"></div>`];
+    totalsParts.push(`<div class="grid total"><div class="cell left">Subtotal</div><div class="cell right">${escapeHtml(ngn(subtotalCents))}</div></div>`);
     if (discountCents > 0) {
-      totalsParts.push(`<div class="row"><div class="left">Discount</div><div class="right">-${escapeHtml(ngn(discountCents))}</div></div>`);
+      totalsParts.push(`<div class="grid total"><div class="cell left">Discount</div><div class="cell right">−${escapeHtml(ngn(discountCents))}</div></div>`);
     }
     if (taxCents > 0) {
-      totalsParts.push(`<div class="row"><div class="left">Tax</div><div class="right">${escapeHtml(ngn(taxCents))}</div></div>`);
+      totalsParts.push(`<div class="grid total"><div class="cell left">Tax</div><div class="cell right">${escapeHtml(ngn(taxCents))}</div></div>`);
     }
     if (tipCents > 0) {
-      totalsParts.push(`<div class="row"><div class="left">Tip</div><div class="right">${escapeHtml(ngn(tipCents))}</div></div>`);
+      totalsParts.push(`<div class="grid total"><div class="cell left">Tip</div><div class="cell right">${escapeHtml(ngn(tipCents))}</div></div>`);
     }
-    totalsParts.push(`<div class="line"></div><div class="row bold big"><div class="left">TOTAL</div><div class="right">${escapeHtml(ngn(totalCents))}</div></div>`);
+    totalsParts.push(`<div class="line"></div><div class="grid total big bold"><div class="cell left">TOTAL</div><div class="cell right">${escapeHtml(ngn(totalCents))}</div></div>`);
 
     // Payment method breakdown (useful when split-bill or cashier wants to verify tender/change).
     if (payments && payments.length) {
-      totalsParts.push(`<div class="line"></div><div class="small muted left">Payments</div>`);
+      totalsParts.push(`<div class="line"></div><div class="small muted">Payments</div>`);
       for (const p of payments) {
         const method = (p?.method || p?.payment_method || 'UNKNOWN').toString().replace(/_/g, ' ');
         const paid = Number(p?.amount_cents ?? p?.amountCents ?? 0);
-        totalsParts.push(`<div class="row small"><div class="left">${escapeHtml(method)}</div><div class="right">${escapeHtml(ngn(paid))}</div></div>`);
+        totalsParts.push(`<div class="grid total small"><div class="cell left">${escapeHtml(method)}</div><div class="cell right">${escapeHtml(ngn(paid))}</div></div>`);
         // For cash payments show tendered + change if available.
         if ((p?.method === 'CASH' || p?.payment_method === 'CASH') && changeDueCents > 0) {
           const tendered = paid + changeDueCents;
-          totalsParts.push(`<div class="row small pad4"><div class="left muted">Tendered</div><div class="right">${escapeHtml(ngn(tendered))}</div></div>`);
-          totalsParts.push(`<div class="row small pad4"><div class="left muted">Change</div><div class="right">${escapeHtml(ngn(changeDueCents))}</div></div>`);
+          totalsParts.push(`<div class="grid total small muted"><div class="cell left">Tendered</div><div class="cell right">${escapeHtml(ngn(tendered))}</div></div>`);
+          totalsParts.push(`<div class="grid total small muted"><div class="cell left">Change</div><div class="cell right">${escapeHtml(ngn(changeDueCents))}</div></div>`);
         }
       }
     }
-    totalsParts.push(`<div class="row bold"><div class="left">Paid</div><div class="right">${isPaid ? 'YES' : 'NO'}</div></div>`);
+    totalsParts.push(`<div class="grid total bold"><div class="cell left">Paid</div><div class="cell right">${isPaid ? 'YES' : 'NO'}</div></div>`);
 
     const footer = `
       <div class="line"></div>
@@ -628,28 +647,173 @@ function registerPrintHandlers(): void {
       <html>
         <head>
           <meta charset="utf-8" />
+          <title>${escapeHtml(meta.title || 'Receipt')}</title>
           <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif; font-size: 12px; margin: 0; padding: 12px; color: #000; }
-            .title { font-size: 14px; font-weight: 800; margin-top: 4px; }
-            .big { font-size: 14px; }
+            /* ----- Screen/preview styles ----- */
+            html, body { margin: 0; padding: 0; background: #fff; color: #000; }
+            html { box-sizing: border-box; }
+            * { box-sizing: inherit; }
+            :root {
+              /* 80mm paper has ~72–76mm printable area depending on printer margins.
+                 We use 74mm as the safe default and let the @page rules size the paper. */
+              --paper-width: 74mm;
+              --font-stack: 'Courier New', Courier, 'DejaVu Sans Mono', Consolas, monospace,
+                            -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+              --body-size: 11px;
+              --body-lh: 1.35;
+              --small-size: 10px;
+              --small-lh: 1.35;
+            }
+            body {
+              width: var(--paper-width);
+              margin: 0 auto;
+              padding: 3mm 3mm 4mm 3mm;
+              font-family: var(--font-stack);
+              font-size: var(--body-size);
+              line-height: var(--body-lh);
+              font-weight: 500;
+              -webkit-font-smoothing: antialiased;
+              color: #000;
+              background: #fff;
+              word-wrap: break-word;
+              overflow-wrap: break-word;
+            }
+            .brand {
+              font-size: 13px;
+              font-weight: 800;
+              letter-spacing: 0.02em;
+              line-height: 1.25;
+            }
+            .title {
+              font-size: 12px;
+              font-weight: 800;
+              margin: 2px 0 0 0;
+              text-transform: uppercase;
+              letter-spacing: 0.12em;
+            }
+            .big { font-size: 13px; }
             .bold { font-weight: 800; }
             .center { text-align: center; }
-            .small { font-size: 11px; }
-            .muted { color: #333; }
-            .note { color: #111; font-style: italic; }
-            .row { display: flex; justify-content: space-between; gap: 10px; margin: 4px 0; }
-            .left { flex: 1 1 auto; }
-            .right { flex: 0 0 auto; text-align: right; white-space: nowrap; }
-            .pad4 { padding-left: 8px; }
-            .line { border-top: 1px dashed #000; margin: 10px 0; }
-            .big-gap > div { margin: 6px 0; }
+            .right { text-align: right; }
+            .small { font-size: var(--small-size); line-height: var(--small-lh); }
+            .muted { color: #111; opacity: 0.75; }
+            .note { color: #000; font-style: italic; }
+            .mono { font-family: 'Courier New', Courier, monospace; }
+
+            /* Two-column info grid (label : value). */
+            .grid {
+              display: grid;
+              grid-template-columns: 24mm 1fr;
+              column-gap: 2mm;
+              row-gap: 1px;
+              align-items: start;
+            }
+            /* Totals two-column grid: left-label | right-amount. */
+            .grid.total {
+              grid-template-columns: 1fr auto;
+              column-gap: 2mm;
+            }
+            .grid.total .cell.right,
+            .grid.total .cell.left { align-self: start; }
+            /* Items three-column grid: qty | name | price.
+               Columns add up to ~var(--paper-width) minus 6mm horizontal padding so
+               74mm paper - 6mm padding = 68mm usable width.
+               qty = 10mm, price = 17mm, gap = 2mm, name = 100% (fills). */
+            .grid.item,
+            .grid.head {
+              grid-template-columns: 10mm 1fr 17mm;
+              column-gap: 1.5mm;
+              align-items: start;
+            }
+            .grid .cell.qty { width: 10mm; }
+            .grid .cell.price { width: 17mm; }
+            .grid .cell.name {
+              width: 100%;
+              min-width: 0;        /* critical: enables overflow-wrap inside grid */
+              overflow-wrap: break-word;
+              word-wrap: break-word;
+              hyphens: manual;
+            }
+            .grid .cell { display: block; min-width: 0; }
+            .grid .cell.left { justify-self: start; }
+            .grid .cell.right { justify-self: end; }
+
+            .line {
+              border-top: 1px dashed #000;
+              margin: 3mm 0;
+            }
+            .line.thin {
+              border-top: 1px dotted #000;
+              margin: 1.5mm 0;
+              opacity: 0.8;
+            }
+
+            /* ----- Thermal print styles ----- */
+            @page {
+              /* size: 80mm width and AUTO height so paper cuts dynamically
+                 instead of forcing A4/Letter. */
+              size: 80mm auto;
+              margin: 0;
+            }
+            @media print {
+              html, body { background: #fff !important; }
+              body {
+                /* Remove any preview padding; @page margin=0 + controlled body padding
+                   keeps the receipt centered on 80mm paper. */
+                width: 74mm;
+                max-width: 74mm;
+                margin: 0 auto !important;
+                padding: 3mm 3mm 3mm 3mm !important;
+                font-family: var(--font-stack) !important;
+                font-size: var(--body-size) !important;
+                line-height: var(--body-lh) !important;
+                color: #000 !important;
+                background: #fff !important;
+              }
+              /* Kill browser chrome: headers, footers, url strings, etc. */
+              @page { margin: 0; size: 80mm auto; }
+              /* Chrome/Chromium default margins on some Linux/Windows builds. */
+              @page :first { margin: 0; }
+              @page :left  { margin: 0; }
+              @page :right { margin: 0; }
+
+              /* Prevent any elements outside the receipt body from leaking onto paper. */
+              body > * { visibility: hidden; }
+              body { visibility: visible; }
+              body > * { visibility: visible; }
+
+              /* Prevent blank trailing pages + avoid page breaks inside rows. */
+              html, body {
+                height: auto !important;
+                min-height: auto !important;
+                max-height: none !important;
+              }
+              .grid, .line, .center, .bold, .big, .brand, .title, .small {
+                page-break-inside: avoid;
+                break-inside: avoid;
+              }
+              .grid.item {
+                page-break-inside: auto;      /* long names can wrap across rows but */
+                break-inside: auto;           /* individual grid cells stay together */
+              }
+              .grid .cell { page-break-inside: avoid; break-inside: avoid; }
+
+              /* Avoid orphans at top/bottom of a page. */
+              body { orphans: 2; widows: 2; }
+
+              /* Ensure no scrollbars/extra background. */
+              * {
+                background: transparent !important;
+                color: #000 !important;
+                box-shadow: none !important;
+                text-shadow: none !important;
+              }
+            }
           </style>
         </head>
         <body>
           ${header}
-          <div class="big-gap">
-            ${bodyLines}
-          </div>
+          ${bodyLines}
           ${totalsParts.join('')}
           ${footer}
         </body>
@@ -674,7 +838,7 @@ function registerPrintHandlers(): void {
       const itemMods = modifiers.filter((m: any) => String(m.order_item_id) === String(it.id));
       rows.push(`
         <div class="kitem">
-          <div class="kqty">${qty}×</div>
+          <div class="kqty">${escapeHtml(String(qty))}×</div>
           <div class="kname">${escapeHtml(name)}</div>
         </div>
       `);
@@ -693,33 +857,104 @@ function registerPrintHandlers(): void {
       <html>
         <head>
           <meta charset="utf-8" />
+          <title>KITCHEN TICKET ${escapeHtml(orderNo || '')}</title>
           <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif; font-size: 13px; margin: 0; padding: 12px; color: #000; }
-            h1 { font-size: 18px; font-weight: 900; text-align: center; margin: 0 0 2px; letter-spacing: 0.14em; }
-            h2 { font-size: 15px; font-weight: 800; text-align: center; margin: 0 0 6px; }
-            .row { display: flex; justify-content: space-between; gap: 10px; margin: 2px 0; }
-            .left { flex: 1 1 auto; }
-            .right { flex: 0 0 auto; text-align: right; white-space: nowrap; font-weight: 700; }
-            .line { border-top: 2px dashed #000; margin: 10px 0; }
+            html, body { margin: 0; padding: 0; background: #fff; color: #000; }
+            html { box-sizing: border-box; }
+            * { box-sizing: inherit; }
+            :root {
+              --paper-width: 74mm;
+              --font-stack: 'Courier New', Courier, 'DejaVu Sans Mono', Consolas, monospace,
+                            -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+              --body-size: 12px;
+              --body-lh: 1.35;
+              --small-size: 11px;
+            }
+            body {
+              width: var(--paper-width);
+              margin: 0 auto;
+              padding: 3mm 3mm 4mm 3mm;
+              font-family: var(--font-stack);
+              font-size: var(--body-size);
+              line-height: var(--body-lh);
+              font-weight: 600;
+              -webkit-font-smoothing: antialiased;
+              color: #000;
+              background: #fff;
+              word-wrap: break-word;
+              overflow-wrap: break-word;
+            }
+            h1 {
+              font-size: 16px;
+              font-weight: 900;
+              text-align: center;
+              margin: 0 0 2px;
+              letter-spacing: 0.14em;
+              text-transform: uppercase;
+            }
+            h2 {
+              font-size: 13px;
+              font-weight: 800;
+              text-align: center;
+              margin: 0 0 6px;
+            }
+            .row {
+              display: grid;
+              grid-template-columns: 24mm 1fr;
+              column-gap: 2mm;
+              row-gap: 1px;
+              align-items: start;
+              margin: 1px 0;
+            }
+            .row > *:first-child { justify-self: start; }
+            .row > *:last-child  { justify-self: end; text-align: right; font-weight: 700; }
+            .line { border-top: 2px dashed #000; margin: 3mm 0; }
             .center { text-align: center; }
-            .kitem { display: flex; gap: 8px; margin: 8px 0 2px; }
-            .kqty { flex: 0 0 auto; font-weight: 900; font-size: 16px; }
-            .kname { flex: 1 1 auto; font-weight: 800; font-size: 15px; }
-            .kmod { padding-left: 28px; font-size: 12px; color: #222; }
+            .kitem { display: grid; grid-template-columns: 10mm 1fr; column-gap: 2mm; margin: 6px 0 2px; align-items: start; }
+            .kqty { font-weight: 900; font-size: 16px; text-align: center; }
+            .kname { font-weight: 800; font-size: 14px; word-wrap: break-word; overflow-wrap: break-word; }
+            .kmod { padding-left: 12mm; font-size: var(--small-size); color: #111; word-wrap: break-word; overflow-wrap: break-word; }
             .note { font-style: italic; color: #111; }
-            .small { font-size: 11px; color: #333; }
+            .small { font-size: var(--small-size); color: #222; opacity: 0.85; }
+
+            @page { size: 80mm auto; margin: 0; }
+            @media print {
+              html, body { background: #fff !important; }
+              body {
+                width: 74mm;
+                max-width: 74mm;
+                margin: 0 auto !important;
+                padding: 3mm 3mm 3mm 3mm !important;
+                font-family: var(--font-stack) !important;
+                font-size: var(--body-size) !important;
+                line-height: var(--body-lh) !important;
+                color: #000 !important;
+                background: #fff !important;
+              }
+              @page { margin: 0; size: 80mm auto; }
+              @page :first { margin: 0; }
+              @page :left  { margin: 0; }
+              @page :right { margin: 0; }
+              body > * { visibility: hidden; }
+              body { visibility: visible; }
+              body > * { visibility: visible; }
+              html, body { height: auto !important; min-height: auto !important; max-height: none !important; }
+              h1, h2, .row, .line, .center, .kitem, .kmod, .note, .small { page-break-inside: avoid; break-inside: avoid; }
+              body { orphans: 2; widows: 2; }
+              * { background: transparent !important; color: #000 !important; box-shadow: none !important; text-shadow: none !important; }
+            }
           </style>
         </head>
         <body>
           <h1>KITCHEN TICKET</h1>
           <h2>${escapeHtml(hdr.line1)}</h2>
           <div class="line"></div>
-          <div class="row"><div class="left">Order</div><div class="right">${escapeHtml(orderNo)}</div></div>
-          <div class="row"><div class="left">Time</div><div class="right">${escapeHtml(createdAt.toLocaleString())}</div></div>
-          ${order?.table_id && order?.table_name ? `<div class="row"><div class="left">Table</div><div class="right">${escapeHtml(order.table_name)}</div></div>` : ''}
-          ${order?.order_type ? `<div class="row"><div class="left">Type</div><div class="right">${escapeHtml(String(order.order_type).replace(/_/g, ' '))}</div></div>` : ''}
-          ${order?.customer_name ? `<div class="row"><div class="left">Customer</div><div class="right">${escapeHtml(order.customer_name)}</div></div>` : ''}
-          ${order?.note ? `<div class="row"><div class="left">Note</div><div class="right">${escapeHtml(order.note)}</div></div>` : ''}
+          <div class="row"><span>Order</span><span>${escapeHtml(orderNo)}</span></div>
+          <div class="row"><span>Time</span><span>${escapeHtml(createdAt.toLocaleString())}</span></div>
+          ${order?.table_id && order?.table_name ? `<div class="row"><span>Table</span><span>${escapeHtml(order.table_name)}</span></div>` : ''}
+          ${order?.order_type ? `<div class="row"><span>Type</span><span>${escapeHtml(String(order.order_type).replace(/_/g, ' '))}</span></div>` : ''}
+          ${order?.customer_name ? `<div class="row"><span>Customer</span><span>${escapeHtml(order.customer_name)}</span></div>` : ''}
+          ${order?.note ? `<div class="row"><span>Note</span><span>${escapeHtml(order.note)}</span></div>` : ''}
           <div class="line"></div>
           ${rows.join('')}
           <div class="line"></div>

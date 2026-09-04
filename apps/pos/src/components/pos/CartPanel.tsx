@@ -152,7 +152,7 @@ export default function CartPanel() {
       const orderNumber = '#' + (10000 + Math.floor(Math.random() * 90000)).toString();
       const normalizedOrderType = orderType === 'TAKEOUT' ? 'TAKEAWAY' : orderType;
 
-      const orderRow = {
+      const orderRow: any = {
         id: orderId,
         branch_id: branch?.id ?? null,
         restaurant_id: restaurant?.id ?? null,
@@ -164,6 +164,18 @@ export default function CartPanel() {
         customer_id: null,
         customer_name: tableName ?? null,
         employee_id: employee?.id ?? null,
+        // Denormalized cashier name snapshot so held → later-paid receipts
+        // print "Cashier: …" in header even after original creator logs out.
+        cashier_name:
+          (employee?.name && String(employee.name).trim()) ||
+          (employee?.firstName || employee?.lastName
+            ? `${String(employee.firstName || '')} ${String(employee.lastName || '')}`.trim()
+            : null),
+        employee_name:
+          (employee?.name && String(employee.name).trim()) ||
+          (employee?.firstName || employee?.lastName
+            ? `${String(employee.firstName || '')} ${String(employee.lastName || '')}`.trim()
+            : null),
         held_by: employee?.id ?? null,
         held_at: now,
         status: 'ON_HOLD',

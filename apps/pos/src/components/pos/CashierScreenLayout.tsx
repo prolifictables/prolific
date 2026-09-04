@@ -140,6 +140,22 @@ export default function CashierScreenLayout() {
 
   const [showShiftModal, setShowShiftModal] = useState<'OPEN' | 'CLOSE' | null>(null);
   const [shiftLoaded, setShiftLoaded] = useState(false);
+  // PRIORITY guard: ensure the "Open Shift" dialog is NEVER re-prompted
+  // while a shift is still OPEN, even if React StrictMode double-invokes
+  // effects, or shiftRestore re-runs because of JWT refresh / branch
+  // change re-mounting the component.
+  //
+  // Rules enforced by this ref:
+  //   (A) ONE auto-prompt maximum per POS session (until app is quit).
+  //   (B) If the user explicitly closes a shift and walks away, they must
+  //       manually tap "Open Shift" from the Shift tab / header pill —
+  //       the modal no longer surprises them on re-render / reconnect.
+  //   (C) ALWAYS superseded by openShift.shiftId presence: even if the ref
+  //       was reset somehow, if a shift is open we don't prompt.
+  const promptedOpenThisSessionRef = useRef(false);
+  const markOpenShiftPrompted = () => { promptedOpenThisSessionRef.current = true; };
+  // Expose for the ShiftModal OPEN-mode onDone callback — see below where we
+  // call this after onDone to prevent post-race StrictMode double re-prompts.
   const [toast, setToast] = useState<string | null>(null);
 
   // --- Mark-as-Paid modal state (for QR table "Pay at Counter" and Website
@@ -711,6 +727,45 @@ export default function CashierScreenLayout() {
             openedAt: openedMs,
             openingCashCents: openingCents,
           });
+        } else {
+          // -----------------------------------------------------------------
+          // PRIORITY: Prompt for a NEW shift ONLY IF:
+          //   (1) the session hasn't already shown the open-shift prompt this
+          //       session (defeats StrictMode double-invoke + JWT re-mounts),
+          //   (2) there is still NO open shift on this device / employee
+          //       after we just finished getOpen queries above (not just
+          //       "!openShift.shiftId" — effect order / stale closures can
+          //       make state lag),
+          //   (3) React state openShift still has a null shiftId after the
+          //       microtask yield in case a concurrent setState above raced.
+          // If any check fails → SILENTLY skip; the attendant can still tap
+          // "Open Shift" in the 🕒 SHIFT sidebar tab or the header pill.
+          // -----------------------------------------------------------------
+          if (!promptedOpenThisSessionRef.current) {
+            // Mark PROMPTED synchronously *before* the async guard so if
+            // StrictMode re-runs the effect body twice in the same tick we
+            // still only show ONE open-shift modal prompt.
+            promptedOpenThisSessionRef.current = true;
+            // Final cross-check with the repo again (covers getOpen race):
+            let stillNoOpen = true;
+            try {
+              const recheck: any = await window.electronAPI?.db?.shifts?.getOpen?.(
+                deviceId
+                  ? { deviceId } as any
+                  : { employeeId: eid, branchId: bid, restaurantId: rid } as any
+              );
+              if (recheck && (recheck.id || recheck.shiftId)) stillNoOpen = false;
+            } catch { /* ignore — default to "do not prompt" safe path. */ stillNoOpen = false; }
+            if (stillNoOpen) {
+              setOpenShift((curr) => {
+                if (curr.shiftId) return curr; // state was already set above → no prompt
+                // Queue the modal show AFTER this setState commit so React
+                // batches it with the shiftLoaded flag below.
+                queueMicrotask(() => setShowShiftModal('OPEN'));
+                return curr;
+              });
+            }
+          }
         }
       } catch (e) {
         console.warn('[pos] shift restore failed', e);
@@ -723,17 +778,36 @@ export default function CashierScreenLayout() {
     };
   }, [employee?.id, branch?.id, restaurant?.id]);
 
-  useEffect(() => {
-    if (!shiftLoaded) return;
-    // Only prompt to open a NEW shift if there is truly no active OPEN shift
-    // already on record. If the user already has a shift open (surviving a
-    // refresh or a logout → login), we keep using that shift until they
-    // explicitly end it via the CLOSE modal.
+  // --------------------------------------------------------------
+  // DEFENSIVE WRAPPERS for the two places that can set showShiftModal:
+  //   (A) Header pill click (user action → use wrapper below)
+  //   (B) Sidebar 🕒 SHIFT tab buttons (shift tab uses disabled guards
+  //       which are good, but still wrap).
+  // These wrappers never allow the modal mode that doesn't match the
+  // current openShift state, eliminating any stale-closure prompt.
+  // --------------------------------------------------------------
+  const requestOpenShift = () => {
+    // NEVER show Open Shift modal if a shift is already open (user should
+    // use CLOSE instead). Also reset prompt ref so, if they closed a
+    // shift, the *next* launch of POS can still auto-prompt if needed.
+    if (openShift.shiftId) {
+      setShowShiftModal('CLOSE');
+      return;
+    }
+    setShowShiftModal('OPEN');
+  };
+  const requestCloseShift = () => {
+    // NEVER show Close Shift modal if there's no open shift — guard to
+    // prevent blank reconciliation cards.
     if (!openShift.shiftId) {
       setShowShiftModal('OPEN');
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shiftLoaded]);
+    setShowShiftModal('CLOSE');
+  };
+  // --- useEffect([shiftLoaded]) auto-prompt removed — replaced by the
+  // shiftRestore effect above to guarantee correct effect ordering with
+  // the getOpen() check (no "modal fires before DB-query returns" race).
 
   const flashToast = (msg: string) => {
     setToast(msg);
@@ -1150,8 +1224,8 @@ export default function CashierScreenLayout() {
       <Header
         connectionState={connection}
         openShift={openShift}
-        onRequestOpenShift={() => setShowShiftModal('OPEN')}
-        onRequestCloseShift={() => setShowShiftModal('CLOSE')}
+        onRequestOpenShift={requestOpenShift}
+        onRequestCloseShift={requestCloseShift}
       />
 
       {/* --- Incoming Web / QR Order Notification Rail -----------------------
@@ -1387,8 +1461,11 @@ export default function CashierScreenLayout() {
                   onClick={() => {
                     setActiveTab(t.id);
                     if (t.id === 'SHIFT') {
-                      if (openShift.shiftId) setShowShiftModal('CLOSE');
-                      else setShowShiftModal('OPEN');
+                      // Use defensive wrappers so the wrong modal mode can
+                      // never be shown (e.g. open-shift modal while a shift
+                      // is still open on this terminal).
+                      if (openShift.shiftId) requestCloseShift();
+                      else requestOpenShift();
                     }
                   }}
                   className={`w-full min-h-[3.5rem] flex flex-col items-center justify-center gap-1 rounded-xl transition-all active:scale-[0.97] ring-1 ring-inset group relative overflow-hidden ${
@@ -1573,7 +1650,7 @@ export default function CashierScreenLayout() {
                     title: openShift.shiftId
                       ? 'A shift is already open — close it first before opening a new one.'
                       : 'Open a new shift and count opening cash in the drawer.',
-                    onClick: () => setShowShiftModal('OPEN'),
+                    onClick: requestOpenShift,
                   },
                   {
                     label: '🔒 Close Shift',
@@ -1582,7 +1659,7 @@ export default function CashierScreenLayout() {
                     title: openShift.shiftId
                       ? 'Close the current open shift — shows professional reconciliation.'
                       : 'No open shift to close. Open a new shift first.',
-                    onClick: () => setShowShiftModal('CLOSE'),
+                    onClick: requestCloseShift,
                   },
                 ]}
               />
@@ -1640,22 +1717,25 @@ export default function CashierScreenLayout() {
       </div>
 
       {/* Shift modals */}
-      {showShiftModal === 'OPEN' && (
+      {showShiftModal === 'OPEN' && !openShift.shiftId && (
         <ShiftModal
           mode="OPEN"
           openShift={openShift}
           onClose={() => {
-            if (!openShift.shiftId) return;
+            // Even cancel counts as "prompted this session" — ensures the
+            // open-shift dialog won't harass the user until the POS restarts.
+            markOpenShiftPrompted();
             setShowShiftModal(null);
           }}
           onDone={(s) => {
+            markOpenShiftPrompted();
             setOpenShift(s);
             setShowShiftModal(null);
             flashToast('✅ Shift opened. Good luck!');
           }}
         />
       )}
-      {showShiftModal === 'CLOSE' && (
+      {showShiftModal === 'CLOSE' && openShift.shiftId && (
         <ShiftModal
           mode="CLOSE"
           openShift={openShift}
@@ -1666,6 +1746,24 @@ export default function CashierScreenLayout() {
             flashToast('🔒 Shift closed — see Reports for summary.');
           }}
         />
+      )}
+      {/* Belt-and-suspenders: even if showShiftModal somehow gets set to
+          'OPEN' while openShift.shiftId truthy (or vice versa), silently
+          drop the bad state on the next render so user doesn't see the
+          wrong modal. */}
+      {showShiftModal === 'OPEN' && openShift.shiftId && (
+        <span className="hidden" ref={() => {
+          if (showShiftModal === 'OPEN') {
+            // Runs once after DOM commit because ref callback fires after layout;
+            // safe defer.
+            queueMicrotask(() => setShowShiftModal((m) => (m === 'OPEN' ? 'CLOSE' : m)));
+          }
+        }} />
+      )}
+      {showShiftModal === 'CLOSE' && !openShift.shiftId && (
+        <span className="hidden" ref={() => {
+          queueMicrotask(() => setShowShiftModal((m) => (m === 'CLOSE' ? null : m)));
+        }} />
       )}
 
       {/* Table tab details — opened from Cart rail "View Tab" CTA or table-card badge */}

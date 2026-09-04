@@ -1364,6 +1364,11 @@ export function installMockElectronAPI() {
     const totalCents = Number(order?.total_cents ?? order?.totalCents ?? 0);
     const changeDueCents = Number(order?.change_due_cents ?? order?.changeDueCents ?? 0);
     const isPaid = String(order?.payment_status ?? order?.paymentStatus ?? '').toUpperCase() === 'PAID';
+    const cashierName =
+      String(order?.cashier_name ?? order?.employee_name ?? order?.cashierName ?? order?.employeeName ?? '').trim();
+    const orderType = String(order?.order_type ?? order?.orderType ?? 'POS ORDER').replace(/_/g, ' ');
+    const tableStr = (order?.table_name || order?.tableName) ? escapeHtml(String(order.table_name || order.tableName)) : '';
+    const customerStr = (order?.customer_name || order?.customerName) ? escapeHtml(String(order.customer_name || order.customerName)) : '';
 
     const rows: string[] = [];
     for (const it of items || []) {
@@ -1372,78 +1377,162 @@ export function installMockElectronAPI() {
       const unit = Number(it.price_snapshot_cents ?? it.unitPriceCents ?? it.price_cents ?? 0);
       const total = Number(it.total_cents ?? it.totalCents ?? it.subtotal_cents ?? qty * unit);
       const note = it.special_instructions || it.specialInstructions || it.notes || '';
-      rows.push(`
-        <div class="row"><div class="left">${escapeHtml(qty)}x ${escapeHtml(name)}</div><div class="right">${escapeHtml(ngn(total))}</div></div>
-        ${unit && qty > 1 ? `<div class="row small muted"><div class="left">&nbsp;&nbsp;@ ${escapeHtml(ngn(unit))} each</div><div class="right"></div></div>` : ''}
-      `);
       const itemId = it.id || it.order_item_id || it._id;
       const itemMods = (modifiers || []).filter((m) =>
         String(m.order_item_id || m.orderItemId || m._id) === String(itemId)
       );
+      rows.push(`
+        <div class="grid item">
+          <div class="cell qty center">${escapeHtml(String(qty))}</div>
+          <div class="cell name">${escapeHtml(name)}</div>
+          <div class="cell price right">${escapeHtml(ngn(total))}</div>
+        </div>
+        ${unit && qty > 1 ? `<div class="grid small muted"><div class="cell qty"></div><div class="cell name">@ ${escapeHtml(ngn(unit))} each</div><div class="cell price right"></div></div>` : ''}
+      `);
       for (const mod of itemMods) {
-        rows.push(`<div class="row small muted"><div class="left">&nbsp;&nbsp;+ ${escapeHtml(String(mod.modifier_name || mod.modifierName || ''))}: ${escapeHtml(String(mod.option_name || mod.optionName || ''))}</div><div class="right"></div></div>`);
+        rows.push(`<div class="grid small muted"><div class="cell qty"></div><div class="cell name">+ ${escapeHtml(String(mod.modifier_name || mod.modifierName || ''))}: ${escapeHtml(String(mod.option_name || mod.optionName || ''))}</div><div class="cell price right"></div></div>`);
       }
-      if (note) rows.push(`<div class="row small note"><div class="left">※ ${escapeHtml(String(note))}</div><div class="right"></div></div>`);
+      if (note) rows.push(`<div class="grid small note"><div class="cell qty"></div><div class="cell name">※ ${escapeHtml(String(note))}</div><div class="cell price right"></div></div>`);
     }
 
-    const totalsParts: string[] = [
-      `<div class="line"></div>`,
-      `<div class="row small pad4"><div class="left muted">Subtotal</div><div class="right">${escapeHtml(ngn(subtotalCents))}</div></div>`,
-    ];
-    if (discountCents !== 0) totalsParts.push(`<div class="row small pad4"><div class="left muted">Discount</div><div class="right">−${escapeHtml(ngn(discountCents))}</div></div>`);
-    if (taxCents !== 0) totalsParts.push(`<div class="row small pad4"><div class="left muted">Tax</div><div class="right">${escapeHtml(ngn(taxCents))}</div></div>`);
-    if (tipCents !== 0) totalsParts.push(`<div class="row small pad4"><div class="left muted">Tip</div><div class="right">${escapeHtml(ngn(tipCents))}</div></div>`);
-    totalsParts.push(`<div class="row bold"><div class="left">TOTAL</div><div class="right">${escapeHtml(ngn(totalCents))}</div></div>`);
+    const totalsParts: string[] = [`<div class="line thin"></div>`];
+    totalsParts.push(`<div class="grid total small"><div class="cell left muted">Subtotal</div><div class="cell right">${escapeHtml(ngn(subtotalCents))}</div></div>`);
+    if (discountCents !== 0) totalsParts.push(`<div class="grid total small"><div class="cell left muted">Discount</div><div class="cell right">−${escapeHtml(ngn(Math.abs(discountCents)))}</div></div>`);
+    if (taxCents !== 0) totalsParts.push(`<div class="grid total small"><div class="cell left muted">Tax</div><div class="cell right">${escapeHtml(ngn(taxCents))}</div></div>`);
+    if (tipCents !== 0) totalsParts.push(`<div class="grid total small"><div class="cell left muted">Tip</div><div class="cell right">${escapeHtml(ngn(tipCents))}</div></div>`);
+    totalsParts.push(`<div class="line"></div><div class="grid total big bold"><div class="cell left">TOTAL</div><div class="cell right">${escapeHtml(ngn(totalCents))}</div></div>`);
 
-    for (const p of payments || []) {
-      const method = String(p.method || p.payment_method || '').toUpperCase() || 'PAYMENT';
-      const paid = Number(p.amount_cents ?? p.amountCents ?? p.amount ?? 0);
-      totalsParts.push(`<div class="row small pad4"><div class="left muted">${escapeHtml(method)}</div><div class="right">${escapeHtml(ngn(paid))}</div></div>`);
-      if ((p?.method === 'CASH' || p?.payment_method === 'CASH') && changeDueCents > 0) {
-        const tendered = paid + changeDueCents;
-        totalsParts.push(`<div class="row small pad4"><div class="left muted">Tendered</div><div class="right">${escapeHtml(ngn(tendered))}</div></div>`);
-        totalsParts.push(`<div class="row small pad4"><div class="left muted">Change</div><div class="right">${escapeHtml(ngn(changeDueCents))}</div></div>`);
+    if ((payments || []).length) {
+      totalsParts.push(`<div class="line"></div><div class="small muted">Payments</div>`);
+      for (const p of payments || []) {
+        const method = String(p.method || p.payment_method || '').toUpperCase() || 'PAYMENT';
+        const paid = Number(p.amount_cents ?? p.amountCents ?? p.amount ?? 0);
+        totalsParts.push(`<div class="grid total small"><div class="cell left">${escapeHtml(method.replace(/_/g, ' '))}</div><div class="cell right">${escapeHtml(ngn(paid))}</div></div>`);
+        if ((p?.method === 'CASH' || p?.payment_method === 'CASH') && changeDueCents > 0) {
+          const tendered = paid + changeDueCents;
+          totalsParts.push(`<div class="grid total small muted"><div class="cell left">Tendered</div><div class="cell right">${escapeHtml(ngn(tendered))}</div></div>`);
+          totalsParts.push(`<div class="grid total small muted"><div class="cell left">Change</div><div class="cell right">${escapeHtml(ngn(changeDueCents))}</div></div>`);
+        }
       }
     }
-    totalsParts.push(`<div class="row bold"><div class="left">Paid</div><div class="right">${isPaid ? 'YES' : 'NO'}</div></div>`);
+    totalsParts.push(`<div class="grid total bold"><div class="cell left">Paid</div><div class="cell right">${isPaid ? 'YES' : 'NO'}</div></div>`);
 
-    const orderType = String(order?.order_type ?? order?.orderType ?? 'POS ORDER').replace(/_/g, ' ');
-    const tableStr = (order?.table_name || order?.tableName) ? `🪑 ${escapeHtml(String(order.table_name || order.tableName))}` : '';
-    const customerStr = (order?.customer_name || order?.customerName) ? `👤 ${escapeHtml(String(order.customer_name || order.customerName))}` : '';
-
-    return `<!doctype html><html><head><meta charset="utf-8" />
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 12px; margin: 0; padding: 12px; color: #000; }
-        .title { font-size: 14px; font-weight: 800; margin-top: 4px; }
-        .row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
-        .row .left { text-align: left; flex: 1 1 auto; }
-        .row .right { text-align: right; flex: 0 0 auto; white-space: nowrap; }
-        .center { text-align: center; }
-        .bold { font-weight: 800; }
-        .small { font-size: 11px; }
-        .muted { color: #555; }
-        .note { font-style: italic; color: #111; }
-        .pad4 { padding-top: 4px; padding-bottom: 4px; }
-        .line { border-top: 1px dashed #888; margin: 8px 0; }
-        @media print { @page { margin: 0; size: 80mm auto; } body { padding: 4mm; } }
-      </style>
-    </head><body>
-      <div class="center bold">${escapeHtml(hdr.line1)}</div>
+    const header = `
+      <div class="center brand">${escapeHtml(hdr.line1)}</div>
       <div class="center small muted">${escapeHtml(hdr.line2)}</div>
-      <div class="title center">${escapeHtml(meta.title)}</div>
       <div class="line"></div>
-      <div class="row"><div class="left">Order</div><div class="right">${escapeHtml(String(orderNo || ''))}</div></div>
-      <div class="row"><div class="left">Date</div><div class="right">${escapeHtml(createdAt.toLocaleString())}</div></div>
-      ${orderType ? `<div class="row"><div class="left">Type</div><div class="right">${escapeHtml(orderType)}</div></div>` : ''}
-      ${tableStr ? `<div class="row"><div class="left">Table</div><div class="right">${tableStr}</div></div>` : ''}
-      ${customerStr ? `<div class="row"><div class="left">Customer</div><div class="right">${customerStr}</div></div>` : ''}
+      <div class="center title">${escapeHtml(meta.title)}</div>
+      <div class="center small muted">Copy ${meta.copyIndex + 1} of ${meta.totalCopies}</div>
+      <div class="grid">
+        <div class="cell muted">Date</div><div class="cell right">${escapeHtml(createdAt.toLocaleString())}</div>
+        ${orderNo ? `<div class="cell muted">Order</div><div class="cell right mono">${escapeHtml(String(orderNo || ''))}</div>` : ''}
+        ${orderType ? `<div class="cell muted">Type</div><div class="cell right">${escapeHtml(orderType)}</div>` : ''}
+        ${tableStr ? `<div class="cell muted">Table</div><div class="cell right">${tableStr}</div>` : ''}
+        ${customerStr ? `<div class="cell muted">Customer</div><div class="cell right">${customerStr}</div>` : ''}
+        ${cashierName ? `<div class="cell muted">Cashier</div><div class="cell right">${escapeHtml(cashierName)}</div>` : ''}
+      </div>
       <div class="line"></div>
-      ${rows.join('')}
-      ${totalsParts.join('')}
+      <div class="grid head small muted">
+        <div class="cell qty">Qty</div>
+        <div class="cell name">Item</div>
+        <div class="cell price right">Price</div>
+      </div>
+      <div class="line thin"></div>
+    `;
+    const footer = `
       <div class="line"></div>
       <div class="center small muted">Printed: ${escapeHtml(new Date(meta.printedAt).toLocaleString())}</div>
       <div class="center small bold">Thank you</div>
       <div class="center small muted">${escapeHtml(hdr.defaultFooter)}</div>
+    `;
+
+    // Reuse the exact same thermal CSS as Electron main buildReceiptHtml so
+    // browser dev-mode printing matches real hardware printing.
+    return `<!doctype html><html><head><meta charset="utf-8" />
+      <title>${escapeHtml(meta.title || 'Receipt')}</title>
+      <style>
+        html, body { margin: 0; padding: 0; background: #fff; color: #000; }
+        html { box-sizing: border-box; }
+        * { box-sizing: inherit; }
+        :root {
+          --paper-width: 74mm;
+          --font-stack: 'Courier New', Courier, 'DejaVu Sans Mono', Consolas, monospace,
+                        -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+          --body-size: 11px;
+          --body-lh: 1.35;
+          --small-size: 10px;
+          --small-lh: 1.35;
+        }
+        body {
+          width: var(--paper-width);
+          margin: 0 auto;
+          padding: 3mm 3mm 4mm 3mm;
+          font-family: var(--font-stack);
+          font-size: var(--body-size);
+          line-height: var(--body-lh);
+          font-weight: 500;
+          -webkit-font-smoothing: antialiased;
+          color: #000;
+          background: #fff;
+          word-wrap: break-word;
+          overflow-wrap: break-word;
+        }
+        .brand { font-size: 13px; font-weight: 800; letter-spacing: 0.02em; line-height: 1.25; }
+        .title { font-size: 12px; font-weight: 800; margin: 2px 0 0 0; text-transform: uppercase; letter-spacing: 0.12em; }
+        .big { font-size: 13px; }
+        .bold { font-weight: 800; }
+        .center { text-align: center; }
+        .right { text-align: right; }
+        .small { font-size: var(--small-size); line-height: var(--small-lh); }
+        .muted { color: #111; opacity: 0.75; }
+        .note { color: #000; font-style: italic; }
+        .mono { font-family: 'Courier New', Courier, monospace; }
+        .grid { display: grid; grid-template-columns: 24mm 1fr; column-gap: 2mm; row-gap: 1px; align-items: start; }
+        .grid.total { grid-template-columns: 1fr auto; column-gap: 2mm; }
+        .grid.total .cell.right, .grid.total .cell.left { align-self: start; }
+        .grid.item, .grid.head { grid-template-columns: 10mm 1fr 17mm; column-gap: 1.5mm; align-items: start; }
+        .grid .cell.qty { width: 10mm; }
+        .grid .cell.price { width: 17mm; }
+        .grid .cell.name { width: 100%; min-width: 0; overflow-wrap: break-word; word-wrap: break-word; hyphens: manual; }
+        .grid .cell { display: block; min-width: 0; }
+        .grid .cell.left { justify-self: start; }
+        .grid .cell.right { justify-self: end; }
+        .line { border-top: 1px dashed #000; margin: 3mm 0; }
+        .line.thin { border-top: 1px dotted #000; margin: 1.5mm 0; opacity: 0.8; }
+
+        @page { size: 80mm auto; margin: 0; }
+        @media print {
+          html, body { background: #fff !important; }
+          body {
+            width: 74mm; max-width: 74mm;
+            margin: 0 auto !important;
+            padding: 3mm 3mm 3mm 3mm !important;
+            font-family: var(--font-stack) !important;
+            font-size: var(--body-size) !important;
+            line-height: var(--body-lh) !important;
+            color: #000 !important;
+            background: #fff !important;
+          }
+          @page { margin: 0; size: 80mm auto; }
+          @page :first { margin: 0; }
+          @page :left  { margin: 0; }
+          @page :right { margin: 0; }
+          body > * { visibility: hidden; }
+          body { visibility: visible; }
+          body > * { visibility: visible; }
+          html, body { height: auto !important; min-height: auto !important; max-height: none !important; }
+          .grid, .line, .center, .bold, .big, .brand, .title, .small { page-break-inside: avoid; break-inside: avoid; }
+          .grid.item { page-break-inside: auto; break-inside: auto; }
+          .grid .cell { page-break-inside: avoid; break-inside: avoid; }
+          body { orphans: 2; widows: 2; }
+          * { background: transparent !important; color: #000 !important; box-shadow: none !important; text-shadow: none !important; }
+        }
+      </style>
+    </head><body>
+      ${header}
+      ${rows.join('')}
+      ${totalsParts.join('')}
+      ${footer}
     </body></html>`;
   };
 
@@ -1474,38 +1563,106 @@ export function installMockElectronAPI() {
       for (const mod of itemMods) {
         rows.push(`<div class="kmod">+ ${escapeHtml(String(mod.modifier_name || mod.modifierName || ''))}: ${escapeHtml(String(mod.option_name || mod.optionName || ''))}</div>`);
       }
-      if (note) rows.push(`<div class="note">※ ${escapeHtml(String(note))}</div>`);
+      if (note) rows.push(`<div class="note kmod">※ ${escapeHtml(String(note))}</div>`);
     }
 
     const orderType = String(order?.order_type ?? order?.orderType ?? '').replace(/_/g, ' ');
     return `<!doctype html><html><head><meta charset="utf-8" />
+      <title>KITCHEN TICKET ${escapeHtml(orderNo || '')}</title>
       <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 12px; margin: 0; padding: 12px; color: #000; }
-        h1 { font-size: 18px; margin: 0 0 4px; text-align: center; }
-        h2 { font-size: 13px; margin: 0 0 6px; text-align: center; }
-        .row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
-        .row .left { text-align: left; flex: 1 1 auto; }
-        .row .right { text-align: right; flex: 0 0 auto; }
+        html, body { margin: 0; padding: 0; background: #fff; color: #000; }
+        html { box-sizing: border-box; }
+        * { box-sizing: inherit; }
+        :root {
+          --paper-width: 74mm;
+          --font-stack: 'Courier New', Courier, 'DejaVu Sans Mono', Consolas, monospace,
+                        -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+          --body-size: 12px;
+          --body-lh: 1.35;
+          --small-size: 11px;
+        }
+        body {
+          width: var(--paper-width);
+          margin: 0 auto;
+          padding: 3mm 3mm 4mm 3mm;
+          font-family: var(--font-stack);
+          font-size: var(--body-size);
+          line-height: var(--body-lh);
+          font-weight: 600;
+          -webkit-font-smoothing: antialiased;
+          color: #000;
+          background: #fff;
+          word-wrap: break-word;
+          overflow-wrap: break-word;
+        }
+        h1 {
+          font-size: 16px;
+          font-weight: 900;
+          text-align: center;
+          margin: 0 0 2px;
+          letter-spacing: 0.14em;
+          text-transform: uppercase;
+        }
+        h2 {
+          font-size: 13px;
+          font-weight: 800;
+          text-align: center;
+          margin: 0 0 6px;
+        }
+        .row {
+          display: grid;
+          grid-template-columns: 24mm 1fr;
+          column-gap: 2mm;
+          row-gap: 1px;
+          align-items: start;
+          margin: 1px 0;
+        }
+        .row > *:first-child { justify-self: start; }
+        .row > *:last-child  { justify-self: end; text-align: right; font-weight: 700; }
+        .line { border-top: 2px dashed #000; margin: 3mm 0; }
         .center { text-align: center; }
-        .kitem { display: flex; gap: 8px; margin: 8px 0 2px; }
-        .kqty { flex: 0 0 auto; font-weight: 900; font-size: 16px; }
-        .kname { flex: 1 1 auto; font-weight: 800; font-size: 15px; }
-        .kmod { padding-left: 28px; font-size: 12px; color: #222; }
+        .kitem { display: grid; grid-template-columns: 10mm 1fr; column-gap: 2mm; margin: 6px 0 2px; align-items: start; }
+        .kqty { font-weight: 900; font-size: 16px; text-align: center; }
+        .kname { font-weight: 800; font-size: 14px; word-wrap: break-word; overflow-wrap: break-word; }
+        .kmod { padding-left: 12mm; font-size: var(--small-size); color: #111; word-wrap: break-word; overflow-wrap: break-word; }
         .note { font-style: italic; color: #111; }
-        .small { font-size: 11px; color: #333; }
-        .line { border-top: 1px dashed #888; margin: 8px 0; }
-        @media print { @page { margin: 0; size: 80mm auto; } body { padding: 4mm; } }
+        .small { font-size: var(--small-size); color: #222; opacity: 0.85; }
+        @page { size: 80mm auto; margin: 0; }
+        @media print {
+          html, body { background: #fff !important; }
+          body {
+            width: 74mm; max-width: 74mm;
+            margin: 0 auto !important;
+            padding: 3mm 3mm 3mm 3mm !important;
+            font-family: var(--font-stack) !important;
+            font-size: var(--body-size) !important;
+            line-height: var(--body-lh) !important;
+            color: #000 !important;
+            background: #fff !important;
+          }
+          @page { margin: 0; size: 80mm auto; }
+          @page :first { margin: 0; }
+          @page :left  { margin: 0; }
+          @page :right { margin: 0; }
+          body > * { visibility: hidden; }
+          body { visibility: visible; }
+          body > * { visibility: visible; }
+          html, body { height: auto !important; min-height: auto !important; max-height: none !important; }
+          h1, h2, .row, .line, .center, .kitem, .kmod, .note, .small { page-break-inside: avoid; break-inside: avoid; }
+          body { orphans: 2; widows: 2; }
+          * { background: transparent !important; color: #000 !important; box-shadow: none !important; text-shadow: none !important; }
+        }
       </style>
     </head><body>
       <h1>KITCHEN TICKET</h1>
       <h2>${escapeHtml(hdr.line1)}</h2>
       <div class="line"></div>
-      <div class="row"><div class="left">Order</div><div class="right">${escapeHtml(String(orderNo || ''))}</div></div>
-      <div class="row"><div class="left">Time</div><div class="right">${escapeHtml(createdAt.toLocaleString())}</div></div>
-      ${(order?.table_id || order?.tableId) && (order?.table_name || order?.tableName) ? `<div class="row"><div class="left">Table</div><div class="right">${escapeHtml(String(order.table_name || order.tableName))}</div></div>` : ''}
-      ${orderType ? `<div class="row"><div class="left">Type</div><div class="right">${escapeHtml(orderType)}</div></div>` : ''}
-      ${(order?.customer_name || order?.customerName) ? `<div class="row"><div class="left">Customer</div><div class="right">${escapeHtml(String(order.customer_name || order.customerName))}</div></div>` : ''}
-      ${(order?.note || order?.notes) ? `<div class="row"><div class="left">Note</div><div class="right">${escapeHtml(String(order.note || order.notes))}</div></div>` : ''}
+      <div class="row"><span>Order</span><span>${escapeHtml(String(orderNo || ''))}</span></div>
+      <div class="row"><span>Time</span><span>${escapeHtml(createdAt.toLocaleString())}</span></div>
+      ${(order?.table_id || order?.tableId) && (order?.table_name || order?.tableName) ? `<div class="row"><span>Table</span><span>${escapeHtml(String(order.table_name || order.tableName))}</span></div>` : ''}
+      ${orderType ? `<div class="row"><span>Type</span><span>${escapeHtml(orderType)}</span></div>` : ''}
+      ${(order?.customer_name || order?.customerName) ? `<div class="row"><span>Customer</span><span>${escapeHtml(String(order.customer_name || order.customerName))}</span></div>` : ''}
+      ${(order?.note || order?.notes) ? `<div class="row"><span>Note</span><span>${escapeHtml(String(order.note || order.notes))}</span></div>` : ''}
       <div class="line"></div>
       ${rows.join('')}
       <div class="line"></div>
@@ -2366,10 +2523,120 @@ export function installMockElectronAPI() {
         // dev mode vs packaged Electron.
         getShiftTotals: async (shiftId: string) => {
           await delay(10);
-          const pays = mockPayments.filter((p) =>
-            (p.shiftId === shiftId) &&
-            (p.status === 'PAID' || p.status === undefined)
+
+          // -----------------------------------------------------------------
+          // Shared "is qualifying payment" predicate — mirrors
+          // reports.repository PAID_FILTER + payments.repository updated
+          // getShiftTotals. (Same rules used for collectPaidPayments above
+          // in the reports shim engine.)
+          // -----------------------------------------------------------------
+          const isPaidPayment = (p: any): boolean => {
+            const status = (p.status == null) ? '' : String(p.status);
+            const up = status ? status.toUpperCase() : '';
+            const amt =
+              typeof p.amount_cents === 'number' ? p.amount_cents :
+              typeof p.amountCents === 'number' ? p.amountCents :
+              Math.round(Number(p.amount || 0) * 100);
+            if (['SUCCESS', 'COMPLETED', 'PAID', 'CLOSED'].includes(up)) return true;
+            if (!up && amt > 0) return true;
+            if (up === 'PENDING' || up === 'AWAITING_CONFIRM') {
+              if (amt <= 0) return false;
+              const completedAt =
+                typeof p.completed_at === 'number' ? p.completed_at :
+                typeof p.completedAt === 'number' ? p.completedAt : 0;
+              if (completedAt > 0) return true;
+              const oid =
+                (p.orderId != null) ? String(p.orderId) :
+                (p.order_id != null) ? String(p.order_id) : '';
+              if (oid) {
+                // Walk mockOrders to find matching row (no separate
+                // getOrderById helper in the shim engine, keep local lookup so
+                // the file stays self-contained).
+                const order = mockOrders.find((oo: any) => {
+                  const ooId =
+                    oo.id != null ? String(oo.id) :
+                    (oo._id != null ? String(oo._id) : '');
+                  return ooId && String(ooId) === String(oid);
+                });
+                if (order) {
+                  const os = (order.status || '').toUpperCase();
+                  const ps = (
+                    order.paymentStatus ||
+                    order.payment_status ||
+                    ''
+                  ).toUpperCase();
+                  if (
+                    ['COMPLETED', 'PAID', 'CLOSED', 'SERVED', 'DELIVERED', 'AWAITING_PAYMENT'].includes(os) ||
+                    ['PAID', 'PARTIALLY_PAID', 'REFUNDED', 'PARTIALLY_REFUNDED'].includes(ps)
+                  ) return true;
+                }
+              }
+            }
+            return false;
+          };
+
+          const realPays = mockPayments.filter((p) => {
+            if (p.shiftId !== shiftId && String(p.shift_id || '') !== String(shiftId)) return false;
+            return isPaidPayment(p);
+          });
+
+          // Shift-id matched orders — used for fallbacks + voids.
+          const shiftOrders = mockOrders.filter((o: any) =>
+            o.shiftId === shiftId || String(o.shift_id || '') === String(shiftId)
           );
+
+          // PAID orders that DON'T have a qualifying payment → virtual
+          // payments (mirrors the SQL fallback UNION above).
+          const virtualPays: any[] = [];
+          for (const o of shiftOrders) {
+            const status = (o.status || '').toUpperCase();
+            const payStatus = (o.payment_status || o.paymentStatus || '').toUpperCase();
+            if (!['COMPLETED', 'PAID', 'CLOSED', 'SERVED', 'DELIVERED', 'AWAITING_PAYMENT'].includes(status)) continue;
+            if (!['PAID', 'PARTIALLY_PAID'].includes(payStatus)) continue;
+            const paidAmt =
+              typeof o.paid_amount_cents === 'number' ? o.paid_amount_cents :
+              typeof o.paidAmountCents === 'number' ? o.paidAmountCents :
+              typeof o.paidAmount === 'number' ? Math.round(o.paidAmount * 100) : 0;
+            if (paidAmt <= 0) continue;
+            const oid =
+              (o.id != null) ? String(o.id) :
+              (o._id != null) ? String(o._id) : '';
+            const hasReal = realPays.some((p) => {
+              const paid =
+                typeof p.amount_cents === 'number' ? p.amount_cents :
+                typeof p.amountCents === 'number' ? p.amountCents :
+                Math.round(Number(p.amount || 0) * 100);
+              if (paid <= 0) return false;
+              const poid =
+                (p.orderId != null) ? String(p.orderId) :
+                (p.order_id != null) ? String(p.order_id) : '';
+              return poid && String(poid) === String(oid);
+            });
+            if (hasReal) continue;
+            const method = (
+              o.payment_method ||
+              o.paymentMethod ||
+              'CASH'
+            ).toString().toUpperCase();
+            virtualPays.push({
+              id: `vp-${oid}`,
+              shiftId,
+              order_id: oid,
+              orderId: oid,
+              method,
+              amount_cents: paidAmt,
+              amountCents: paidAmt,
+              tip_cents: 0,
+              tipCents: 0,
+              status: 'PAID',
+              completed_at: (typeof (o.created_at || o.createdAt) === 'number')
+                ? Number(o.created_at || o.createdAt)
+                : Date.now(),
+              _isVirtual: true,
+            });
+          }
+          const pays = [...realPays, ...virtualPays];
+
           let cash = 0, card = 0, other = 0, tip = 0;
           let cashCount = 0, cardCount = 0, otherCount = 0;
           const perMethod = new Map<string, { method: string; amount: number; tip: number; count: number }>();
@@ -2377,11 +2644,11 @@ export function installMockElectronAPI() {
             const amt =
               typeof p.amount_cents === 'number' ? p.amount_cents :
               typeof p.amountCents === 'number' ? p.amountCents :
-              Math.round((Number(p.amount || 0)) * 100);
+              Math.round(Number(p.amount || 0) * 100);
             const tipCents =
               typeof p.tip_cents === 'number' ? p.tip_cents :
               typeof p.tipCents === 'number' ? p.tipCents :
-              Math.round((Number(p.tip || 0)) * 100);
+              Math.round(Number(p.tip || 0) * 100);
             const method = (p.method || 'OTHER').toUpperCase();
             tip += tipCents;
             const bucket = perMethod.get(method) || { method, amount: 0, tip: 0, count: 0 };
@@ -2390,53 +2657,48 @@ export function installMockElectronAPI() {
             bucket.count += 1;
             perMethod.set(method, bucket);
             if (method === 'CASH') { cash += amt; cashCount++; }
-            else if (method.includes('CARD') || method === 'PAYSTACK' || method === 'FLUTTERWAVE' || method === 'POS') {
+            else if (method.includes('CARD') || method === 'POS_CARD' || method === 'CARD_POS' ||
+                     method === 'PAYSTACK' || method === 'FLUTTERWAVE' || method === 'POS') {
               card += amt; cardCount++;
             }
             else { other += amt; otherCount++; }
           }
-          // Order statistics for the shift (all orders linked to this shift,
-          // regardless of payment state — the SQL query does the same so
-          // voids/refunds are counted properly).
-          const shiftOrders = mockOrders.filter((o: any) =>
-            o.shiftId === shiftId || String(o.shift_id || '') === String(shiftId)
-          );
+
           let paidOrderCount = 0, voidedOrderCount = 0, refundedOrderCount = 0;
-          let paidItemQty = 0, subtotalCents = 0, discountCents = 0, taxCents = 0, totalPaidCents = 0;
+          let paidItemQty = 0, subtotalCents = 0, discountCents = 0, taxCents = 0;
           for (const o of shiftOrders) {
             const status = (o.status || '').toUpperCase();
             const payStatus = (o.payment_status || o.paymentStatus || '').toUpperCase();
-            if (payStatus === 'PAID') paidOrderCount++;
-            if (status === 'VOID') voidedOrderCount++;
-            if (status === 'REFUNDED') refundedOrderCount++;
+            const paidAmtChk =
+              typeof o.paid_amount_cents === 'number' ? o.paid_amount_cents :
+              typeof o.paidAmountCents === 'number' ? o.paidAmountCents :
+              typeof o.paidAmount === 'number' ? Math.round(o.paidAmount * 100) : 0;
+            if ((payStatus === 'PAID' || payStatus === 'PARTIALLY_PAID') && paidAmtChk > 0) paidOrderCount++;
+            if (status === 'VOID' || status === 'VOIDED') voidedOrderCount++;
+            if (status === 'REFUNDED' || payStatus === 'REFUNDED' || payStatus === 'PARTIALLY_REFUNDED') refundedOrderCount++;
             const itemQty =
               typeof o.item_qty === 'number' ? o.item_qty :
               typeof o.itemQty === 'number' ? o.itemQty :
               Number(o.quantity || 0);
             paidItemQty += itemQty;
-            const st =
+            subtotalCents +=
               typeof o.subtotal_cents === 'number' ? o.subtotal_cents :
               typeof o.subtotalCents === 'number' ? o.subtotalCents :
               Math.round(Number(o.subtotal || 0) * 100);
-            const disc =
+            discountCents +=
               typeof o.discount_cents === 'number' ? o.discount_cents :
               typeof o.discountCents === 'number' ? o.discountCents :
               Math.round(Number(o.discount || 0) * 100);
-            const tx =
+            taxCents +=
               typeof o.tax_cents === 'number' ? o.tax_cents :
               typeof o.taxCents === 'number' ? o.taxCents :
               Math.round(Number(o.tax || 0) * 100);
-            const tot =
-              typeof o.total_cents === 'number' ? o.total_cents :
-              typeof o.totalCents === 'number' ? o.totalCents :
-              Math.round(Number(o.total || 0) * 100);
-            subtotalCents += st;
-            discountCents += disc;
-            taxCents += tx;
-            totalPaidCents += tot;
           }
-          // Payouts (petty cash withdrawals) — in the shim they live as
-          // direction=PAID_OUT cash adjustments.
+          // Match the SQL repository: totalPaidCents = derived cash+card+other
+          // (not sum of orders.total_cents) because drawer reconciliation uses
+          // the paid-method amounts; mismatches become variance.
+          const totalPaidCents = cash + card + other;
+
           let totalPayoutCents = 0, payoutCount = 0;
           let totalPaidInAdj = 0, totalPaidOutAdj = 0, cashAdjCount = 0;
           for (const a of mockCashAdjustments) {
@@ -2450,14 +2712,12 @@ export function installMockElectronAPI() {
             if (dir === 'PAID_OUT') { totalPaidOutAdj += amt; }
             else if (dir === 'PAID_IN') { totalPaidInAdj += amt; }
           }
-          // In the SQL schema, distinct payouts table holds withdrawals; in
-          // the shim we've historically used PAID_OUT cash adjustments.
-          // Surface them as payouts too (non-destructive overlap is fine).
           totalPayoutCents = totalPaidOutAdj;
           payoutCount = mockCashAdjustments.filter((a) =>
             a.shiftId === shiftId &&
             ((a.direction || a.type || '').toUpperCase() === 'PAID_OUT')
           ).length;
+
           return {
             cash,
             card,
@@ -2898,7 +3158,86 @@ export function installMockElectronAPI() {
           const amt = normNum(p, 'amount_cents', 'amountCents', 'amount');
           if (status && PAID_STATUSES.has(status.toUpperCase())) return true;
           if ((status == null || status === '') && amt > 0) return true;
+          // PENDING / AWAITING_CONFIRM payment rows that are otherwise
+          // "settled enough to count as revenue": either they have a real
+          // completed_at timestamp set, OR they're attached to an order
+          // already marked PAID/COMPLETED.
+          const upStatus = status ? status.toUpperCase() : '';
+          if (upStatus === 'PENDING' || upStatus === 'AWAITING_CONFIRM') {
+            if (amt <= 0) return false;
+            const completedAt = normNum(p, 'completed_at', 'completedAt');
+            if (completedAt > 0) return true;
+            const oid = normStr(p, 'order_id', 'orderId');
+            if (oid) {
+              const order = getOrderById(oid);
+              if (order) {
+                const os = normStr(order, 'status')?.toUpperCase() || '';
+                const ps = normStr(order, 'payment_status', 'paymentStatus')?.toUpperCase() || '';
+                if (
+                  ['COMPLETED', 'PAID', 'CLOSED', 'SERVED', 'DELIVERED', 'AWAITING_PAYMENT'].includes(os) ||
+                  ['PAID', 'PARTIALLY_PAID', 'REFUNDED', 'PARTIALLY_REFUNDED'].includes(ps)
+                ) return true;
+              }
+            }
+          }
           return false;
+        };
+
+        // Matching the Electron SQL fallback catch-all — PAID orders that
+        // never received a qualifying payment row (legacy cash write,
+        // eventually-consistent pull, mark-paid without payment entry, etc.).
+        // Returns fake "virtual payment" rows that aggregate identically to
+        // real payments so totals/reconcile with the shift/history tab.
+        const collectOrderPaidFallback = (startTs: number, endTs: number, scope: any): any[] => {
+          const virtuals: any[] = [];
+          for (const o of mockOrders) {
+            const status = normStr(o, 'status')?.toUpperCase() || '';
+            const payStatus = normStr(o, 'payment_status', 'paymentStatus')?.toUpperCase() || '';
+            if (!['COMPLETED', 'PAID', 'CLOSED', 'SERVED', 'DELIVERED', 'AWAITING_PAYMENT'].includes(status)) continue;
+            if (!['PAID', 'PARTIALLY_PAID'].includes(payStatus)) continue;
+            const paidAmt = normNum(o, 'paid_amount_cents', 'paidAmountCents', 'paidAmount');
+            if (paidAmt <= 0) continue;
+            const ct = normNum(o, 'created_at', 'createdAt');
+            if (ct < startTs || ct > endTs) continue;
+            if (!filterScope(o, scope)) continue;
+            const oid = normStr(o, 'id') ?? '';
+            // Skip if there is ALREADY a qualifying payment row for this
+            // order (avoids double-counting).
+            const hasRealPaid = mockPayments.some((pp) => {
+              const poid = normStr(pp, 'order_id', 'orderId');
+              if (!poid || String(poid) !== String(oid)) return false;
+              const amt = normNum(pp, 'amount_cents', 'amountCents', 'amount');
+              if (amt <= 0) return false;
+              return isPaidPayment(pp);
+            });
+            if (hasRealPaid) continue;
+            virtuals.push({
+              id: `vpay-${oid}`,
+              order_id: oid,
+              amount_cents: paidAmt,
+              tip_cents: 0,
+              method: normStr(o, 'payment_method') || 'CASH',
+              completed_at: ct,
+              _isVirtual: true,
+            });
+          }
+          return virtuals;
+        };
+
+        const collectPaidPayments = (startTs: number, endTs: number, scope: any) => {
+          const real = mockPayments.filter((p) => {
+            const completedAt = normNum(p, 'completed_at', 'completedAt');
+            if (completedAt <= 0) return false;
+            if (completedAt < startTs || completedAt > endTs) return false;
+            if (!isPaidPayment(p)) return false;
+            if (!filterScope(p, scope)) return false;
+            return true;
+          });
+          // Append order-paid fallback rows. Reporting-level helpers use
+          // normNum/normStr so they handle both real + virtual shapes
+          // identically without special-casing.
+          const virtual = collectOrderPaidFallback(startTs, endTs, scope);
+          return [...real, ...virtual];
         };
 
         const filterScope = (
@@ -3007,17 +3346,6 @@ export function installMockElectronAPI() {
               };
             }
           }
-        };
-
-        const collectPaidPayments = (startTs: number, endTs: number, scope: any) => {
-          return mockPayments.filter((p) => {
-            const completedAt = normNum(p, 'completed_at', 'completedAt');
-            if (completedAt <= 0) return false;
-            if (completedAt < startTs || completedAt > endTs) return false;
-            if (!isPaidPayment(p)) return false;
-            if (!filterScope(p, scope)) return false;
-            return true;
-          });
         };
 
         const aggregateTotals = (startTs: number, endTs: number, scope: any) => {

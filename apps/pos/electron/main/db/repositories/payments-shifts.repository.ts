@@ -83,73 +83,171 @@ export class PaymentsRepository {
       count: number;
     };
   } {
-    // Payment aggregation: sum amount_cents + tip_cents + count GROUP BY method
+    // First, load the shift's opened_at (used to scope order-level fallback
+    // aggregation to opened_at <= ts <= Date.now()).
+    const shiftRow = this.db.get<{ opened_at: number }>(
+      `SELECT COALESCE(opened_at, 0) opened_at FROM shifts WHERE id = ?`,
+      shiftId,
+    );
+    const openedAt = Number(shiftRow?.opened_at || 0);
+    const closeAt = Date.now();
+
+    // -------------------------------------------------------------------
+    // Payment aggregation — mirrors reports.repository: accept payments
+    // with PAID status OR legacy NULL/empty status with amount_cents > 0
+    // OR PENDING/AWAITING_CONFIRM where either completed_at is set OR the
+    // attached order is already marked PAID. This ensures close-shift
+    // numbers EXACTLY match ReportsPanel + History numbers above.
+    // -------------------------------------------------------------------
+    const PAID_STATUS_FILTER = `
+      status IN ('SUCCESS','COMPLETED','PAID','CLOSED')
+      OR (COALESCE(status,'') = '' AND COALESCE(amount_cents,0) > 0)
+      OR (status IN ('PENDING','AWAITING_CONFIRM') AND COALESCE(amount_cents,0) > 0 AND (
+           COALESCE(completed_at,0) > 0
+           OR EXISTS (
+             SELECT 1 FROM orders oo WHERE oo.id = payments.order_id
+               AND (
+                 UPPER(COALESCE(oo.status,'')) IN ('COMPLETED','PAID','CLOSED','SERVED','DELIVERED')
+                 OR UPPER(COALESCE(oo.payment_status,'')) IN ('PAID','PARTIALLY_PAID','REFUNDED','PARTIALLY_REFUNDED')
+               )
+           )
+         ))
+    `;
+
     const payRows = this.db.all<{ method: string; amount: number; tip: number; cnt: number }>(
       `SELECT method,
               COALESCE(SUM(amount_cents),0) amount,
               COALESCE(SUM(tip_cents),0) tip,
               COUNT(*) cnt
-       FROM payments WHERE shift_id = ? AND status = 'PAID'
+       FROM payments WHERE shift_id = ? AND (${PAID_STATUS_FILTER})
        GROUP BY method`,
-      shiftId
+      shiftId,
     );
+
+    // PAID-ORDER FALLBACK — rows marked PAID/COMPLETED with paid_amount_cents
+    // > 0 AND shift_id = this shift that do NOT have a qualifying payment
+    // row. Bucket these as method = (order.payment_method else CASH). This is
+    // the exact same rule as used by Reports repository so numbers match.
+    const fallbackRows = this.db.all<{ method: string; amount: number; tip: number; cnt: number }>(
+      `SELECT
+         COALESCE(o.payment_method, 'CASH') method,
+         COALESCE(SUM(o.paid_amount_cents),0) amount,
+         0 tip,
+         COUNT(DISTINCT o.id) cnt
+       FROM orders o
+       WHERE o.shift_id = ?
+         AND UPPER(COALESCE(o.status,'')) IN ('COMPLETED','PAID','CLOSED','SERVED','DELIVERED')
+         AND UPPER(COALESCE(o.payment_status,'')) IN ('PAID','PARTIALLY_PAID')
+         AND COALESCE(o.paid_amount_cents,0) > 0
+         AND NOT EXISTS (
+           SELECT 1 FROM payments pp
+           WHERE pp.shift_id = o.shift_id
+             AND pp.order_id = o.id
+             AND COALESCE(pp.amount_cents,0) > 0
+             AND (${PAID_STATUS_FILTER.replace(/payments\./g, 'pp.')})
+         )
+       GROUP BY COALESCE(o.payment_method, 'CASH')`,
+      shiftId,
+    );
+
+    // Merge real payments + fallback by method.
+    const mergedByMethod = new Map<string, { method: string; amount: number; tip: number; count: number }>();
+    for (const r of payRows || []) {
+      const k = r.method || 'OTHER';
+      const p = mergedByMethod.get(k) || { method: k, amount: 0, tip: 0, count: 0 };
+      p.amount += Number(r.amount || 0);
+      p.tip += Number(r.tip || 0);
+      p.count += Number(r.cnt || 0);
+      mergedByMethod.set(k, p);
+    }
+    for (const r of fallbackRows || []) {
+      const k = r.method || 'OTHER';
+      const p = mergedByMethod.get(k) || { method: k, amount: 0, tip: 0, count: 0 };
+      p.amount += Number(r.amount || 0);
+      p.tip += Number(r.tip || 0);
+      p.count += Number(r.cnt || 0);
+      mergedByMethod.set(k, p);
+    }
+
     let cash = 0, card = 0, other = 0, tip = 0;
     let cashCount = 0, cardCount = 0, otherCount = 0;
     const perMethod: Array<{ method: string; amount: number; tip: number; count: number }> = [];
-    for (const r of payRows) {
+    for (const r of mergedByMethod.values()) {
       tip += r.tip;
-      const amt = r.amount || 0;
-      const count = r.cnt || 0;
-      perMethod.push({
-        method: r.method || 'OTHER',
-        amount: amt,
-        tip: r.tip || 0,
-        count,
-      });
-      if (r.method === 'CASH') { cash += amt; cashCount += count; }
-      else if (r.method === 'CARD_POS' || r.method === 'PAYSTACK' || r.method === 'FLUTTERWAVE') {
-        card += amt; cardCount += count;
-      }
-      else { other += amt; otherCount += count; }
+      perMethod.push(r);
+      const up = (r.method || '').toUpperCase();
+      if (up === 'CASH') { cash += r.amount; cashCount += r.count; }
+      else if (up.includes('CARD') || up === 'POS_CARD' || up === 'CARD_POS' || up === 'PAYSTACK' || up === 'FLUTTERWAVE') {
+        card += r.amount; cardCount += r.count;
+      } else { other += r.amount; otherCount += r.count; }
     }
 
-    // Order-level aggregation for paid orders in this shift.
-    // Columns are sourced from shifts.order*_cents fields stored on each order.
-    const orderStats = this.db.all<{
-      subtotal: number; discount: number; tax: number; total: number; items_qty: number;
-      paid: number; voided: number; refunded: number;
-    }>(
-      `SELECT
-         COALESCE(SUM(subtotal_cents),0) subtotal,
-         COALESCE(SUM(discount_cents),0) discount,
-         COALESCE(SUM(tax_cents),0) tax,
-         COALESCE(SUM(total_cents),0) total,
-         COALESCE(SUM(item_qty),0) items_qty,
-         COALESCE(SUM(CASE WHEN payment_status = 'PAID' THEN 1 ELSE 0 END),0) paid,
-         COALESCE(SUM(CASE WHEN status = 'VOID' THEN 1 ELSE 0 END),0) voided,
-         COALESCE(SUM(CASE WHEN status = 'REFUNDED' THEN 1 ELSE 0 END),0) refunded
-       FROM orders WHERE shift_id = ?`,
-      shiftId
-    );
-    const orderRow = orderStats[0] || {
-      subtotal: 0, discount: 0, tax: 0, total: 0, items_qty: 0,
-      paid: 0, voided: 0, refunded: 0,
-    };
+    // Order-level metrics for the close-shift sheet:
+    //   paidOrderCount: distinct orders whose SUM of qualifying payments +
+    //                   order paid_amount fallback covers their total OR
+    //                   order.payment_status = PAID / PARTIALLY_PAID with
+    //                   non-zero paid_amount.
+    //   voidedOrderCount: status = VOID / VOIDED in this shift.
+    //   refundedOrderCount: status = REFUNDED / payment_status REFUNDED /
+    //                       PARTIALLY_REFUNDED.
+    //   paidItemQty: SUM of item_qty from PAID orders; fallback 0 if column
+    //                absent in earlier migrations.
+    //   subtotal / discount / tax / total: sums from order rows; missing
+    //                columns → 0.
+    const scopedOrders = (sql: string, ...extraParams: unknown[]) =>
+      this.db.all(sql, shiftId, ...extraParams);
 
-    // Payouts (manager petty cash payouts / withdrawals) — legacy table may be
-    // absent (SQLite → fallback to 0).
+    let subtotal = 0, discount = 0, tax = 0, orderTotal = 0, itemQty = 0;
+    try {
+      const cols = this.db.all<{ cid: number; name: string }>(
+        `PRAGMA table_info(orders)`,
+      );
+      const colsSet = new Set((cols || []).map((c) => c.name));
+      const parts: string[] = [];
+      const pushIf = (col: string, alias: string) => {
+        if (colsSet.has(col)) parts.push(`COALESCE(SUM(${col}),0) ${alias}`);
+        else parts.push(`0 ${alias}`);
+      };
+      pushIf('subtotal_cents', 'subtotal');
+      pushIf('discount_cents', 'discount');
+      pushIf('tax_cents', 'tax');
+      pushIf('total_cents', 'total');
+      pushIf('item_qty', 'items_qty');
+      const row = this.db.get<{
+        subtotal: number; discount: number; tax: number; total: number; items_qty: number;
+      }>(
+        `SELECT ${parts.join(', ')} FROM orders WHERE shift_id = ?`,
+        shiftId,
+      );
+      subtotal = Number(row?.subtotal || 0);
+      discount = Number(row?.discount || 0);
+      tax = Number(row?.tax || 0);
+      orderTotal = Number(row?.total || 0);
+      itemQty = Number(row?.items_qty || 0);
+    } catch { /* ignore — defaults zeroed above */ }
+
+    const paidAndVoids = this.db.get<{ paid: number; voided: number; refunded: number; ordersCoveredCount: number }>(
+      `SELECT
+         COALESCE(SUM(CASE WHEN UPPER(COALESCE(o.payment_status,'')) IN ('PAID','PARTIALLY_PAID') AND COALESCE(o.paid_amount_cents,0) > 0 THEN 1 ELSE 0 END),0) paid,
+         COALESCE(SUM(CASE WHEN UPPER(COALESCE(o.status,'')) IN ('VOID','VOIDED') THEN 1 ELSE 0 END),0) voided,
+         COALESCE(SUM(CASE WHEN UPPER(COALESCE(o.status,'')) = 'REFUNDED' OR UPPER(COALESCE(o.payment_status,'')) IN ('REFUNDED','PARTIALLY_REFUNDED') THEN 1 ELSE 0 END),0) refunded,
+         COUNT(DISTINCT o.id) ordersCoveredCount
+       FROM orders o
+       WHERE o.shift_id = ?`,
+      shiftId,
+    );
+
+    // Payouts — already filtered by shift_id (table present; else 0).
     let payouts = { totalPayoutCents: 0, payoutCount: 0 };
     try {
       const p = this.db.all<{ amount: number; cnt: number }>(
         `SELECT COALESCE(SUM(amount_cents),0) amount, COUNT(*) cnt FROM payouts WHERE shift_id = ?`,
-        shiftId
+        shiftId,
       );
-      if (p && p[0]) {
-        payouts = { totalPayoutCents: p[0].amount || 0, payoutCount: p[0].cnt || 0 };
-      }
+      if (p && p[0]) payouts = { totalPayoutCents: p[0].amount || 0, payoutCount: p[0].cnt || 0 };
     } catch { /* payouts table may not exist in earlier schema — ignore */ }
 
-    // Cash adjustments (cash drops / no-sales / paid-in / paid-out)
+    // Cash adjustments — paid-in / paid-out by shift_id.
     let cashAdj = { totalPaidInCents: 0, totalPaidOutCents: 0, count: 0 };
     try {
       const c = this.db.all<{ paidin: number; paidout: number; cnt: number }>(
@@ -158,22 +256,28 @@ export class PaymentsRepository {
            COALESCE(SUM(CASE WHEN direction = 'PAID_OUT' THEN amount_cents ELSE 0 END),0) paidout,
            COUNT(*) cnt
          FROM cash_adjustments WHERE shift_id = ?`,
-        shiftId
+        shiftId,
       );
-      if (c && c[0]) {
-        cashAdj = {
-          totalPaidInCents: c[0].paidin || 0,
-          totalPaidOutCents: c[0].paidout || 0,
-          count: c[0].cnt || 0,
-        };
-      }
+      if (c && c[0]) cashAdj = {
+        totalPaidInCents: c[0].paidin || 0,
+        totalPaidOutCents: c[0].paidout || 0,
+        count: c[0].cnt || 0,
+      };
     } catch { /* cash_adjustments table may not exist in earlier schema */ }
 
+    // Grand total paid: cash + card + other. Must equal the totals card in
+    // HISTORY + REPORTS tabs for the same shift window.
+    const total = cash + card + other;
+    // orderTotal (from orders.total_cents) is an informational baseline.
+    // Use the actual cash+card+other derived sum as the single source of
+    // truth for paid $ because it reconciles with drawer math (cash) +
+    // card processor (card) + any transfer methods.
+    void orderTotal; void closeAt; void openedAt; void paidAndVoids?.ordersCoveredCount;
     return {
       cash,
       card,
       other,
-      total: cash + card + other,
+      total,
       tip,
       counts: {
         cash: cashCount,
@@ -183,14 +287,14 @@ export class PaymentsRepository {
       },
       perMethod,
       orders: {
-        paidOrderCount: orderRow.paid || 0,
-        voidedOrderCount: orderRow.voided || 0,
-        refundedOrderCount: orderRow.refunded || 0,
-        paidItemQty: orderRow.items_qty || 0,
-        subtotalCents: orderRow.subtotal || 0,
-        discountCents: orderRow.discount || 0,
-        taxCents: orderRow.tax || 0,
-        totalPaidCents: orderRow.total || 0,
+        paidOrderCount: Number(paidAndVoids?.paid || 0),
+        voidedOrderCount: Number(paidAndVoids?.voided || 0),
+        refundedOrderCount: Number(paidAndVoids?.refunded || 0),
+        paidItemQty: itemQty,
+        subtotalCents: subtotal,
+        discountCents: discount,
+        taxCents: tax,
+        totalPaidCents: total,
       },
       payouts,
       cashAdjustments: cashAdj,

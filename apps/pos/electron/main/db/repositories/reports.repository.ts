@@ -59,8 +59,62 @@ export interface PeriodReport {
   availableYears: number[];
 }
 
-const PAID_STATUS = "('SUCCESS','COMPLETED','PAID','CLOSED')";
-const PAID_FILTER = `(p.status IN ${PAID_STATUS} OR (p.status IS NULL AND COALESCE(p.amount_cents,0) > 0))`;
+const PAID_PAYMENT_STATUS = "('SUCCESS','COMPLETED','PAID','CLOSED')";
+//
+// When a payment qualifies as "recorded revenue":
+//   (A) explicit SUCCESS / COMPLETED / PAID / CLOSED status,
+//   (B) status is NULL / '' but amount_cents > 0 (legacy offline write),
+//   (C) status = PENDING / AWAITING_CONFIRM but either
+//        * attached order is PAID/COMPLETED/SERVED or payment_status = PAID,
+//          OR the payment itself has a completed_at timestamp set, meaning
+//          the provider settled it synchronously and we just haven't updated
+//          the status field post-migration yet.
+//
+// The original filter dropped rows if `status == 'PENDING'` (default for
+// card/transfer in PaymentModal) even though they carried a real
+// completed_at / amount value — exactly the "reports shows 0 on online +
+// offline POS" bug the user is seeing.
+const PAID_FILTER = `(
+  p.status IN ${PAID_PAYMENT_STATUS}
+  OR (COALESCE(p.status, '') = '' AND COALESCE(p.amount_cents, 0) > 0)
+  OR (p.status IN ('PENDING','AWAITING_CONFIRM') AND COALESCE(p.amount_cents, 0) > 0 AND (
+    EXISTS (
+      SELECT 1 FROM orders oo
+      WHERE oo.id = p.order_id
+        AND (
+          UPPER(COALESCE(oo.status,'')) IN ('COMPLETED','PAID','CLOSED','SERVED','DELIVERED')
+          OR UPPER(COALESCE(oo.payment_status,'')) IN ('PAID','PARTIALLY_PAID','REFUNDED','PARTIALLY_REFUNDED')
+        )
+    )
+    OR COALESCE(p.completed_at, 0) > 0
+  ))
+)`;
+
+// Fallback catch-all: any order marked PAID/COMPLETED with non-zero
+// paid_amount_cents that does NOT have a matching payment row. Covers
+// legacy offline cash writes that saved only the orders row, sync-pull
+// orders where the payment table is eventually-consistent, and manual
+// "mark paid" edits that bypass the payment ledger. Aggregations UNION
+// these alongside real payments so the Reports tab never disagrees with
+// Shift totals / History paid-orders counter.
+const PAID_ORDER_STATUS_SQL = `('COMPLETED','PAID','CLOSED','SERVED','DELIVERED')`;
+const PAID_ORDER_PAYSTATUS_SQL = `('PAID','PARTIALLY_PAID')`;
+const PAID_ORDER_FALLBACK_WHERE = (oAlias: string, scopeClause: string) => `
+  UPPER(COALESCE(${oAlias}.status,'')) IN ${PAID_ORDER_STATUS_SQL}
+  AND UPPER(COALESCE(${oAlias}.payment_status,'')) IN ${PAID_ORDER_PAYSTATUS_SQL}
+  AND COALESCE(${oAlias}.paid_amount_cents, 0) > 0
+  AND NOT EXISTS (
+    SELECT 1 FROM payments pp
+    WHERE pp.order_id = ${oAlias}.id
+      AND COALESCE(pp.amount_cents, 0) > 0
+      AND (
+        pp.status IN ${PAID_PAYMENT_STATUS}
+        OR (COALESCE(pp.status, '') = '' AND COALESCE(pp.amount_cents, 0) > 0)
+        OR COALESCE(pp.completed_at, 0) > 0
+      )
+  )
+  ${scopeClause.replace(/p\./g, `${oAlias}.`)}
+`;
 
 interface Scope {
   year?: number;
@@ -277,8 +331,8 @@ export class ReportsRepository {
 
   private aggregateTotals(startTs: number, endTs: number, scope: Scope): PeriodReport['totals'] {
     const { clause, params } = buildScopeWhere(scope);
-    const paidParams = [...params, startTs, endTs];
 
+    // -------- REAL PAYMENTS (classic path) --------------------------------
     const salesRow = this.db.get<{
       gross: number;
       tip: number;
@@ -290,15 +344,34 @@ export class ReportsRepository {
          COALESCE(SUM(p.tip_cents),0) tip,
          COUNT(p.id) payCount,
          COUNT(DISTINCT o.id) orderCount
-       FROM payments p
-       LEFT JOIN orders o ON o.id = p.order_id
-       WHERE p.completed_at IS NOT NULL
-         AND p.completed_at >= ? AND p.completed_at <= ?
-         AND ${PAID_FILTER}
-         ${clause}`,
-      ...paidParams
+       FROM (
+         SELECT p.id, p.amount_cents, p.tip_cents, p.order_id, p.completed_at, p.status
+         FROM payments p
+         WHERE p.completed_at IS NOT NULL
+           AND p.completed_at >= ? AND p.completed_at <= ?
+           AND ${PAID_FILTER}
+           ${clause}
+       ) p
+       LEFT JOIN orders o ON o.id = p.order_id`,
+      startTs, endTs, startTs, endTs, ...params,
     );
 
+    // -------- FALLBACK: PAID orders with no qualifying payment row --------
+    // Acts as a virtual "payment" so numbers reconcile with the shift
+    // "paid orders" counter. Uses the exact same paid-qualifying filter
+    // as PAID_FILTER but on orders.paid_amount_cents instead.
+    const fallbackRow = this.db.get<{ gross: number; orderCount: number }>(
+      `SELECT
+         COALESCE(SUM(o.paid_amount_cents),0) gross,
+         COUNT(DISTINCT o.id) orderCount
+       FROM orders o
+       WHERE o.created_at >= ? AND o.created_at <= ?
+         AND ${PAID_ORDER_FALLBACK_WHERE('o', clause)}`,
+      startTs, endTs, startTs, endTs, ...params,
+    );
+
+    // Refunds are already an orders-status-level concept — no payment row
+    // required — so remain order-centric.
     const refundRow = this.db.get<{ refunds: number }>(
       `SELECT COALESCE(SUM(ABS(COALESCE(o.paid_amount_cents,0))),0) refunds
        FROM orders o
@@ -321,14 +394,16 @@ export class ReportsRepository {
       ...[...caParams, startTs, endTs]
     );
 
-    const gross = Number(salesRow?.gross ?? 0);
+    const gross = Number(salesRow?.gross ?? 0) + Number(fallbackRow?.gross ?? 0);
     const tip = Number(salesRow?.tip ?? 0);
+    const payCount = Number(salesRow?.payCount ?? 0) + Number(fallbackRow?.orderCount ?? 0);
+    const orderCount = Number(salesRow?.orderCount ?? 0) + Number(fallbackRow?.orderCount ?? 0);
     return {
       grossCents: gross,
       tipCents: tip,
       netCents: gross,
-      paymentCount: Number(salesRow?.payCount ?? 0),
-      ordersCount: Number(salesRow?.orderCount ?? 0),
+      paymentCount: payCount,
+      ordersCount: orderCount,
       refundCents: Number(refundRow?.refunds ?? 0),
       payoutCents: Number(payoutRow?.payouts ?? 0),
     };
@@ -355,7 +430,9 @@ export class ReportsRepository {
   }
 
   private buildHourlyBuckets(range: PeriodRange, scopeClause: string, scopeParams: unknown[]): PeriodBucket[] {
-    const rows = this.db.all<{
+    // Real payments JOINED with orders (the classic reporting path).
+    // Use same PAID_FILTER + scope guard from aggregateTotals.
+    const realRows = this.db.all<{
       h: number;
       gross: number;
       tip: number;
@@ -376,10 +453,39 @@ export class ReportsRepository {
          ${scopeClause}
        GROUP BY h
        ORDER BY h ASC`,
-      ...[...scopeParams, range.startTs, range.endTs]
+      ...[range.startTs, range.endTs, range.startTs, range.endTs, ...scopeParams]
     );
-    const map = new Map<number, typeof rows[number]>();
-    for (const r of rows || []) map.set(r.h, r);
+
+    // Fallback: orders marked PAID with no qualifying payment row. Bucketed
+    // by o.created_at hour — same heuristic used by the cash drawer counter.
+    const fallbackRows = this.db.all<{
+      h: number; gross: number; payCount: number; orderCount: number;
+    }>(
+      `SELECT
+         CAST(strftime('%H', o.created_at/1000, 'unixepoch', 'localtime') AS INTEGER) h,
+         COALESCE(SUM(o.paid_amount_cents),0) gross,
+         0 payCount,
+         COUNT(DISTINCT o.id) orderCount
+       FROM orders o
+       WHERE o.created_at >= ? AND o.created_at <= ?
+         AND ${PAID_ORDER_FALLBACK_WHERE('o', scopeClause)}
+       GROUP BY h
+       ORDER BY h ASC`,
+      ...[range.startTs, range.endTs, range.startTs, range.endTs, ...scopeParams]
+    );
+
+    const map = new Map<number, typeof realRows[number]>();
+    for (const r of realRows || []) map.set(r.h, r);
+    for (const r of fallbackRows || []) {
+      const prev = map.get(r.h);
+      if (prev) {
+        prev.gross = Number(prev.gross || 0) + Number(r.gross || 0);
+        prev.payCount = Number(prev.payCount || 0) + Number(r.orderCount || 0);
+        prev.orderCount = Number(prev.orderCount || 0) + Number(r.orderCount || 0);
+      } else {
+        map.set(r.h, { h: r.h, gross: r.gross, tip: 0, payCount: r.orderCount, orderCount: r.orderCount });
+      }
+    }
 
     const buckets: PeriodBucket[] = [];
     const dayStart = startOfDayMs(range.startTs);
@@ -404,7 +510,7 @@ export class ReportsRepository {
   }
 
   private buildWeeklyDailyBuckets(range: PeriodRange, scopeClause: string, scopeParams: unknown[]): PeriodBucket[] {
-    const rows = this.db.all<{
+    const realRows = this.db.all<{
       doy: number;
       gross: number;
       tip: number;
@@ -424,10 +530,34 @@ export class ReportsRepository {
          AND ${PAID_FILTER}
          ${scopeClause}
        GROUP BY doy`,
-      ...[...scopeParams, range.startTs, range.endTs]
+      ...[range.startTs, range.endTs, range.startTs, range.endTs, ...scopeParams]
     );
-    const map = new Map<number, typeof rows[number]>();
-    for (const r of rows || []) map.set(r.doy, r);
+    const fallbackRows = this.db.all<{
+      doy: number; gross: number; payCount: number; orderCount: number;
+    }>(
+      `SELECT
+         CAST(strftime('%j', o.created_at/1000, 'unixepoch', 'localtime') AS INTEGER) doy,
+         COALESCE(SUM(o.paid_amount_cents),0) gross,
+         0 payCount,
+         COUNT(DISTINCT o.id) orderCount
+       FROM orders o
+       WHERE o.created_at >= ? AND o.created_at <= ?
+         AND ${PAID_ORDER_FALLBACK_WHERE('o', scopeClause)}
+       GROUP BY doy`,
+      ...[range.startTs, range.endTs, range.startTs, range.endTs, ...scopeParams]
+    );
+    const map = new Map<number, typeof realRows[number]>();
+    for (const r of realRows || []) map.set(r.doy, r);
+    for (const r of fallbackRows || []) {
+      const prev = map.get(r.doy);
+      if (prev) {
+        prev.gross = Number(prev.gross || 0) + Number(r.gross || 0);
+        prev.payCount = Number(prev.payCount || 0) + Number(r.orderCount || 0);
+        prev.orderCount = Number(prev.orderCount || 0) + Number(r.orderCount || 0);
+      } else {
+        map.set(r.doy, { doy: r.doy, gross: r.gross, tip: 0, payCount: r.orderCount, orderCount: r.orderCount });
+      }
+    }
 
     const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     const buckets: PeriodBucket[] = [];
@@ -462,7 +592,7 @@ export class ReportsRepository {
     const m = startD.getMonth();
     const maxDay = daysInMonth(y, m);
 
-    const rows = this.db.all<{
+    const realRows = this.db.all<{
       dm: number;
       gross: number;
       tip: number;
@@ -483,10 +613,36 @@ export class ReportsRepository {
          ${scopeClause}
        GROUP BY dm
        ORDER BY dm ASC`,
-      ...[...scopeParams, range.startTs, range.endTs]
+      ...[range.startTs, range.endTs, range.startTs, range.endTs, ...scopeParams]
     );
-    const map = new Map<number, typeof rows[number]>();
-    for (const r of rows || []) map.set(r.dm, r);
+    const fallbackRows = this.db.all<{
+      dm: number; gross: number; payCount: number; orderCount: number;
+    }>(
+      `SELECT
+         CAST(strftime('%d', o.created_at/1000, 'unixepoch', 'localtime') AS INTEGER) dm,
+         COALESCE(SUM(o.paid_amount_cents),0) gross,
+         0 payCount,
+         COUNT(DISTINCT o.id) orderCount
+       FROM orders o
+       WHERE o.created_at >= ? AND o.created_at <= ?
+         AND ${PAID_ORDER_FALLBACK_WHERE('o', scopeClause)}
+       GROUP BY dm
+       ORDER BY dm ASC`,
+      ...[range.startTs, range.endTs, range.startTs, range.endTs, ...scopeParams]
+    );
+
+    const map = new Map<number, typeof realRows[number]>();
+    for (const r of realRows || []) map.set(r.dm, r);
+    for (const r of fallbackRows || []) {
+      const prev = map.get(r.dm);
+      if (prev) {
+        prev.gross = Number(prev.gross || 0) + Number(r.gross || 0);
+        prev.payCount = Number(prev.payCount || 0) + Number(r.orderCount || 0);
+        prev.orderCount = Number(prev.orderCount || 0) + Number(r.orderCount || 0);
+      } else {
+        map.set(r.dm, { dm: r.dm, gross: r.gross, tip: 0, payCount: r.orderCount, orderCount: r.orderCount });
+      }
+    }
 
     const buckets: PeriodBucket[] = [];
     for (let d = 1; d <= maxDay; d++) {
@@ -509,7 +665,7 @@ export class ReportsRepository {
 
   private buildYearlyMonthlyBuckets(range: PeriodRange, scopeClause: string, scopeParams: unknown[]): PeriodBucket[] {
     const y = new Date(range.startTs).getFullYear();
-    const rows = this.db.all<{
+    const realRows = this.db.all<{
       mo: number;
       gross: number;
       tip: number;
@@ -530,10 +686,35 @@ export class ReportsRepository {
          ${scopeClause}
        GROUP BY mo
        ORDER BY mo ASC`,
-      ...[...scopeParams, range.startTs, range.endTs]
+      ...[range.startTs, range.endTs, range.startTs, range.endTs, ...scopeParams]
     );
-    const map = new Map<number, typeof rows[number]>();
-    for (const r of rows || []) map.set(r.mo, r);
+    const fallbackRows = this.db.all<{
+      mo: number; gross: number; payCount: number; orderCount: number;
+    }>(
+      `SELECT
+         CAST(strftime('%m', o.created_at/1000, 'unixepoch', 'localtime') AS INTEGER) mo,
+         COALESCE(SUM(o.paid_amount_cents),0) gross,
+         0 payCount,
+         COUNT(DISTINCT o.id) orderCount
+       FROM orders o
+       WHERE o.created_at >= ? AND o.created_at <= ?
+         AND ${PAID_ORDER_FALLBACK_WHERE('o', scopeClause)}
+       GROUP BY mo
+       ORDER BY mo ASC`,
+      ...[range.startTs, range.endTs, range.startTs, range.endTs, ...scopeParams]
+    );
+    const map = new Map<number, typeof realRows[number]>();
+    for (const r of realRows || []) map.set(r.mo, r);
+    for (const r of fallbackRows || []) {
+      const prev = map.get(r.mo);
+      if (prev) {
+        prev.gross = Number(prev.gross || 0) + Number(r.gross || 0);
+        prev.payCount = Number(prev.payCount || 0) + Number(r.orderCount || 0);
+        prev.orderCount = Number(prev.orderCount || 0) + Number(r.orderCount || 0);
+      } else {
+        map.set(r.mo, { mo: r.mo, gross: r.gross, tip: 0, payCount: r.orderCount, orderCount: r.orderCount });
+      }
+    }
 
     const monthNames = [
       'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -561,7 +742,7 @@ export class ReportsRepository {
 
   private aggregateMethodSplit(startTs: number, endTs: number, scope: Scope): MethodSplit[] {
     const { clause, params } = buildScopeWhere(scope);
-    const rows = this.db.all<{
+    const realRows = this.db.all<{
       method: string | null;
       gross: number;
       tip: number;
@@ -579,20 +760,47 @@ export class ReportsRepository {
          ${clause}
        GROUP BY p.method
        ORDER BY gross DESC`,
-      ...[...params, startTs, endTs]
+      ...[startTs, endTs, startTs, endTs, ...params]
     );
-    return (rows || []).map((r) => ({
-      method: r.method || 'OTHER',
-      netCents: Number(r.gross ?? 0),
-      tipCents: Number(r.tip ?? 0),
-      count: Number(r.cnt ?? 0),
-    }));
+    // Fallback: orders without a payment get bucketed under CASH method —
+    // that's the overwhelmingly common case for offline "mark paid" orders.
+    const fallback = this.db.get<{ gross: number; orderCount: number }>(
+      `SELECT
+         COALESCE(SUM(o.paid_amount_cents),0) gross,
+         COUNT(DISTINCT o.id) orderCount
+       FROM orders o
+       WHERE o.created_at >= ? AND o.created_at <= ?
+         AND ${PAID_ORDER_FALLBACK_WHERE('o', clause)}`,
+      ...[startTs, endTs, startTs, endTs, ...params]
+    );
+
+    const byMethod = new Map<string, { method: string; netCents: number; tipCents: number; count: number }>();
+    for (const r of realRows || []) {
+      const k = r.method || 'OTHER';
+      const p = byMethod.get(k) || { method: k, netCents: 0, tipCents: 0, count: 0 };
+      p.netCents += Number(r.gross || 0);
+      p.tipCents += Number(r.tip || 0);
+      p.count += Number(r.cnt || 0);
+      byMethod.set(k, p);
+    }
+    const fallbackCount = Number(fallback?.orderCount ?? 0);
+    const fallbackGross = Number(fallback?.gross ?? 0);
+    if (fallbackCount > 0 || fallbackGross > 0) {
+      const k = 'CASH';
+      const p = byMethod.get(k) || { method: k, netCents: 0, tipCents: 0, count: 0 };
+      p.netCents += fallbackGross;
+      p.count += fallbackCount;
+      byMethod.set(k, p);
+    }
+    return [...byMethod.values()].sort((a, b) => b.netCents - a.netCents);
   }
 
   private aggregateTopItems(startTs: number, endTs: number, scope: Scope): TopItem[] {
     const { clause, params } = buildScopeWhere(scope);
     const clauseForOrders = clause.replace(/p\./g, 'p2.');
-    const rows = this.db.all<{
+    // Top items via real-payment join (original behavior, but using the
+    // full PAID_FILTER so PENDING payments on a PAID order are included).
+    const realRows = this.db.all<{
       menuItemId: string | null;
       name: string | null;
       qty: number;
@@ -613,13 +821,56 @@ export class ReportsRepository {
        GROUP BY oi.menu_item_id, oi.name_snapshot
        ORDER BY revenue DESC
        LIMIT 10`,
-      ...[...params, startTs, endTs]
+      ...[startTs, endTs, startTs, endTs, ...params]
     );
-    return (rows || []).map((r, i) => ({
-      menuItemId: r.menuItemId ?? null,
-      name: r.name ?? (r.menuItemId ? `Item #${i + 1}` : null),
-      qty: Number(r.qty ?? 0),
-      revenueCents: Number(r.revenue ?? 0),
-    }));
+    // Fallback: PAID orders with no qualifying payment row — JOIN their
+    // items in separately so menu item popularity isn't under-counted just
+    // because the payment row is missing/legacy (cash legacy writes).
+    // Only pull order rows that match the PAID_ORDER_FALLBACK_WHERE guard.
+    // Clause substitution maps p. scope (branchId/restaurantId) → o alias.
+    const clauseForFbOrders = clause.replace(/p\./g, 'o.');
+    const fallbackRows = this.db.all<{
+      menuItemId: string | null;
+      name: string | null;
+      qty: number;
+      revenue: number;
+    }>(
+      `SELECT
+         oi.menu_item_id menuItemId,
+         oi.name_snapshot name,
+         COALESCE(SUM(oi.quantity),0) qty,
+         COALESCE(SUM(oi.subtotal_cents),0) revenue
+       FROM order_items oi
+       INNER JOIN orders o ON o.id = oi.order_id
+       WHERE o.created_at >= ? AND o.created_at <= ?
+         AND ${PAID_ORDER_FALLBACK_WHERE('o', clause)}
+       GROUP BY oi.menu_item_id, oi.name_snapshot
+       ORDER BY revenue DESC
+       LIMIT 10`,
+      ...[startTs, endTs, startTs, endTs, ...params]
+    );
+
+    const agg = new Map<string, TopItem & { _isKey: string }>();
+    for (const r of [...(realRows || []), ...(fallbackRows || [])]) {
+      const key = `${r.menuItemId ?? ''}::${r.name ?? ''}`;
+      const existing = agg.get(key);
+      if (existing) {
+        existing.qty += Number(r.qty || 0);
+        existing.revenueCents += Number(r.revenue || 0);
+      } else {
+        agg.set(key, {
+          _isKey: key,
+          menuItemId: r.menuItemId ?? null,
+          name: r.name ?? (r.menuItemId ? `Item` : null),
+          qty: Number(r.qty || 0),
+          revenueCents: Number(r.revenue || 0),
+        });
+      }
+    }
+    // Drop _isKey helper field before returning
+    return [...agg.values()]
+      .sort((a, b) => b.revenueCents - a.revenueCents)
+      .slice(0, 10)
+      .map(({ _isKey, ...rest }) => rest as TopItem);
   }
 }
