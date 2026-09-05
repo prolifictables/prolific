@@ -118,6 +118,15 @@ export default function CashierScreenLayout() {
   const cartActions = useCartStore((s) => s.actions);
   const [activeTab, setActiveTab] = useState<SidebarTab>('MENU');
 
+  // H7a freeze fix: stable-hash short-circuit refs for the bootstrap + menu
+  // periodic pull workers. MUST be declared at TOP LEVEL of the component,
+  // NEVER inside a useEffect callback (React Rule of Hooks #321 crash). Stores
+  // the last canonical JSON signature actually written to DB; identical pulls
+  // skip the 3 heavy applySnapshot writes (~50-500ms main-thread blocks) and
+  // reduce idle 15s refresh to ~1ms signature-compare only.
+  const lastBootstrapSigRef = useRef<string>('');
+  const lastMenuSigRef = useRef<string>('');
+
   // Role-gated sidebar tabs: MANAGER tab rail is only shown to
   // MANAGER/ADMIN/SUPER_ADMIN/OWNER roles per RBAC matrix (MENU_EDIT).
   const sidebarTabs = useMemo(() => {
@@ -447,14 +456,6 @@ export default function CashierScreenLayout() {
     if (String(connection.status || '').toUpperCase() !== 'ONLINE') return;
 
     let alive = true;
-    // H7a: stable-hash short-circuit refs. Store a canonical JSON signature of
-    // the last server payload actually written to DB. If the next pull returns
-    // identical data we skip the 3 heavy applySnapshot DB writes entirely
-    // (incl. their synchronous main-thread SQLite writes + bcrypt.hashSync
-    // calls per employee). Reduces idle 15s-refresh from ~50-500ms of main
-    // thread block to ~1ms (signature compare + network calls only).
-    const lastBootstrapSigRef = useRef<string>('');
-    const lastMenuSigRef = useRef<string>('');
 
     // Canonical signature builders: pick fields that describe identity +
     // mutability (updatedAt, pin presence, role, name, price) and sort by id
