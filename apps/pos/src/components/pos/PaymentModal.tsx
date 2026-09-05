@@ -96,14 +96,33 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       return;
     }
     setProcessing(true);
+    // ——— Local-persistence guard flags ———
+    // The outer generic "Payment not recorded" toast caused cashiers to
+    // double-tap Confirm and double-charge. We now only show the hard
+    // failure toast if NEITHER the order row nor the payment row could
+    // be read back from SQLite after the guarded create() calls. Any
+    // partial persistence (order saved / payment saved / both saved)
+    // always surfaces a soft warning + continues to onPaid() because
+    // the transaction is effectively done locally and sync/print/CD
+    // errors are background concerns for an offline-first POS.
+    let orderPersisted = false;
+    let paymentPersisted = false;
+    let softWarning: string | null = null;
+    // Declared outside try so the outer-catch persistence-gated success path
+    // can reference them (handles the case where DB writes succeeded but a
+    // later stage threw, which was the original false-negative toast bug).
+    let realOrderId = '';
+    let realOrderNumber = '';
     try {
-      const open: any = await window.electronAPI?.db?.shifts?.getOpen?.();
+      const open: any = await window.electronAPI?.db?.shifts?.getOpen?.().catch(() => null);
       const shiftId = open?.id || open?.shiftId || null;
 
       const now = Date.now();
       const orderId =
         (crypto.randomUUID && crypto.randomUUID()) || `ord_${now}_${Math.random()}`;
       const orderNumber = '#' + (10000 + Math.floor(Math.random() * 90000)).toString();
+      realOrderId = orderId;
+      realOrderNumber = orderNumber;
       const normalizedOrderType = orderType === 'TAKEOUT' ? 'TAKEAWAY' : orderType;
 
       const orderRow: any = {
@@ -176,65 +195,101 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         updated_at: now,
       };
 
-      await window.electronAPI?.db?.orders?.create(orderRow);
-      const realOrderId = orderId;
+      // Defensive: orders.repository already handles idempotency non-throwingly
+      // (SELECT pre-check + INSERT OR IGNORE + fallback lookup), but wrap in a
+      // broad guard anyway so an unexpected SQLite schema/constraint error from
+      // a future migration mismatch never surfaces the generic "Payment not
+      // recorded" toast for an order that was actually written. Then verify
+      // the row was persisted via getById so the outer-catch toast-gate can
+      // distinguish "nothing was saved" from "order was saved, everything
+      // else is warnings".
+      try {
+        await window.electronAPI?.db?.orders?.create(orderRow);
+      } catch (ocErr: any) {
+        console.warn('[pay] orders.create threw (continuing — idempotency may have saved it)', ocErr);
+      }
+      try {
+        const checkRow: any = await window.electronAPI?.db?.orders?.getById?.(orderId);
+        orderPersisted = !!(checkRow && (checkRow.id || (checkRow as any)?.result?.id));
+      } catch {
+        orderPersisted = false;
+      }
+      // Note: `realOrderId` declared above (outside try block) so the
+      // persistence-gated outer-catch success path can still reference it.
 
       // Collect modifier option rows to persist alongside items so receipts and
       // kitchen tickets display modifier + options printed line items correctly.
       const modifierRows: any[] = [];
 
-      for (const l of lines) {
-        await window.electronAPI?.db?.orders?.addItem?.(realOrderId, {
-          id: l.lineId,
-          menu_item_id: l.menuItem.id,
-          name_snapshot: l.menuItem.name,
-          price_snapshot_cents: l.perUnitPriceCents,
-          quantity: l.quantity,
-          subtotal_cents: l.subtotalCents,
-          tax_cents: 0,
-          discount_cents: 0,
-          total_cents: l.subtotalCents,
-          special_instructions: l.notes ? String(l.notes) : null,
-          preparation_status: 'NEW',
-        });
-        // Resolve modifier and option display names (cart stores {modifierId, optionIds[]}
-        // only). Use same API as the sync code below (listForItemId) so we have the
-        // full schema; fallback gracefully if not available.
-        if (Array.isArray(l.modifiers) && l.modifiers.length) {
-          let itemModDefs: any[] | null = null;
+      // ——— Defensive wrap: addItem / modifier build loop ———
+      // Even if a single line item's modifier option fails DB insert (e.g. a
+      // column NOT NULL constraint on a newly added field that older rows
+      // don't supply), we MUST continue the flow. Otherwise the user sees
+      // "Payment not recorded" even though both the order and payment rows
+      // were persisted, and re-clicking Confirm creates duplicate sync-queue
+      // entries. Wrapping here converts item-persistence failures into
+      // best-effort warnings (receipts will print a summary from the cart
+      // object instead of DB rows, which is fine).
+      try {
+        for (const l of lines) {
           try {
-            const fetched: any =
-              (await window.electronAPI?.db?.menuModifiers?.listForItemId?.(l.menuItem.id)) || [];
-            itemModDefs = Array.isArray(fetched) ? fetched : null;
-          } catch (_e) {
-            itemModDefs = null;
+            await window.electronAPI?.db?.orders?.addItem?.(realOrderId, {
+              id: l.lineId,
+              menu_item_id: l.menuItem.id,
+              name_snapshot: l.menuItem.name,
+              price_snapshot_cents: l.perUnitPriceCents,
+              quantity: l.quantity,
+              subtotal_cents: l.subtotalCents,
+              tax_cents: 0,
+              discount_cents: 0,
+              total_cents: l.subtotalCents,
+              special_instructions: l.notes ? String(l.notes) : null,
+              preparation_status: 'NEW',
+            });
+          } catch (aiErr) {
+            console.warn('[pay] addItem failed for line', l.lineId, aiErr);
           }
-          for (const sel of l.modifiers) {
-            const mod = itemModDefs?.find((m: any) => String(m.id) === String(sel.modifierId));
-            const modName = (mod?.name || mod?.modifierName || String(sel.modifierId)) as string;
-            if (Array.isArray(sel.optionIds)) {
-              for (const oid of sel.optionIds) {
-                const option = (mod?.options || []).find((o: any) => String(o.id) === String(oid));
-                modifierRows.push({
-                  id: `moid_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-                  order_item_id: l.lineId,
-                  modifier_id: sel.modifierId || null,
-                  modifier_name: modName || null,
-                  option_id: oid || null,
-                  option_name: (option?.name || option?.label || String(oid)) as string,
-                  price_delta_cents: Number(option?.priceDeltaCents || option?.priceDelta || 0),
-                });
+          // Resolve modifier and option display names (cart stores {modifierId, optionIds[]}
+          // only). Use same API as the sync code below (listForItemId) so we have the
+          // full schema; fallback gracefully if not available.
+          if (Array.isArray(l.modifiers) && l.modifiers.length) {
+            let itemModDefs: any[] | null = null;
+            try {
+              const fetched: any =
+                (await window.electronAPI?.db?.menuModifiers?.listForItemId?.(l.menuItem.id)) || [];
+              itemModDefs = Array.isArray(fetched) ? fetched : null;
+            } catch (_e) {
+              itemModDefs = null;
+            }
+            for (const sel of l.modifiers) {
+              const mod = itemModDefs?.find((m: any) => String(m.id) === String(sel.modifierId));
+              const modName = (mod?.name || mod?.modifierName || String(sel.modifierId)) as string;
+              if (Array.isArray(sel.optionIds)) {
+                for (const oid of sel.optionIds) {
+                  const option = (mod?.options || []).find((o: any) => String(o.id) === String(oid));
+                  modifierRows.push({
+                    id: `moid_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+                    order_item_id: l.lineId,
+                    modifier_id: sel.modifierId || null,
+                    modifier_name: modName || null,
+                    option_id: oid || null,
+                    option_name: (option?.name || option?.label || String(oid)) as string,
+                    price_delta_cents: Number(option?.priceDeltaCents || option?.priceDelta || 0),
+                  });
+                }
               }
             }
           }
         }
-      }
-      if (modifierRows.length) {
-        try {
-          await window.electronAPI?.db?.orderItemModifierOptions?.bulkInsert?.(modifierRows);
-        } catch (e) {
-          console.warn('[pay] persist modifiers insert failed', e);
+        if (modifierRows.length) {
+          try {
+            await window.electronAPI?.db?.orderItemModifierOptions?.bulkInsert?.(modifierRows);
+          } catch (e) {
+            console.warn('[pay] persist modifiers insert failed', e);
+          }
         }
+      } catch (loopErr) {
+        console.warn('[pay] items loop outer guard caught', loopErr);
       }
 
       // Note: kitchen ticket printing moved below with the 2-copy customer +
@@ -281,188 +336,237 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         updated_at: now,
       };
 
-      await window.electronAPI?.db?.payments?.create(paymentRow);
+      // ——— Defensive: payments.create guard + persisted? verify ———
+      // If payment-row insert throws (e.g. SQLite UNIQUE clash, missing column,
+      // etc.) we MUST still continue to the onPaid callback and skip the generic
+      // failure toast. The order row already carries paid_amount_cents /
+      // payment_status set correctly for CASH, so shift totals still reconcile.
+      // Skipping the payment ledger row is a data-quality issue but FAR better
+      // than telling the customer the payment failed when it actually went
+      // through (which would cause the cashier to double-tap and double-charge).
+      // Then read back via listByOrderId so the outer-catch toast-gate can
+      // distinguish "no persistence at all" from "persisted but warnings".
+      try {
+        await window.electronAPI?.db?.payments?.create(paymentRow);
+      } catch (pcErr: any) {
+        console.warn('[pay] payments.create threw (continuing with order-level status only)', pcErr);
+      }
+      try {
+        const checkPays = (await window.electronAPI?.db?.payments?.listByOrderId?.(realOrderId)) || [];
+        const arr = Array.isArray(checkPays) ? checkPays : [];
+        paymentPersisted = arr.some((p: any) => String(p?.id ?? p?.payment_id ?? '') === String(paymentId)) || arr.length > 0;
+      } catch {
+        paymentPersisted = false;
+      }
 
-      if (window.electronAPI?.db?.syncQueue?.push) {
-        const taxIds = taxes.map((t) => String(t.id ?? t._id ?? '')).filter(Boolean);
-        const serverItems = await Promise.all(
-          lines.map(async (l) => {
-            try {
-              const modifiers = (await window.electronAPI?.db?.menuModifiers?.listForItemId?.(l.menuItem.id)) as any[];
-              const modById = new Map<string, any>();
-              for (const m of modifiers || []) modById.set(String(m.id), m);
-              const modifierOptions: any[] = [];
-              for (const sel of l.modifiers || []) {
-                const mod = modById.get(String((sel as any).modifierId));
-                const options = Array.isArray(mod?.options) ? mod.options : [];
-                const optById = new Map<string, any>();
-                for (const o of options) optById.set(String(o.id), o);
-                for (const optId of (sel as any).optionIds || []) {
-                  const opt = optById.get(String(optId));
-                  modifierOptions.push({
-                    modifierId: String((sel as any).modifierId),
-                    optionId: String(optId),
-                    name: opt?.name != null ? String(opt.name) : String(optId),
-                    priceDeltaCents:
-                      typeof opt?.price_delta_cents === 'number'
-                        ? opt.price_delta_cents
-                        : typeof opt?.priceDeltaCents === 'number'
-                          ? opt.priceDeltaCents
-                          : 0,
-                  });
+      // ——— Defensive wrap: entire sync-queue build + push block ———
+      // Building server payloads walks menuModifiers.listForItemId,
+      // JSON.stringify, and syncQueue.push (INSERT with UNIQUE op_id). Any of
+      // those can throw (bad menu modifier data, circular reference, DB lock
+      // during claimBatch race). Swallowing them here keeps the checkout flow
+      // intact — the offline-sync 30s poll + explicit syncNow on reconnect will
+      // still attempt delivery later (the order is already persisted locally).
+      try {
+        if (window.electronAPI?.db?.syncQueue?.push) {
+          const taxIds = taxes.map((t) => String(t.id ?? t._id ?? '')).filter(Boolean);
+          const serverItems = await Promise.all(
+            lines.map(async (l) => {
+              try {
+                const modifiers = (await window.electronAPI?.db?.menuModifiers?.listForItemId?.(l.menuItem.id)) as any[];
+                const modById = new Map<string, any>();
+                for (const m of modifiers || []) modById.set(String(m.id), m);
+                const modifierOptions: any[] = [];
+                for (const sel of l.modifiers || []) {
+                  const mod = modById.get(String((sel as any).modifierId));
+                  const options = Array.isArray(mod?.options) ? mod.options : [];
+                  const optById = new Map<string, any>();
+                  for (const o of options) optById.set(String(o.id), o);
+                  for (const optId of (sel as any).optionIds || []) {
+                    const opt = optById.get(String(optId));
+                    modifierOptions.push({
+                      modifierId: String((sel as any).modifierId),
+                      optionId: String(optId),
+                      name: opt?.name != null ? String(opt.name) : String(optId),
+                      priceDeltaCents:
+                        typeof opt?.price_delta_cents === 'number'
+                          ? opt.price_delta_cents
+                          : typeof opt?.priceDeltaCents === 'number'
+                            ? opt.priceDeltaCents
+                            : 0,
+                    });
+                  }
                 }
+                return {
+                  menuItemId: l.menuItem.id,
+                  menuItemName: l.menuItem.name,
+                  quantity: l.quantity,
+                  unitPriceCents: l.perUnitPriceCents,
+                  subtotalCents: l.subtotalCents,
+                  discountCents: 0,
+                  taxCents: 0,
+                  totalCents: l.subtotalCents,
+                  modifierOptions,
+                  notes: l.notes || undefined,
+                  isVoided: false,
+                  preparationStatus: 'NEW',
+                };
+              } catch {
+                return {
+                  menuItemId: l.menuItem.id,
+                  menuItemName: l.menuItem.name,
+                  quantity: l.quantity,
+                  unitPriceCents: l.perUnitPriceCents,
+                  subtotalCents: l.subtotalCents,
+                  discountCents: 0,
+                  taxCents: 0,
+                  totalCents: l.subtotalCents,
+                  modifierOptions: [],
+                  notes: l.notes || undefined,
+                  isVoided: false,
+                  preparationStatus: 'NEW',
+                };
               }
-              return {
-                menuItemId: l.menuItem.id,
-                menuItemName: l.menuItem.name,
-                quantity: l.quantity,
-                unitPriceCents: l.perUnitPriceCents,
-                subtotalCents: l.subtotalCents,
-                discountCents: 0,
-                taxCents: 0,
-                totalCents: l.subtotalCents,
-                modifierOptions,
-                notes: l.notes || undefined,
-                isVoided: false,
-                preparationStatus: 'NEW',
-              };
-            } catch {
-              return {
-                menuItemId: l.menuItem.id,
-                menuItemName: l.menuItem.name,
-                quantity: l.quantity,
-                unitPriceCents: l.perUnitPriceCents,
-                subtotalCents: l.subtotalCents,
-                discountCents: 0,
-                taxCents: 0,
-                totalCents: l.subtotalCents,
-                modifierOptions: [],
-                notes: l.notes || undefined,
-                isVoided: false,
-                preparationStatus: 'NEW',
-              };
-            }
-          })
-        );
+            })
+          );
 
-        const serverOrderPayload = {
-          restaurantId: restaurant?.id,
-          branchId: branch?.id,
-          orderNumber,
-          type: normalizedOrderType,
-          status: method === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
-          paymentStatus: method === 'CASH' ? 'PAID' : 'PENDING',
-          source: 'POS',
-          tableId: tableId ?? undefined,
-          customerId: customer?.id,
-          employeeId: employee?.id,
-          shiftId: shiftId || undefined,
-          subtotalCents: totals.subtotal,
-          discountCents: totals.discount,
-          taxCents: totals.tax,
-          totalCents: totals.total,
-          discountId: discountId ?? undefined,
-          taxIds,
-          notes: note || undefined,
-          idempotencyKey: orderId,
-          items: serverItems,
-        };
+          const serverOrderPayload = {
+            restaurantId: restaurant?.id,
+            branchId: branch?.id,
+            orderNumber,
+            type: normalizedOrderType,
+            status: method === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
+            paymentStatus: method === 'CASH' ? 'PAID' : 'PENDING',
+            source: 'POS',
+            tableId: tableId ?? undefined,
+            customerId: customer?.id,
+            employeeId: employee?.id,
+            shiftId: shiftId || undefined,
+            subtotalCents: totals.subtotal,
+            discountCents: totals.discount,
+            taxCents: totals.tax,
+            totalCents: totals.total,
+            discountId: discountId ?? undefined,
+            taxIds,
+            notes: note || undefined,
+            idempotencyKey: orderId,
+            items: serverItems,
+          };
 
-        const serverPaymentPayload = {
-          restaurantId: restaurant?.id,
-          branchId: branch?.id,
-          orderId: realOrderId,
-          employeeId: employee?.id,
-          shiftId: shiftId || undefined,
-          amountCents: totals.total,
-          currency: (restaurant?.currency as any) || 'NGN',
-          method: paymentMethod,
-          verificationSource: 'LOCAL',
-          status: method === 'CASH' ? 'PAID' : 'PENDING',
-          notes: referenceNote,
-          idempotencyKey: paymentId,
-          receiptNumber: orderNumber.replace('#', 'RCP-'),
-          completedAt: method === 'CASH' ? new Date(now) : undefined,
-        };
+          const serverPaymentPayload = {
+            restaurantId: restaurant?.id,
+            branchId: branch?.id,
+            orderId: realOrderId,
+            employeeId: employee?.id,
+            shiftId: shiftId || undefined,
+            amountCents: totals.total,
+            currency: (restaurant?.currency as any) || 'NGN',
+            method: paymentMethod,
+            verificationSource: 'LOCAL',
+            status: method === 'CASH' ? 'PAID' : 'PENDING',
+            notes: referenceNote,
+            idempotencyKey: paymentId,
+            receiptNumber: orderNumber.replace('#', 'RCP-'),
+            completedAt: method === 'CASH' ? new Date(now) : undefined,
+          };
 
-        await window.electronAPI?.db?.syncQueue?.push?.({
-          op_id: `order_${orderId}`,
-          entity_type: 'ORDER',
-          operation: 'CREATE',
-          entity_id: orderId,
-          payload: JSON.stringify(serverOrderPayload),
-          idempotency_key: orderId,
-          local_entity_version: 1,
-        });
-        await window.electronAPI?.db?.syncQueue?.push?.({
-          op_id: `payment_${paymentId}`,
-          entity_type: 'PAYMENT',
-          operation: 'CREATE',
-          entity_id: paymentId,
-          payload: JSON.stringify(serverPaymentPayload),
-          idempotency_key: paymentId,
-          local_entity_version: 1,
-        });
-
-        if (typeof window !== 'undefined') {
           try {
-            // Professional 4-tier API base resolution so the POS browser
-            // mode always posts to the Render production API on prod
-            // hostnames — never silently falls to localhost:4000.
-            const apiBaseRaw = resolveApiBase?.()
-              ?? (typeof import.meta !== 'undefined'
-                && (import.meta as any).env
-                && ((import.meta as any).env.VITE_API_BASE_URL
-                  || (import.meta as any).env.VITE_API_URL
-                  || (import.meta as any).env.VITE_PUBLIC_API_URL
-                  || (import.meta as any).env.API_BASE_URL))
-              ?? 'http://localhost:4000/api/v1';
-            const apiBase = String(apiBaseRaw).replace(/\/+$/, '');
-
-            const stored = localStorage.getItem('pos_device_id');
-            const deviceId = stored || (crypto.randomUUID ? crypto.randomUUID() : `browser_${Date.now()}`);
-            if (!stored) localStorage.setItem('pos_device_id', deviceId);
-
-            const endpoint = accessToken ? '/sync/batch' : '/public/pos-sync-batch';
-            const headers: Record<string, string> = {
-              'Content-Type': 'application/json',
-              Accept: 'application/json',
-            };
-            if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-            const res = await fetch(`${apiBase}${endpoint}`, {
-              method: 'POST',
-              headers,
-              body: JSON.stringify({
-                deviceId,
-                commands: [
-                  {
-                    idempotencyKey: orderId,
-                    entityType: 'ORDER',
-                    operation: 'CREATE',
-                    entityId: orderId,
-                    localEntityVersion: 1,
-                    payload: serverOrderPayload,
-                  },
-                  {
-                    idempotencyKey: paymentId,
-                    entityType: 'PAYMENT',
-                    operation: 'CREATE',
-                    entityId: paymentId,
-                    localEntityVersion: 1,
-                    payload: serverPaymentPayload,
-                  },
-                ],
-              }),
+            await window.electronAPI?.db?.syncQueue?.push?.({
+              op_id: `order_${orderId}`,
+              entity_type: 'ORDER',
+              operation: 'CREATE',
+              entity_id: orderId,
+              payload: JSON.stringify(serverOrderPayload),
+              idempotency_key: orderId,
+              local_entity_version: 1,
             });
-            if (!res.ok) {
-              const raw = await res.text().catch(() => '');
-              throw new Error(`Sync failed (${res.status}): ${raw || res.statusText}`);
+          } catch (sqErr) {
+            console.warn('[pay] syncQueue.push ORDER failed (deferred to later cycle)', sqErr);
+          }
+          try {
+            await window.electronAPI?.db?.syncQueue?.push?.({
+              op_id: `payment_${paymentId}`,
+              entity_type: 'PAYMENT',
+              operation: 'CREATE',
+              entity_id: paymentId,
+              payload: JSON.stringify(serverPaymentPayload),
+              idempotency_key: paymentId,
+              local_entity_version: 1,
+            });
+          } catch (sqErr) {
+            console.warn('[pay] syncQueue.push PAYMENT failed (deferred to later cycle)', sqErr);
+          }
+
+          // Inline POST to sync-batch endpoint (best-effort, optional). Keep this
+          // INSIDE the if (syncQueue.push) block because serverOrderPayload
+          // and serverPaymentPayload are declared in that scope. The outer
+          // syncBlockErr catch (immediately below) guards the whole block so
+          // JSON.stringify / API-base resolution / fetch errors all continue
+          // the checkout flow instead of showing "Payment not recorded".
+          if (typeof window !== 'undefined') {
+            try {
+              const apiBaseRaw = resolveApiBase?.()
+                ?? (typeof import.meta !== 'undefined'
+                  && (import.meta as any).env
+                  && ((import.meta as any).env.VITE_API_BASE_URL
+                    || (import.meta as any).env.VITE_API_URL
+                    || (import.meta as any).env.VITE_PUBLIC_API_URL
+                    || (import.meta as any).env.API_BASE_URL))
+                ?? 'http://localhost:4000/api/v1';
+              const apiBase = String(apiBaseRaw).replace(/\/+$/, '');
+
+              const stored = localStorage.getItem('pos_device_id');
+              const deviceId = stored || (crypto.randomUUID ? crypto.randomUUID() : `browser_${Date.now()}`);
+              if (!stored) localStorage.setItem('pos_device_id', deviceId);
+
+              const endpoint = accessToken ? '/sync/batch' : '/public/pos-sync-batch';
+              const headers: Record<string, string> = {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+              };
+              if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+              const res = await fetch(`${apiBase}${endpoint}`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                  deviceId,
+                  commands: [
+                    {
+                      idempotencyKey: orderId,
+                      entityType: 'ORDER',
+                      operation: 'CREATE',
+                      entityId: orderId,
+                      localEntityVersion: 1,
+                      payload: serverOrderPayload,
+                    },
+                    {
+                      idempotencyKey: paymentId,
+                      entityType: 'PAYMENT',
+                      operation: 'CREATE',
+                      entityId: paymentId,
+                      localEntityVersion: 1,
+                      payload: serverPaymentPayload,
+                    },
+                  ],
+                }),
+              });
+              if (!res.ok) {
+                const raw = await res.text().catch(() => '');
+                throw new Error(`Sync failed (${res.status}): ${raw || res.statusText}`);
+              }
+            } catch (syncErr: any) {
+              // Don't interrupt checkout on direct-sync POST failure: order
+              // + payment rows are already persisted locally and the queue
+              // reader will retry delivery on its poll interval or when the
+              // monitor detects internet. But surface a visible warning so
+              // the cashier knows the admin hasn't received it yet.
+              void syncErr;
+              setToast('Saved locally, but failed to sync to Admin.');
+              setTimeout(() => setToast(null), 4000);
             }
-          } catch {
-            setToast('Saved locally, but failed to sync to Admin.');
-            setTimeout(() => setToast(null), 4000);
           }
         }
+      } catch (syncBlockErr) {
+        console.warn('[pay] outer sync-queue block caught — continuing checkout', syncBlockErr);
       }
 
       try {
@@ -560,7 +664,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           changeDueCents: method === 'CASH' ? changeCents : undefined,
           bankDetails: cachedBank || undefined,
         });
-      } catch (e) {
+      } catch (e: any) {
         console.warn('[pay] customer display error', e);
       }
 
@@ -579,7 +683,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         await window.electronAPI?.print?.receipt?.(realOrderId, 2);
         setToast && setToast(`🧾 Receipt ${orderNumber || '#'} printed`);
         setTimeout(() => setToast && setToast(null), 2200);
-      } catch (e) {
+      } catch (e: any) {
         console.warn('[pay] print receipt error', e);
       }
       setTimeout(
@@ -593,10 +697,35 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           }),
         150
       );
-    } catch (e) {
+    } catch (e: any) {
       console.warn('[pay] confirm failed', e);
-      setToast('Payment not recorded. Try again.');
-      setTimeout(() => setToast(null), 2600);
+
+      // ——— Toast gate: only the hard "Payment not recorded" toast when
+      // NEITHER order nor payment rows could be persisted locally. For ANY
+      // partial success (order saved / payment saved / both saved), show a
+      // soft warning + continue to onPaid() so the cashier never double-taps
+      // Confirm, which is what caused the double-charge duplicate rows.
+      if (orderPersisted || paymentPersisted) {
+        const safeOrderId: string = realOrderId || '';
+        const safeOrderNumber = realOrderNumber || '#';
+        const safeTotal = Number.isFinite(totals?.total) ? totals.total / 100 : 0;
+        setToast(softWarning || 'Saved locally. Background warnings — order is recorded.');
+        setTimeout(() => setToast(null), 3600);
+        setTimeout(
+          () =>
+            onPaid?.({
+              id: safeOrderId,
+              orderNumber: safeOrderNumber,
+              status: method === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
+              paymentStatus: method === 'CASH' ? 'PAID' : 'PENDING',
+              totalAmount: safeTotal,
+            }),
+          200
+        );
+      } else {
+        setToast('Payment not recorded. Try again.');
+        setTimeout(() => setToast(null), 2600);
+      }
     } finally {
       setProcessing(false);
     }

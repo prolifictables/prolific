@@ -751,12 +751,50 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
   ipcMain.handle(
     'db:orders:listRecent',
     wrap('db:orders:listRecent', (branchId: unknown, limit: unknown) => {
-      const inferredBranchId =
-        typeof branchId === 'string' && branchId && limit !== undefined
-          ? branchId
-          : getActiveBranchId(repos);
-      const inferredLimit = limit !== undefined ? limit : branchId;
-      return repos.orders.listRecent(String(inferredBranchId ?? ''), Number(inferredLimit ?? 50));
+      // ——— Strengthened listRecent argument inference ———
+      // The preload surface exposes `orders.listRecent(limit?)` (single arg,
+      // L136 cashier.ts) while older callers / callers-of-wrapped-shapes or
+      // direct invokeDb pass `(branchId, limit)`. The earlier formula:
+      //   inferredBranchId = string-non-empty branchId && limit !== undefined
+      //                      ? branchId : getActiveBranchId(repos)
+      //   inferredLimit    = limit !== undefined ? limit : branchId
+      // fails when `limit` is a plain number (e.g. listRecent(200)) because
+      // typeof branchId === 'number' not === 'string' so inferredBranchId
+      // falls back to getActiveBranchId(). That part is fine, BUT if
+      // getActiveBranchId() returns '' (no lastAuth), then
+      // repos.orders.listRecent('', 200) runs the branch-empty guard —
+      // that's correct and History returns everything.
+      //
+      // Edge still broken: an indirect caller passes (limit=number,
+      // limit=undefined) and `branchId` is a NON-EMPTY STRING that is
+      // accidentally NOT a branch id, e.g. a filter string or stray UUID.
+      // We sanitise by only honouring string branchId when it looks like a
+      // plausible id (length>4) and `limit` is a valid number. Also clamp
+      // inferredLimit to [1, 10 000] so accidental huge numbers don't blow
+      // up memory. Finally: if the active meta.branchId exists and the
+      // inferred branchId is empty, set inferred to active so
+      // branch-scoped installs (which do have meta lastAuth) still show
+      // correct scoped results, same as before.
+      const hasExplicitBranch =
+        typeof branchId === 'string' && branchId.length > 4 && limit !== undefined;
+      const limitFromArg =
+        limit !== undefined
+          ? limit
+          : typeof branchId === 'number' || (typeof branchId === 'string' && /^-?\d+$/.test(branchId))
+            ? branchId
+            : undefined;
+      const numericLimitCandidate = Number(limitFromArg ?? 50);
+      const safeLimit = Number.isFinite(numericLimitCandidate)
+        ? Math.min(10_000, Math.max(1, Math.floor(numericLimitCandidate)))
+        : 50;
+      const activeBranch = getActiveBranchId(repos);
+      let safeBranchId = hasExplicitBranch ? String(branchId) : activeBranch;
+      if (safeBranchId && typeof safeBranchId === 'string' && safeBranchId.length < 3) {
+        // Treat obviously fake short branch ids (e.g. '' or single char
+        // corruption) as "no filter" so History still shows data.
+        safeBranchId = '';
+      }
+      return repos.orders.listRecent(String(safeBranchId ?? ''), safeLimit);
     })
   );
 

@@ -610,7 +610,9 @@ export default function CashierScreenLayout() {
             detectAndQueueExternalOrders(hydrated);
             setOrders(hydrated);
           }
-        } catch { /* ignore */ }
+        } catch (e: any) {
+          console.warn('[pos] history init error', e);
+        }
 
         // Load running-table sessions so table cards can show live balance / tab
         // number directly on the floor plan.

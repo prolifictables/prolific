@@ -3,13 +3,32 @@ import { protocol } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 
+// IMPORTANT: keep directives aligned with the <meta> CSP in index.html.
+// Electron applies BOTH the HTTP response header (below, injected via onHeadersReceived)
+// AND the meta tag. Chromium uses the INTERSECTION (strictest) of both policies, so
+// if the header's connect-src is localhost-only but the meta tag allows *.onrender.com,
+// all remote API fetches are blocked with "violates the document's Content Security
+// Policy" (the exact error from the user's DevTools screenshots).
 const CSP_POLICY = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline'",
+  // script-src: keep 'unsafe-eval' + Vite HMR origins (ws + http) so dev mode works
+  "script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:5173 ws://localhost:5173",
   "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob: app: http://localhost:* http://127.0.0.1:*",
+  // img-src: allow remote hosts (Render slugs, Prolific subdomains) plus local dev
+  "img-src 'self' data: blob: app: http://localhost:* http://127.0.0.1:* https://*.onrender.com https://*.prolifictables.com",
   "font-src 'self' data:",
-  "connect-src 'self' ws://localhost:* http://localhost:* http://127.0.0.1:*",
+  // connect-src (fetch/XHR/WebSocket): whitelist production hosts (wildcards cover any
+  // Render free-tier slug + all Prolific subdomains on both REST + WS transports).
+  // Local dev ports (5173 Vite, 4000 local API, loopback variants) preserved.
+  "connect-src 'self'" +
+    " https://*.prolifictables.com wss://*.prolifictables.com" +
+    " https://prolifictables.com wss://prolifictables.com" +
+    " https://*.onrender.com wss://*.onrender.com" +
+    " ws://localhost:5173 http://localhost:5173" +
+    " ws://localhost:4000 http://localhost:4000" +
+    " ws://127.0.0.1:4000 http://127.0.0.1:4000" +
+    " ws://0.0.0.0:4000 http://0.0.0.0:4000" +
+    " ws://localhost:* http://localhost:* http://127.0.0.1:*",
   "media-src 'self' data: blob:",
   "frame-src 'none'",
   "object-src 'none'",

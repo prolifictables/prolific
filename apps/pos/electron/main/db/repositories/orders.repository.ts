@@ -119,6 +119,22 @@ export class OrdersRepository {
   }
 
   listRecent(branchId: string, limit = 50): OrderRow[] {
+    // ——— Offline-scoping safety: treat empty branchId as "no filter" ———
+    // getActiveBranchId() returns '' when the meta table auth snapshot is
+    // missing/corrupted or hasn't been written yet after a fresh install.
+    // Without this guard the query becomes WHERE branch_id = '' → 0 rows,
+    // which surfaces to the cashier as a completely empty History panel even
+    // though dozens of sales are saved locally (the "History not populating"
+    // bug). Falling back to an unfiltered list matches the browser-mode mock
+    // shim parity and is safe because orders never leave the local device;
+    // shift totals and close-shift reports use shift_id + time-window scoping
+    // so they never double-count.
+    if (!branchId) {
+      return this.db.all<OrderRow>(
+        'SELECT * FROM orders ORDER BY created_at DESC LIMIT ?',
+        limit
+      );
+    }
     return this.db.all<OrderRow>(
       'SELECT * FROM orders WHERE branch_id = ? ORDER BY created_at DESC LIMIT ?',
       branchId,

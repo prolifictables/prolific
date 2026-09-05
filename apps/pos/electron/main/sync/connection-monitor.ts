@@ -111,9 +111,16 @@ export class ConnectionMonitor {
     try {
       const ok = await this.httpClient.pingHealth();
       if (ok) {
-        if (this.status === 'OFFLINE') {
-          this.setStatus('ONLINE', 'health-ping-ok');
-        }
+        // ——— Broadcast every successful health check, not only on transitions ———
+        // Earlier this only called setStatus('ONLINE',…) when current status
+        // was OFFLINE. That broke SyncEngine's ONLINE-with-pending-work
+        // auto-flush (sync/index.ts v2 trigger) because the status-change
+        // callback never fired during stable-online periods even though
+        // pending orders could still be sitting in the queue from a
+        // previous transient failure (HTTP 5xx, token refresh gap, captive
+        // portal). Always emitting the event with a non-empty reason causes
+        // the downstream `pendingWork > 0` flush gate to run each heartbeat.
+        this.setStatus('ONLINE', 'health-ping-ok');
         this.consecutiveErrors = 0;
         this.lastOnlineAt = Date.now();
       } else {

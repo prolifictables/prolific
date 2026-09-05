@@ -89,6 +89,44 @@ export class SyncEngine {
       (payload) => {
         this.broadcastToRenderers?.('sync:status-changed', payload);
         this.onStatusChange?.(payload.status);
+        // ——— OFFLINE → ONLINE auto-flush trigger, hardened ———
+        // The ConnectionMonitor ping-health loop detects internet restoration
+        // (transition OFFLINE→ONLINE every 10s) and emits setStatus here.
+        // Without this explicit requestNow() call, the QueueReader only flushes
+        // on its internal POLL_INTERVAL_MS timer or an explicit user click.
+        // That violates the user requirement "data syncs when the internet is
+        // connected" — the cashier expects pending orders to upload immediately
+        // the moment Wi-Fi comes back, not 30 seconds later.
+        //
+        // Second-pass hardening (v2): two extra guarantees
+        //   (A) The original pingHealth() only emits setStatus ONLINE when the
+        //       previous monitor state was OFFLINE. If monitor is already
+        //       ONLINE (stale because previous health pings resolved but the
+        //       queue cycle threw a transient network / DNS error), we still
+        //       want flush on ANY ONLINE emit that carries a "positive" reason
+        //       (health-ping-ok or sync-success).
+        //   (B) If getCounts() reports QUEUED + RETRYING work, bypass the
+        //       reason-based gate entirely for status=ONLINE. This catches the
+        //       edge where monitor is "ONLINE" because of old state but the
+        //       queue never retried after an auth-token refresh.
+        if (payload.status === 'ONLINE') {
+          const counts = this.repos.syncQueue.getCounts() as any;
+          const pendingWork =
+            Number(counts?.QUEUED ?? 0) +
+            Number(counts?.RETRYING ?? 0) +
+            Number(counts?.PROCESSING ?? 0);
+          const positiveReason =
+            typeof payload.reason === 'string' &&
+            (payload.reason.startsWith('health-ping-ok') ||
+              payload.reason === 'sync-success');
+          if (positiveReason || pendingWork > 0) {
+            void Promise.resolve()
+              .then(() => this.queueReader.requestNow())
+              .catch((err) =>
+                console.warn('[sync] online-transition flush error:', err?.message || err)
+              );
+          }
+        }
       }
     );
 
