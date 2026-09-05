@@ -49,6 +49,56 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
   const [tenderedRaw, setTenderedRaw] = useState<string>('');
   const [processing, setProcessing] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  // Admin-uploaded bank details (bankName, accountName, accountNumber, caption)
+  // from the branch customer-display settings. Strict rule: visible on POS for
+  // BANK_TRANSFER payments AND on the customer display for every payment
+  // method. Loaded from offline settings cache on mount, refreshed when
+  // branchId changes (supports multi-branch cashier switches).
+  const [bankDetails, setBankDetails] = useState<{
+    bankName?: string;
+    accountName?: string;
+    accountNumber?: string;
+    caption?: string;
+  } | null>(null);
+
+  // Load the cached bank details once the modal opens. Same read path that
+  // CartPanel uses for held-order receipts: `bank_details:<branchId>` stored
+  // offline by the customer-display poller (mock-electron-shim.ts L432).
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      let cached: any = null;
+      try {
+        if (branch?.id && window.electronAPI?.db?.settings?.get) {
+          const key = `bank_details:${branch.id}`;
+          cached = (await window.electronAPI.db.settings.get(key, 'BRANCH')) || null;
+        }
+        // Browser-mode shim fallback: localStorage settings snapshot
+        if (!cached && branch?.id && typeof window !== 'undefined' && (window as any).localStorage) {
+          try {
+            const raw = (window as any).localStorage.getItem(`settings:BRANCH:bank_details:${branch.id}`);
+            if (raw) cached = JSON.parse(raw);
+          } catch { /* ignore */ }
+        }
+      } catch { cached = null; }
+      if (!alive) return;
+      if (cached && typeof cached === 'object' && (
+        typeof cached.bankName === 'string' ||
+        typeof cached.accountName === 'string' ||
+        typeof cached.accountNumber === 'string'
+      )) {
+        setBankDetails({
+          bankName: typeof cached.bankName === 'string' ? cached.bankName : undefined,
+          accountName: typeof cached.accountName === 'string' ? cached.accountName : undefined,
+          accountNumber: typeof cached.accountNumber === 'string' ? cached.accountNumber : undefined,
+          caption: typeof cached.caption === 'string' ? cached.caption : undefined,
+        });
+      } else {
+        setBankDetails(null);
+      }
+    })();
+    return () => { alive = false; };
+  }, [branch?.id]);
 
   const totalCents = totals.total;
 
@@ -894,17 +944,45 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
                 <div className="card p-6 space-y-4">
                   <div className="text-center">
                     <div className="text-5xl mb-2">🏦</div>
-                    <div className="text-white font-bold text-lg">Bank Transfer Details</div>
+                    <div className="text-white font-bold text-lg">
+                      {bankDetails?.caption || 'Bank Transfer Details'}
+                    </div>
+                    <div className="text-slate-400 text-xs mt-1">
+                      Visible on both the POS and the customer-facing display — always
+                    </div>
                   </div>
+
+                  {/* Render the three core fields. Falls back to a soft placeholder
+                      if the manager hasn't uploaded the bank info yet (links the
+                      cashier directly to Admin settings without blocking checkout). */}
                   <div className="space-y-2 text-sm">
-                    <div className="flex justify-between p-3 rounded-xl bg-slate-950/40 ring-1 ring-inset ring-white/5">
-                      <span className="text-slate-400">Bank</span>
-                      <span className="text-white font-semibold">{branch?.name || 'Prolofic'} MFB</span>
-                    </div>
-                    <div className="flex justify-between p-3 rounded-xl bg-slate-950/40 ring-1 ring-inset ring-white/5">
-                      <span className="text-slate-400">Account</span>
-                      <span className="text-white font-mono font-semibold">0012345678</span>
-                    </div>
+                    {[
+                      { label: 'Bank', value: bankDetails?.bankName },
+                      { label: 'Account name', value: bankDetails?.accountName },
+                      { label: 'Account number', value: bankDetails?.accountNumber, mono: true },
+                    ].map((f) => (
+                      <div
+                        key={f.label}
+                        className="flex justify-between p-3 rounded-xl bg-slate-950/40 ring-1 ring-inset ring-white/5 min-h-[3rem]"
+                      >
+                        <span className="text-slate-400">{f.label}</span>
+                        <span
+                          className={
+                            'text-white font-semibold text-right min-w-0 max-w-[60%] truncate ' +
+                            (f.mono ? 'font-mono tabular-nums tracking-wide' : '')
+                          }
+                          title={f.value || ''}
+                        >
+                          {f.value || (
+                            <span className="text-slate-500 italic font-normal">
+                              Not set — Admin → Settings → Bank Account Details
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                    ))}
+
+                    {/* Amount row — kept independent of bank-detail emptiness */}
                     <div className="flex justify-between p-3 rounded-xl bg-slate-950/40 ring-1 ring-inset ring-white/5">
                       <span className="text-slate-400">Amount</span>
                       <span className="text-emerald-400 font-bold tabular-nums">
@@ -912,6 +990,14 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
                       </span>
                     </div>
                   </div>
+
+                  {!bankDetails?.accountNumber && (
+                    <div className="rounded-xl bg-amber-500/10 ring-1 ring-amber-400/30 px-3.5 py-2.5 text-[11px] text-amber-200 leading-snug">
+                      ⚠️ Bank details are empty. Ask your manager to enter them in{' '}
+                      <strong>Admin → Settings → Customer Display → Bank Account Details</strong>{' '}
+                      so customers see the correct account number on every screen.
+                    </div>
+                  )}
                 </div>
               )}
 
