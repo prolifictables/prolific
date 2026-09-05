@@ -6,7 +6,7 @@ import { useAuthStore } from '../../lib/auth-store';
 import { formatCentsToNgn, padZero } from '../../lib/ui-helpers';
 import { resolveApiBase } from '../../lib/remote-auth';
 
-type PaymentMethod = 'CASH' | 'PHYSICAL_POS' | 'BANK_TRANSFER' | 'SPLIT_BILL' | 'ONLINE';
+type PaymentMethod = 'PHYSICAL_POS' | 'BANK_TRANSFER';
 
 interface PaymentModalProps {
   totals: {
@@ -22,15 +22,24 @@ interface PaymentModalProps {
   onPaid: (order: any) => void;
 }
 
+// User strict rule (2026-09-05): only two payment methods are ever offered.
+// 1) ATM Card (PHYSICAL_POS) - tap/insert on the connected POS terminal
+// 2) Bank Transfer (BANK_TRANSFER) - shows admin-uploaded bank account details
+//    on BOTH the POS AND the customer-facing display.
 const METHODS: { id: PaymentMethod; label: string; icon: string; desc: string }[] = [
-  { id: 'CASH', label: 'Cash', icon: '💵', desc: 'Notes & coins' },
-  { id: 'PHYSICAL_POS', label: 'POS Terminal', icon: '💳', desc: 'Card terminal tap' },
-  { id: 'BANK_TRANSFER', label: 'Bank Transfer', icon: '🏦', desc: 'Notify customer' },
-  { id: 'SPLIT_BILL', label: 'Split Bill', icon: '✂️', desc: 'Divide among seats' },
-  { id: 'ONLINE', label: 'Online Link', icon: '🔗', desc: 'Paystack / Flutterwave' },
+  {
+    id: 'PHYSICAL_POS',
+    label: 'ATM Card',
+    icon: '💳',
+    desc: 'Tap / insert card on terminal',
+  },
+  {
+    id: 'BANK_TRANSFER',
+    label: 'Bank Transfer',
+    icon: '🏦',
+    desc: 'Bank details on both screens',
+  },
 ];
-
-const NUM_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', '⌫'];
 
 export default function PaymentModal({ totals, taxes, onClose, onPaid }: PaymentModalProps) {
   const {
@@ -45,8 +54,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
   } = useCartStore();
   const { employee, branch, restaurant } = useAuthStore();
   const accessToken = useAuthStore((s) => s.accessToken);
-  const [method, setMethod] = useState<PaymentMethod>('CASH');
-  const [tenderedRaw, setTenderedRaw] = useState<string>('');
+  const [method, setMethod] = useState<PaymentMethod>('PHYSICAL_POS');
   const [processing, setProcessing] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   // Admin-uploaded bank details (bankName, accountName, accountNumber, caption)
@@ -102,49 +110,8 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
 
   const totalCents = totals.total;
 
-  const tenderedCents = useMemo(() => {
-    if (!tenderedRaw) return 0;
-    const cleaned = tenderedRaw.replace(/[^0-9.]/g, '');
-    const num = parseFloat(cleaned);
-    if (isNaN(num)) return 0;
-    return Math.round(num * 100);
-  }, [tenderedRaw]);
-
-  const changeCents = Math.max(0, tenderedCents - totalCents);
-  const remaining = Math.max(0, totalCents - tenderedCents);
-
-  useEffect(() => {
-    if (method === 'CASH' && !tenderedRaw) {
-      const rounded = Math.ceil(totalCents / 100) * 100;
-      const defaultVal = rounded >= totalCents ? rounded : totalCents;
-      setTenderedRaw((defaultVal / 100).toFixed(2));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [method, totalCents]);
-
-  const appendKey = (k: string) => {
-    if (k === '⌫') {
-      setTenderedRaw((p) => p.slice(0, -1));
-      return;
-    }
-    if (k === '.') {
-      setTenderedRaw((p) => (p.includes('.') ? p : p + '.'));
-      return;
-    }
-    setTenderedRaw((p) => {
-      if (p.includes('.') && p.split('.')[1]?.length >= 2) return p;
-      if (p === '0') return k;
-      return p + k;
-    });
-  };
-
   const handleConfirm = async () => {
     if (processing) return;
-    if (method === 'CASH' && tenderedCents < totalCents) {
-      setToast('Insufficient cash tendered.');
-      setTimeout(() => setToast(null), 2500);
-      return;
-    }
     setProcessing(true);
     // ——— Local-persistence guard flags ———
     // The outer generic "Payment not recorded" toast caused cashiers to
@@ -213,29 +180,26 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         shift_id: shiftId,
         held_by: null,
         held_at: null,
-        status: method === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
-        payment_status: method === 'CASH' ? 'PAID' : 'PENDING',
+        // User strict rule (2026-09-05): both available methods (ATM Card /
+        // Bank Transfer) are treated as terminal + FINAL the moment the
+        // cashier clicks Confirm. NO secondary Admin approval is required.
+        // Orders + payments are always written PAID / COMPLETED immediately;
+        // paid_amount_cents is set to full total; balance_due_cents stays 0;
+        // shift totals reconcile cleanly without any "later confirm" step.
+        status: 'COMPLETED',
+        payment_status: 'PAID',
         payment_method:
           method === 'PHYSICAL_POS'
             ? 'CARD'
-            : method === 'BANK_TRANSFER'
-              ? 'BANK_TRANSFER'
-              : method === 'ONLINE'
-                ? 'ONLINE_PAYSTACK'
-                : 'CASH',
-        // Set paid / balance columns so downstream chips and Shift totals
-        // read the correct numbers immediately, without waiting for the
-        // payments-list aggregation. CASH is paid in full on the spot; any
-        // non-CASH method (card terminal, bank transfer, Paystack link) is
-        // confirmed later via the "Mark Paid" counter workflow.
-        paid_amount_cents: method === 'CASH' ? totals.total : 0,
-        balance_due_cents: method === 'CASH' ? 0 : totals.total,
+            : 'BANK_TRANSFER',
+        paid_amount_cents: totals.total,
+        balance_due_cents: 0,
         subtotal_cents: totals.subtotal,
         discount_cents: totals.discount,
         tax_cents: totals.tax,
         total_cents: totals.total,
         tip_cents: totals.tip,
-        change_due_cents: method === 'CASH' ? changeCents : 0,
+        change_due_cents: 0,
         discount_id: discountId ?? null,
         note: note ? String(note) : null,
         split_group_id: null,
@@ -351,17 +315,8 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       const paymentId =
         (crypto.randomUUID && crypto.randomUUID()) || `pay_${now}_${Math.random()}`;
       const paymentMethod =
-        method === 'PHYSICAL_POS'
-          ? 'CARD'
-          : method === 'BANK_TRANSFER'
-            ? 'BANK_TRANSFER'
-            : method === 'ONLINE'
-              ? 'ONLINE_PAYSTACK'
-              : 'CASH';
-      const referenceNote =
-        method === 'CASH'
-          ? `Tendered ${formatCentsToNgn(tenderedCents)} · Change ${formatCentsToNgn(changeCents)}`
-          : `${METHODS.find((m) => m.id === method)?.label}`;
+        method === 'PHYSICAL_POS' ? 'CARD' : 'BANK_TRANSFER';
+      const referenceNote = `${METHODS.find((m) => m.id === method)?.label}`;
 
       const paymentRow: any = {
         id: paymentId,
@@ -375,10 +330,12 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         transaction_reference: null,
         amount_cents: totals.total,
         tip_cents: totals.tip,
-        change_due_cents: method === 'CASH' ? changeCents : 0,
-        status: method === 'CASH' ? 'PAID' : 'PENDING',
+        change_due_cents: 0,
+        // User rule: cashier confirmation is final. ATM + Bank Transfer are
+        // marked PAID / completed immediately — no later "Mark as Paid" step.
+        status: 'PAID',
         verification_source: 'LOCAL',
-        completed_at: method === 'CASH' ? now : null,
+        completed_at: now,
         reference_note: referenceNote,
         idempotency_key: paymentId,
         synced: 0,
@@ -484,8 +441,10 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
             branchId: branch?.id,
             orderNumber,
             type: normalizedOrderType,
-            status: method === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
-            paymentStatus: method === 'CASH' ? 'PAID' : 'PENDING',
+            // Strict rule: cashier confirm = FINAL confirmation; both methods
+            // (ATM card terminal, Bank Transfer) always ship COMPLETED/PAID.
+            status: 'COMPLETED',
+            paymentStatus: 'PAID',
             source: 'POS',
             tableId: tableId ?? undefined,
             customerId: customer?.id,
@@ -512,11 +471,12 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
             currency: (restaurant?.currency as any) || 'NGN',
             method: paymentMethod,
             verificationSource: 'LOCAL',
-            status: method === 'CASH' ? 'PAID' : 'PENDING',
+            // Sync path matches local row: PAID/completed immediately.
+            status: 'PAID',
             notes: referenceNote,
             idempotencyKey: paymentId,
             receiptNumber: orderNumber.replace('#', 'RCP-'),
-            completedAt: method === 'CASH' ? new Date(now) : undefined,
+            completedAt: new Date(now),
           };
 
           try {
@@ -636,16 +596,12 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         }
 
         // Human-readable payment-method label shown on ThankYou and ActiveOrder
-        // (e.g. "💵 Cash Paid" vs "💳 POS Terminal").
+        // (e.g. "💳 ATM Card" vs "🏦 Bank Transfer").
         const METHOD_LABEL = METHODS.find((m) => m.id === method)?.label || method;
         const paymentMethodLabel =
-          method === 'CASH'
-            ? `💵 ${METHOD_LABEL}`
-            : method === 'PHYSICAL_POS'
-              ? `💳 ${METHOD_LABEL}`
-              : method === 'BANK_TRANSFER'
-                ? `🏦 ${METHOD_LABEL}`
-                : `🌐 ${METHOD_LABEL}`;
+          method === 'PHYSICAL_POS'
+            ? `💳 ${METHOD_LABEL}`
+            : `🏦 ${METHOD_LABEL}`;
 
         // Build CustomerOrderPreview-compatible lines array (matches CartPanel's
         // existing showOrder preview shape so ThankYouScreen and ActiveOrder
@@ -708,10 +664,8 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           })),
           paymentMethod: method,
           paymentMethodLabel,
-          tendered: tenderedCents / 100,
-          tenderedCents: method === 'CASH' ? tenderedCents : undefined,
-          change: changeCents / 100,
-          changeDueCents: method === 'CASH' ? changeCents : undefined,
+          tenderedCents: undefined,
+          changeDueCents: undefined,
           bankDetails: cachedBank || undefined,
         });
       } catch (e: any) {
@@ -741,8 +695,10 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           onPaid({
             id: realOrderId,
             orderNumber,
-            status: method === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
-            paymentStatus: method === 'CASH' ? 'PAID' : 'PENDING',
+            // Both ATM Card + Bank Transfer are complete when the cashier
+            // confirms — no secondary Admin approval required.
+            status: 'COMPLETED',
+            paymentStatus: 'PAID',
             totalAmount: totals.total / 100,
           }),
         150
@@ -766,8 +722,8 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
             onPaid?.({
               id: safeOrderId,
               orderNumber: safeOrderNumber,
-              status: method === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
-              paymentStatus: method === 'CASH' ? 'PAID' : 'PENDING',
+              status: 'COMPLETED',
+              paymentStatus: 'PAID',
               totalAmount: safeTotal,
             }),
           200
@@ -861,67 +817,6 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
             </div>
 
             <div className="space-y-4">
-              {method === 'CASH' && (
-                <>
-                  <div className="card p-5 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-slate-400 font-medium">
-                        Amount Tendered
-                      </span>
-                      <div className="flex gap-1.5 flex-wrap">
-                        {[totalCents, Math.ceil(totalCents / 500) * 500, Math.ceil(totalCents / 1000) * 1000]
-                          .map((v, i) => (
-                            <button
-                              key={i}
-                              onClick={() => setTenderedRaw((v / 100).toFixed(2))}
-                              className="chip !py-1 hover:bg-amber-500/15 hover:text-amber-200 transition-colors text-xs font-bold ring-1 ring-inset ring-white/10"
-                            >
-                              {v === totalCents ? 'Exact' : formatCentsToNgn(v)}
-                            </button>
-                          ))}
-                      </div>
-                    </div>
-                    <div className="min-h-16 rounded-2xl bg-slate-950/50 ring-1 ring-inset ring-amber-400/20 flex items-center justify-end px-5">
-                      <div className="text-3xl font-black tabular-nums text-gradient-neon animate-text-glow tracking-tight">
-                        {formatCentsToNgn(tenderedCents)}
-                      </div>
-                    </div>
-                    {changeCents > 0 && (
-                      <div className="min-h-12 rounded-2xl bg-emerald-500/10 ring-1 ring-inset ring-emerald-500/25 flex items-center justify-between px-5 shadow-glow-emerald">
-                        <span className="text-emerald-300 text-sm font-semibold">Change</span>
-                        <span className="text-emerald-300 font-black text-xl tabular-nums">
-                          +{formatCentsToNgn(changeCents)}
-                        </span>
-                      </div>
-                    )}
-                    {remaining > 0 && (
-                      <div className="min-h-12 rounded-2xl bg-rose-500/10 ring-1 ring-inset ring-rose-500/25 flex items-center justify-between px-5">
-                        <span className="text-rose-300 text-sm font-semibold">Short</span>
-                        <span className="text-rose-400 font-black text-xl tabular-nums">
-                          −{formatCentsToNgn(remaining)}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-2">
-                    {NUM_KEYS.map((k) => (
-                      <button
-                        key={k}
-                        onClick={() => appendKey(k)}
-                        className={`min-h-[4.5rem] rounded-2xl font-black text-2xl transition-all active:scale-[0.96] ${
-                          k === '⌫'
-                            ? 'bg-rose-500/10 text-rose-300 ring-1 ring-inset ring-rose-500/20 hover:bg-rose-500/20'
-                            : 'bg-white/5 text-white ring-1 ring-inset ring-white/10 hover:bg-white/10'
-                        }`}
-                      >
-                        {k}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-
               {method === 'PHYSICAL_POS' && (
                 <div className="card p-6 text-center space-y-4">
                   <div className="text-6xl">💳</div>
@@ -1001,42 +896,6 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
                 </div>
               )}
 
-              {method === 'SPLIT_BILL' && (
-                <div className="card p-6 text-center space-y-3">
-                  <div className="text-5xl">✂️</div>
-                  <div className="text-white font-bold text-lg">Split Bill</div>
-                  <p className="text-slate-400 text-sm">
-                    Record {formatCentsToNgn(totalCents)} as split payment. Use the receipt
-                    for per-seat breakdowns at the table.
-                  </p>
-                </div>
-              )}
-
-              {method === 'ONLINE' && (
-                <div className="card p-6 text-center space-y-4">
-                  <div className="text-5xl">🔗</div>
-                  <div>
-                    <div className="text-white font-bold text-lg">Online Payment Link</div>
-                    <p className="text-slate-400 text-sm mt-1">
-                      Customer pays via Paystack/Flutterwave checkout
-                    </p>
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      onClick={() => console.log('[pay] generate paystack link')}
-                      className="btn-secondary"
-                    >
-                      Paystack
-                    </button>
-                    <button
-                      onClick={() => console.log('[pay] generate flutterwave link')}
-                      className="btn-secondary"
-                    >
-                      Flutterwave
-                    </button>
-                  </div>
-                </div>
-              )}
             </div>
           </div>
         </div>
@@ -1052,9 +911,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           >
             {processing
               ? 'Processing…'
-              : `Confirm · ${formatCentsToNgn(
-                  method === 'CASH' ? totalCents : totalCents
-                )}`}
+              : `Confirm · ${formatCentsToNgn(totalCents)}`}
           </button>
         </div>
 
