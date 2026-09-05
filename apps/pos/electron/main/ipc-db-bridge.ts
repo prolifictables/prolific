@@ -1790,4 +1790,23 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
       });
     })
   );
+
+  // --- Admin Danger Zone: Bulk purge all local sales data ---
+  // Wipes orders/payments/kitchen tickets, zeroes open table sessions
+  // and shift aggregate columns so the next shift starts fresh.
+  // Branch-scoped via getActiveBranchId — never cross-branch.
+  ipcMain.handle(
+    'db:admin:purgeAllLocalSalesData',
+    wrap('db:admin:purgeAllLocalSalesData', (_opts: unknown) => {
+      const branchId = getActiveBranchId(repos);
+      const txn = repos.db.transaction(() => {
+        const orders = repos.orders.deleteAll(branchId);
+        const payments = repos.payments.deleteAll(branchId);
+        const sessions = repos.tableSessions.zeroizeOpenSessions(branchId);
+        const shifts = repos.payments.zeroizeShiftAggregates(branchId);
+        return { orders, payments, sessions, shifts };
+      });
+      return txn();
+    })
+  );
 }

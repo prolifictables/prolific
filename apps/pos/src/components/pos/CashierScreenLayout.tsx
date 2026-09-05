@@ -1011,6 +1011,32 @@ export default function CashierScreenLayout() {
     };
   }, [employee?.id, branch?.id, restaurant?.id]);
 
+  // --- Local sales purge broadcast handler ------------------------------
+  // ManagerTools "Clear Local Orders" dispatches pos:local-sales-purged
+  // after the IPC transaction commits. We react by clearing the in-flight
+  // cart, closing any open modals, and resetting the panels that showed
+  // now-deleted orders / sessions so the UI is consistent with the wiped DB.
+  useEffect(() => {
+    const handler = ((_e: Event) => {
+      // 1) Drop the current in-flight cart — it may reference items tied
+      //    to a wiped table session; the next add-to-cart rebuilds clean.
+      try { cartActions.clear(); } catch {}
+      // 2) Close any open reconciliation / shift modals — the open shift
+      //    row still exists but its aggregates have been zeroed, so a
+      //    half-built Close Shift reconciliation would show stale numbers.
+      setShowShiftModal(null);
+      // 3) Close tab-details drawer — the underlying session is now zero.
+      setTabDetails({ open: false });
+      // 4) Reset listing panels to empty immediately. Their polling
+      //    intervals (orders/sessions L690s, tables L620s) will repopulate
+      //    on the next tick if anything survived — nothing will.
+      setOrders([]);
+      setTableSessions([]);
+    }) as EventListener;
+    window.addEventListener('pos:local-sales-purged', handler);
+    return () => window.removeEventListener('pos:local-sales-purged', handler);
+  }, [cartActions]);
+
   // --------------------------------------------------------------
   // DEFENSIVE WRAPPERS for the two places that can set showShiftModal:
   //   (A) Header pill click (user action → use wrapper below)

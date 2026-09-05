@@ -230,6 +230,13 @@ export default function ManagerTools(props: ManagerToolsProps) {
   const debouncedSearch = useDebounced(search);
   const [offlineSaveToast, setOfflineSaveToast] = useState<string | null>(null);
 
+  // ========== Danger Zone: Clear Local Orders state ==========
+  const [purgeDialogOpen, setPurgeDialogOpen] = useState(false);
+  const [purgePin, setPurgePin] = useState('');
+  const [purgeLoading, setPurgeLoading] = useState(false);
+  const [purgeError, setPurgeError] = useState<string | null>(null);
+  const [purgeConfirmed, setPurgeConfirmed] = useState(false);
+
   // ========== Categories state ==========
   const [categories, setCategories] = useState<MenuCategory[]>([]);
   const [categoriesLoading, setCategoriesLoading] = useState(false);
@@ -337,6 +344,84 @@ export default function ManagerTools(props: ManagerToolsProps) {
     void (async () => {
       try { await onMenuChanged(); } catch {}
     })();
+  };
+
+  // Numeric keypad used for PIN entry in the purge confirm dialog
+  const PIN_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '⌫', '0', 'C'];
+
+  // Append / backspace / clear for the PIN pad
+  const appendPinKey = (k: string) => {
+    setPurgeError(null);
+    if (k === 'C') { setPurgePin(''); return; }
+    if (k === '⌫') { setPurgePin((cur) => cur.slice(0, -1)); return; }
+    setPurgePin((cur) => (cur.length >= 6 ? cur : cur + k));
+  };
+
+  // Open purge dialog (reset state)
+  const openPurgeDialog = () => {
+    setPurgePin('');
+    setPurgeError(null);
+    setPurgeConfirmed(false);
+    setPurgeDialogOpen(true);
+  };
+
+  // Execute purge — manager-PIN gated, calls IPC, invalidates parent state.
+  const handlePurgeLocal = async () => {
+    setPurgeLoading(true);
+    setPurgeError(null);
+    try {
+      // --- Manager/Admin PIN verification gate ---
+      // Even users currently logged in as MANAGER still must re-enter their
+      // PIN (two-person-rule style safety). Matches ShiftModal variance flow.
+      let mgrOk = false;
+      try {
+        const mgr: any = await (window as any).electronAPI?.db?.employees?.findByPin?.(purgePin);
+        const role = (mgr && (mgr.role || '')) || '';
+        if (
+          mgr &&
+          (role === 'MANAGER' ||
+            role === 'ADMIN' ||
+            role === 'SUPER_ADMIN' ||
+            role === 'SUPERVISOR')
+        ) {
+          mgrOk = true;
+        }
+      } catch {
+        mgrOk = false;
+      }
+      if (!mgrOk) {
+        setPurgeError('Invalid manager PIN. Ask your supervisor for approval.');
+        setPurgeLoading(false);
+        return;
+      }
+
+      // --- Call IPC purge (transactional across orders/payments/sessions/shifts) ---
+      const res = await (window as any).electronAPI?.db?.admin?.purgeAllLocalSalesData?.();
+      const ordersDel = Number(res?.orders?.ordersDeleted ?? 0);
+      const paysDel = Number(res?.payments?.paymentsDeleted ?? 0);
+      const sessCls = Number(res?.sessions?.sessionsClosed ?? 0);
+
+      // --- Notify parent + sibling screens via event + onMenuChanged callback ---
+      // Dispatch a broadcast so CashierScreenLayout can: clear cart, close table
+      // picker, force a refreshReferenceData cycle on its 15s tick immediately.
+      try {
+        window.dispatchEvent(new CustomEvent('pos:local-sales-purged', { detail: res }));
+      } catch {}
+      // onMenuChanged → parent re-reads open shift totals (now zero) etc.
+      try { await onMenuChanged(); } catch {}
+
+      flashToast(
+        `Fresh start ready — wiped ${ordersDel} order(s), ${paysDel} payment(s), closed ${sessCls} table session(s).`
+      );
+
+      setPurgeDialogOpen(false);
+      setPurgePin('');
+      setPurgeConfirmed(false);
+    } catch (e: any) {
+      setPurgeError(e?.message || 'Purge failed. Try again or restart the POS.');
+    } finally {
+      setPurgeLoading(false);
+    }
   };
 
   // ========== Data loading (local-only, NO REST reads) ==========
@@ -895,6 +980,16 @@ export default function ManagerTools(props: ManagerToolsProps) {
 
         <div className="flex-1" />
 
+        {/* Danger Zone: Clear Local Orders (manager-PIN gated, irreversible) */}
+        <button
+          onClick={openPurgeDialog}
+          className="shrink-0 h-10 px-4 rounded-xl font-black text-sm transition-all active:scale-[0.97] ring-1 ring-inset flex items-center gap-2 bg-rose-500/15 hover:bg-rose-500/25 text-rose-200 ring-rose-400/30 hover:ring-rose-400/50 shadow-[0_4px_20px_-10px_rgba(244,63,94,0.5)]"
+          title="Wipe ALL local orders, payments & table sessions (irreversible)"
+        >
+          <span className="text-base">🗑️</span>
+          Clear Local Orders
+        </button>
+
         {/* Search */}
         <div className="relative shrink-0 w-72">
           <input
@@ -1039,6 +1134,145 @@ export default function ManagerTools(props: ManagerToolsProps) {
           onClose={() => { setModEditorOpen(false); setModEditing(null); }}
           onSave={handleSaveModifier}
         />
+      )}
+
+      {/* ============== Purge All Local Sales Confirm Dialog ============== */}
+      {purgeDialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 bg-slate-950/80 backdrop-blur-md animate-fade-in">
+          <div className="relative w-full max-w-lg rounded-3xl bg-slate-900 ring-2 ring-rose-500/40 shadow-[0_30px_80px_-20px_rgba(244,63,94,0.45)] overflow-hidden animate-slide-up">
+            {/* Gradient header accent */}
+            <div className="absolute top-0 inset-x-0 h-24 bg-gradient-to-b from-rose-600/25 via-rose-500/10 to-transparent pointer-events-none" />
+
+            <div className="relative p-6 space-y-5">
+              {/* Title row */}
+              <div className="flex items-start gap-4">
+                <div className="shrink-0 w-14 h-14 rounded-2xl bg-rose-500/15 ring-2 ring-rose-500/40 flex items-center justify-center text-3xl shadow-[0_0_30px_-10px_rgba(244,63,94,0.7)]">
+                  ⚠️
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h2 className="text-xl font-black text-white leading-tight">
+                    Clear All Local Orders
+                  </h2>
+                  <p className="text-[12px] text-ink-300 mt-1.5 leading-relaxed">
+                    Permanently wipe every local order, payment, and open table session on this device.
+                    <span className="text-rose-300 font-bold"> This cannot be undone.</span>
+                  </p>
+                </div>
+              </div>
+
+              {/* Safety checklist — 4-bullet rose-tinted card */}
+              <div className="rounded-2xl bg-rose-500/8 ring-1 ring-inset ring-rose-500/25 p-4 space-y-2.5">
+                <label className="flex items-start gap-3 cursor-pointer select-none group">
+                  <input
+                    type="checkbox"
+                    checked={purgeConfirmed}
+                    onChange={(e) => { setPurgeConfirmed(e.target.checked); setPurgeError(null); }}
+                    className="mt-0.5 w-4 h-4 rounded accent-rose-500 shrink-0"
+                  />
+                  <div className="text-[12px] text-ink-200 leading-relaxed">
+                    I understand that:
+                    <ul className="mt-2 space-y-1.5 text-rose-100/90">
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-400 shrink-0 mt-0.5">✓</span>
+                        <span>ALL orders &amp; payments on this device are deleted permanently.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-400 shrink-0 mt-0.5">✓</span>
+                        <span>Open table sessions are force-closed &amp; zeroed out.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-400 shrink-0 mt-0.5">✓</span>
+                        <span>Shift KPIs (gross/net sales, counts) return to ₦0.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-400 shrink-0 mt-0.5">✓</span>
+                        <span>I need a MANAGER / ADMIN PIN to approve this action.</span>
+                      </li>
+                    </ul>
+                  </div>
+                </label>
+              </div>
+
+              {/* Manager PIN pad */}
+              <div className={`card p-4 space-y-2.5 ring-2 transition-colors ${
+                purgeConfirmed ? 'ring-rose-500/40 bg-slate-800/40' : 'ring-white/5 bg-slate-800/15 opacity-50 pointer-events-none'
+              }`}>
+                <div className="flex items-center gap-2 text-rose-200">
+                  <span>🔐</span>
+                  <span className="font-bold text-sm">Enter Manager PIN to approve</span>
+                </div>
+                <div className="min-h-12 rounded-xl bg-slate-950/60 ring-1 ring-inset ring-white/10 flex items-center justify-center px-5">
+                  <div className="text-2xl font-black tabular-nums text-white tracking-[0.5em]">
+                    {Array.from({ length: 6 }).map((_, i) => (
+                      <span key={i} className={purgePin[i] ? 'text-white' : 'text-slate-700'}>
+                        {purgePin[i] ? '•' : '·'}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 gap-2 pt-1">
+                  {PIN_KEYS.map((k) => (
+                    <button
+                      key={`purge-pin-${k}`}
+                      onClick={() => appendPinKey(k)}
+                      className={`min-h-[3rem] rounded-xl font-black text-xl transition-all active:scale-[0.96] ${
+                        k === '⌫'
+                          ? 'bg-amber-500/10 text-amber-200 ring-1 ring-inset ring-amber-500/20 hover:bg-amber-500/20'
+                          : k === 'C'
+                          ? 'bg-rose-500/10 text-rose-200 ring-1 ring-inset ring-rose-500/20 hover:bg-rose-500/20'
+                          : 'bg-white/5 text-white ring-1 ring-inset ring-white/10 hover:bg-white/10'
+                      }`}
+                    >
+                      {k}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Error banner */}
+              {purgeError && (
+                <div className="rounded-xl bg-rose-500/10 ring-1 ring-rose-500/30 px-4 py-2.5 text-[12px] text-rose-200 font-semibold">
+                  {purgeError}
+                </div>
+              )}
+            </div>
+
+            {/* Footer actions */}
+            <div className="p-4 border-t border-white/5 flex flex-col sm:flex-row gap-2 bg-slate-950/40">
+              <button
+                onClick={() => {
+                  if (purgeLoading) return;
+                  setPurgeDialogOpen(false);
+                  setPurgePin('');
+                  setPurgeConfirmed(false);
+                  setPurgeError(null);
+                }}
+                disabled={purgeLoading}
+                className="btn-secondary sm:flex-1 !min-h-12 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handlePurgeLocal}
+                disabled={purgeLoading || !purgeConfirmed || purgePin.length < 4}
+                className="font-bold !min-h-12 sm:flex-[2] text-lg disabled:opacity-40 disabled:cursor-not-allowed
+                           rounded-2xl bg-gradient-to-b from-rose-500 to-rose-700 text-white
+                           ring-1 ring-inset ring-rose-400/40
+                           shadow-[0_8px_30px_-10px_rgba(244,63,94,0.7)]
+                           hover:brightness-110 active:scale-[0.98] transition-all"
+              >
+                {purgeLoading ? (
+                  <span className="inline-flex items-center gap-2">
+                    <span className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                    Wiping data…
+                  </span>
+                ) : (
+                  <>🗑️  Yes, Delete Everything</>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

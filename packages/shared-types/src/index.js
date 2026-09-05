@@ -226,6 +226,7 @@ export var Permission;
     Permission["ORDER_HOLD"] = "ORDER_HOLD";
     Permission["ORDER_VOID"] = "ORDER_VOID";
     Permission["ORDER_REFUND"] = "ORDER_REFUND";
+    Permission["ORDER_DELETE"] = "ORDER_DELETE";
     Permission["ORDER_DISCOUNT"] = "ORDER_DISCOUNT";
     Permission["ORDER_DISCOUNT_LARGE"] = "ORDER_DISCOUNT_LARGE";
     Permission["ORDER_COMPLETE"] = "ORDER_COMPLETE";

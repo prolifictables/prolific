@@ -11,6 +11,7 @@ import { ConfirmDialog, Modal } from '@/components/ui/Modal';
 import {
   apiGet,
   apiPost,
+  apiDelete,
   unwrapList,
   sid,
 } from '@/lib/api-client';
@@ -204,6 +205,9 @@ export default function OrdersPage() {
   const [actionLoading, setActionLoading] = useState(false);
   const [voidReason, setVoidReason] = useState('');
   const [lastFetchedAt, setLastFetchedAt] = useState<Date | null>(null);
+  const [showPurge, setShowPurge] = useState(false);
+  const [purgeReason, setPurgeReason] = useState('');
+  const [purgeLoading, setPurgeLoading] = useState(false);
 
   const role = getRole();
   const canVoidRefund =
@@ -448,6 +452,41 @@ export default function OrdersPage() {
       toast('Void failed', { description: err.message, variant: 'error' });
     } finally {
       setActionLoading(false);
+    }
+  };
+
+  // --- Bulk Purge (Clear All Orders) ---
+  // Requires ORDER_DELETE permission on the server. Server also blocks if
+  // an OPEN shift exists in the branch (shift aggregates must reconcile).
+  const handlePurgeAll = async () => {
+    setPurgeLoading(true);
+    try {
+      const res: any = await apiDelete('/orders/-/purge', {
+        body: {
+          confirm: true,
+          reason: purgeReason?.trim() || undefined,
+        },
+      });
+      const summary = [
+        res?.ordersDeleted ? `${res.ordersDeleted.toLocaleString()} orders` : null,
+        res?.paymentsDeleted ? `${res.paymentsDeleted.toLocaleString()} payments` : null,
+        res?.kitchenOrdersDeleted ? `${res.kitchenOrdersDeleted.toLocaleString()} kitchen tickets` : null,
+        res?.tableSessionsClosed ? `${res.tableSessionsClosed.toLocaleString()} sessions closed` : null,
+      ].filter(Boolean).join(', ');
+      toast('All orders cleared', {
+        description: summary || 'Sales data wiped successfully. Ready for fresh orders.',
+        variant: 'success',
+      });
+      setShowPurge(false);
+      setPurgeReason('');
+      await fetchOrders();
+    } catch (err: any) {
+      toast('Failed to clear orders', {
+        description: err?.message || 'Unknown error. Close any open shift first.',
+        variant: 'error',
+      });
+    } finally {
+      setPurgeLoading(false);
     }
   };
 
@@ -809,6 +848,27 @@ export default function OrdersPage() {
               </>
             )}
           </Badge>
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={() => {
+              setPurgeReason('');
+              setShowPurge(true);
+            }}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-4 w-4"
+            >
+              <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" />
+            </svg>
+            Clear All
+          </Button>
           <Button variant="outline" size="sm" onClick={fetchOrders}>
             <svg
               viewBox="0 0 24 24"
@@ -1117,6 +1177,45 @@ export default function OrdersPage() {
             />
           </div>
         )}
+      </ConfirmDialog>
+
+      {/* Purge All Orders Confirm Dialog */}
+      <ConfirmDialog
+        open={showPurge}
+        onClose={() => {
+          setShowPurge(false);
+          setPurgeReason('');
+        }}
+        onConfirm={handlePurgeAll}
+        title="Clear All Orders"
+        description="This permanently deletes ALL orders, payments, kitchen tickets and zeroes sales aggregates. Table sessions are closed and shift totals are reset. Close any open shift first — this will fail if a shift is still open. This action cannot be undone."
+        confirmText="Permanently Delete Everything"
+        variant="danger"
+        loading={purgeLoading}
+      >
+        <div className="mb-2">
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">
+            Reason (optional)
+          </label>
+          <textarea
+            className="w-full rounded-xl border border-slate-200 px-4 py-2.5 text-sm focus:border-rose-400 focus:ring-2 focus:ring-rose-100 outline-none"
+            rows={3}
+            placeholder="e.g. Clearing demo / QA data before go-live"
+            value={purgeReason}
+            onChange={(e) => setPurgeReason(e.target.value)}
+          />
+        </div>
+        <div className="rounded-xl bg-rose-50 border border-rose-200 px-4 py-3 text-xs text-rose-700 space-y-1">
+          <div>
+            <strong>⚠️ Before you continue:</strong>
+          </div>
+          <ul className="list-disc list-inside space-y-0.5">
+            <li>Make sure <strong>no open shift exists</strong> — purge will reject otherwise</li>
+            <li>Every order, payment and ticket in this branch will be erased</li>
+            <li>Revenue KPIs and shift totals will return to ₦0</li>
+            <li>The action is audit-logged with your admin account</li>
+          </ul>
+        </div>
       </ConfirmDialog>
     </div>
   );

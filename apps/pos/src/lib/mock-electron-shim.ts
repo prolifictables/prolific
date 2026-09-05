@@ -3943,6 +3943,81 @@ export function installMockElectronAPI() {
           availableYears: async (scope?: any) => { await delay(5); return listAvailableYears(scope); },
         };
       })(),
+
+      // --- Danger Zone: local purge for browser/dev mode ---
+      // Mirrors the Electron IPC db:admin:purgeAllLocalSalesData behaviour.
+      // Wipes orders + payments, closes table sessions, zeroes open shift totals.
+      admin: (() => {
+        const purgeAllLocalSalesData = async (_opts?: any) => {
+          await delay(10);
+          // Count before wipe so we can return a summary matching Electron's shape.
+          const ordersBefore = mockOrders.length;
+          const paymentsBefore = mockPayments.length;
+          const sessionsBefore = mockTableSessions.filter(
+            (s) => !s.status || s.status === 'OPEN' || s.status === 'AWAITING_PAYMENT' || s.status === 'PARTIALLY_PAID'
+          ).length;
+
+          // 1) Wipe orders + payments arrays
+          mockOrders.length = 0;
+          mockPayments.length = 0;
+
+          // 2) Close & zero open table sessions (don't delete rows — preserve
+          //    last-7 lookup history, just mark CLOSED with zero totals).
+          const now = Date.now();
+          for (const s of mockTableSessions) {
+            const st = String(s.status || 'OPEN').toUpperCase();
+            if (st === 'OPEN' || st === 'AWAITING_PAYMENT' || st === 'PARTIALLY_PAID') {
+              s.status = 'CLOSED' as any;
+              s.totalCents = 0;
+              s.paidAmountCents = 0;
+              s.balanceDueCents = 0;
+              s.taxCents = 0;
+              s.tipCents = 0;
+              s.discountCents = 0;
+              s.currentOrderId = null;
+              if (!s.closedAt) { s.closedAt = now; }
+            }
+          }
+
+          // 3) Zeroize order-derived aggregates on the open shift row.
+          if (mockOpenShift && (!mockOpenShift.status || mockOpenShift.status === 'OPEN')) {
+            (mockOpenShift as any).grossSalesCents = 0;
+            (mockOpenShift as any).gross_sales_cents = 0;
+            (mockOpenShift as any).netSalesCents = 0;
+            (mockOpenShift as any).net_sales_cents = 0;
+            (mockOpenShift as any).taxCents = 0;
+            (mockOpenShift as any).tax_cents = 0;
+            (mockOpenShift as any).tipCents = 0;
+            (mockOpenShift as any).tip_cents = 0;
+            (mockOpenShift as any).discountCents = 0;
+            (mockOpenShift as any).discount_cents = 0;
+            (mockOpenShift as any).refundCents = 0;
+            (mockOpenShift as any).refund_cents = 0;
+            (mockOpenShift as any).cashPaidCents = 0;
+            (mockOpenShift as any).cash_paid_cents = 0;
+            (mockOpenShift as any).cardPaidCents = 0;
+            (mockOpenShift as any).card_paid_cents = 0;
+            (mockOpenShift as any).transferPaidCents = 0;
+            (mockOpenShift as any).transfer_paid_cents = 0;
+            (mockOpenShift as any).onlinePaidCents = 0;
+            (mockOpenShift as any).online_paid_cents = 0;
+            (mockOpenShift as any).ordersCount = 0;
+            (mockOpenShift as any).orders_count = 0;
+            (mockOpenShift as any).paymentsCount = 0;
+            (mockOpenShift as any).payments_count = 0;
+            // Re-save so multi-tab / post-refresh sees zeroed aggregates.
+            saveMockOpenShiftToStorage(mockOpenShift);
+          }
+
+          return {
+            orders: { ordersDeleted: ordersBefore, orderItemsDeleted: 0, modifiersDeleted: 0 },
+            payments: { paymentsDeleted: paymentsBefore, cashAdjustmentsDeleted: 0 },
+            sessions: { sessionsClosed: sessionsBefore, ledgerEntriesDeleted: 0 },
+            shifts: { shiftsZeroized: mockOpenShift ? 1 : 0 },
+          };
+        };
+        return { purgeAllLocalSalesData };
+      })(),
     },
 
     customerDisplay: {

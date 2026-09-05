@@ -20,6 +20,7 @@ import { LoyaltyModule } from '../loyalty/loyalty.module';
 import { ShiftsModule } from '../shifts/shifts.module';
 import { UsersModule } from '../users/users.module';
 import { EmployeesModule } from '../employees/employees.module';
+import { PaymentsModule } from '../payments/payments.module';
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { EmployeesModule } from '../employees/employees.module';
     ShiftsModule,
     UsersModule,
     EmployeesModule,
+    PaymentsModule,
     // JwtModule for verifying short-lived manager approval tokens
     JwtModule.register({}),
   ],

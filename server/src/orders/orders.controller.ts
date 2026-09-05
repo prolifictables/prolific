@@ -274,4 +274,29 @@ export class OrdersController {
  opts.approvalToken = body.approvalToken;
  return this.ordersService.updateOrderStatus(user, id, S.OrderStatus.CANCELLED, opts);
  }
+
+ // ---------------------------------------------------------------------------
+ // DELETE /orders/-/purge — DANGER: bulk wipe all orders in the current branch
+ // REQUIRED: ORDER_DELETE permission + explicit confirm:true body +
+ // shift must NOT be OPEN in the branch. Cascade wipes: orders, kitchen
+ // display tickets, payment ledger rows, zeroes shift order-derived
+ // aggregates, closes + zeroes open table sessions.
+ // ---------------------------------------------------------------------------
+ @Delete('-/purge')
+ @HttpCode(200)
+ @RequiredPermissions(S.Permission.ORDER_DELETE)
+ @Audit({
+   action: S.AuditAction.DELETE,
+   entityType: 'ORDER',
+   captureChanges: false,
+ })
+ async purgeAllOrders(@Body() body: {
+   confirm: boolean;
+   reason?: string;
+ }, @CurrentUser() user: AuthContext) {
+   return this.ordersService.purgeAllOrders(user, {
+     confirm: body.confirm === true,
+     reason: body.reason ? String(body.reason).slice(0, 200) : undefined,
+   });
+ }
 }

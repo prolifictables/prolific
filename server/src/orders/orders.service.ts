@@ -20,6 +20,7 @@ import { Table } from '../tables/schemas/table.schema';
 import { Discount } from '../discounts/schemas/discount.schema';
 import { Tax } from '../taxes/schemas/tax.schema';
 import { Recipe } from '../menu/schemas/recipe.schema';
+import { Payment } from '../payments/schemas/payment.schema';
 import { InventoryItem } from '../inventory/schemas/inventory-item.schema';
 import { InventoryTransaction } from '../inventory/schemas/inventory-transaction.schema';
 import { LoyaltyAccount } from '../loyalty/schemas/loyalty-account.schema';
@@ -134,6 +135,7 @@ export class OrdersService {
     @InjectModel(Shift.name) private readonly shiftModel: Model<Shift>,
     @InjectModel(Employee.name) private readonly employeeModel: Model<Employee>,
     @InjectModel(User.name) private readonly userModel: Model<User>,
+    @InjectModel(Payment.name) private readonly paymentModel: Model<Payment>,
     private readonly jwtService: JwtService
   ) {}
 
@@ -567,24 +569,76 @@ export class OrdersService {
       new Set(data.map((d: any) => String(d.employeeId || '')).filter(Boolean))
     );
 
+    // -----------------------------------------------------------------------
+    // Table lookup MUST tolerate mixed-id strategies across channels:
+    //   - Admin / Website / QR flows write a Mongo ObjectId (24-char hex) as
+    //     order.tableId (matches Table model default _id).
+    //   - Offline POS / mock-electron-shim write a human-readable client PK
+    //     (e.g. "tbl-t1") or just the printable name (e.g. "T1") because
+    //     they never synced the seeded Mongo Table rows.
+    // Mongoose's schema-level _id cast throws a CastError ("Cast to ObjectId
+    // failed for value \"tbl-t1\" at path \"_id\" for model \"Table\"") when
+    // ANY non-ObjectId shape appears in a { _id: { $in: [...] } } clause — even
+    // inside $or — so we MUST partition the list first and query $in on
+    // objectIds only for the _id arm, falling back to name for the rest.
+    // -----------------------------------------------------------------------
+    const isMongoObjectIdShape = (s: string) =>
+      /^[0-9a-fA-F]{24}$/.test(s) && Types.ObjectId.isValid(s);
+
+    const oidTableIds: string[] = [];
+    const nameLikeTableIds: string[] = [];
+    for (const id of tableIds) {
+      if (isMongoObjectIdShape(id)) oidTableIds.push(id);
+      else nameLikeTableIds.push(id);
+    }
+
+    const tableOrClauses: Record<string, unknown>[] = [];
+    if (oidTableIds.length > 0) {
+      tableOrClauses.push({
+        _id: { $in: oidTableIds.map((id) => new Types.ObjectId(id)) },
+      });
+    }
+    if (nameLikeTableIds.length > 0) {
+      // Covers (a) explicit POS string PK "tbl-t1" stored on seeded rows AND
+      // (b) legacy name-only writes like "T1". We dedupe afterwards.
+      tableOrClauses.push({ name: { $in: nameLikeTableIds } });
+    }
+
     const [tables, customers, employees] = await Promise.all([
-      tableIds.length
-        ? this.tableModel.find({ _id: { $in: tableIds }, branchId }).exec()
+      tableOrClauses.length > 0
+        ? this.tableModel
+            .find({ $or: tableOrClauses, branchId })
+            .select('_id name qrCodeId')
+            .lean()
+            .exec()
         : Promise.resolve([]),
       customerIds.length
-        ? this.customerModel.find({ _id: { $in: customerIds }, branchId }).exec()
+        ? this.customerModel
+            .find({ _id: { $in: customerIds }, branchId })
+            .lean()
+            .exec()
         : Promise.resolve([]),
       employeeIds.length
-        ? this.employeeModel.find({ _id: { $in: employeeIds }, branchId }).exec()
+        ? this.employeeModel
+            .find({ _id: { $in: employeeIds }, branchId })
+            .lean()
+            .exec()
         : Promise.resolve([]),
     ]);
 
+    // Index tables three ways so any POS-originated string PK / Mongo OID / legacy
+    // name-only join finds the correct row:  _id.toString()  +  name  +  qrCodeId.
     const tableNameById = new Map<string, string>();
-    tables.forEach((t: any) => tableNameById.set(String(t._id), String(t.name)));
+    for (const t of tables as any[]) {
+      const name = String(t.name || '');
+      tableNameById.set(String(t._id), name);
+      if (t.name) tableNameById.set(String(t.name), name);
+      if (t.qrCodeId) tableNameById.set(String(t.qrCodeId), name);
+    }
     const customerById = new Map<string, any>();
-    customers.forEach((c: any) => customerById.set(String(c._id), c));
+    for (const c of customers as any[]) customerById.set(String(c._id), c);
     const employeeById = new Map<string, any>();
-    employees.forEach((e: any) => employeeById.set(String(e._id), e));
+    for (const e of employees as any[]) employeeById.set(String(e._id), e);
     const userIdSet = new Set<string>(
       employees
         .map((e: any) => String(e.userId || ''))
@@ -640,8 +694,23 @@ export class OrdersService {
       throw new NotFoundException(`Order ${id} not found`);
     }
     const doc: any = this.withVirtualId(order);
-    const [table, customer, employee] = await Promise.all([
-      doc.tableId ? this.tableModel.findOne({ _id: doc.tableId, branchId }).exec() : null,
+    // Mirror the mixed-id-tolerance from listOrders: POS writes non-ObjectId
+    // string PKs (tbl-t1 / T1) into order.tableId, so we can't blindly query
+    // by _id (throws CastError). Match by _id when shape-safe, else by name.
+    let table: any = null;
+    if (doc.tableId) {
+      const rawTableId = String(doc.tableId);
+      const shapeSafe = /^[0-9a-fA-F]{24}$/.test(rawTableId) && Types.ObjectId.isValid(rawTableId);
+      const tableQuery: Record<string, unknown> = shapeSafe
+        ? { _id: rawTableId, branchId }
+        : { name: rawTableId, branchId };
+      try {
+        table = await this.tableModel.findOne(tableQuery).lean().exec();
+      } catch (_err) {
+        table = null;
+      }
+    }
+    const [customer, employee] = await Promise.all([
       doc.customerId ? this.customerModel.findOne({ _id: doc.customerId, branchId }).exec() : null,
       doc.employeeId ? this.employeeModel.findOne({ _id: doc.employeeId, branchId }).exec() : null,
     ]);
@@ -1565,6 +1634,165 @@ export class OrdersService {
       default:
         return 1.0;
     }
+  }
+
+  // =========================================================================
+  // purgeAllOrders — DANGER. Branch-scoped bulk wipe of every order plus its
+  // linked payment ledger, kitchen display tickets, and open table sessions
+  // (anything that would otherwise dangle orphaned FK refs on the shift-
+  // closure aggregate sum tables or the payments refunds lookups). Used by
+  // the Admin orders page "Clear All Orders" button so the user can start
+  // taking fresh orders after the pre-seed / QA rows.
+  // =========================================================================
+  async purgeAllOrders(
+    ctx: AuthContext,
+    opts: { confirm: boolean; reason?: string } = { confirm: false }
+  ): Promise<{
+    ordersDeleted: number;
+    kitchenOrdersDeleted: number;
+    paymentsDeleted: number;
+    tableSessionsClosed: number;
+  }> {
+    const branchId = ctx.branchId;
+    const restaurantId = ctx.restaurantId;
+    if (!branchId) throw new BadRequestException('Branch context required');
+    if (!opts.confirm) {
+      throw new BadRequestException(
+        'Confirm flag is required. This operation is irreversible.'
+      );
+    }
+
+    // Safety: refuse to run while any shift is OPEN in the same branch. Cashier
+    // shift totals are pre-computed incremental aggregates over order rows —
+    // deleting orders mid-shift would make the shift-closure close() step
+    // reconcile an inconsistent "cash on hand vs order sales total" report.
+    const openShift = await this.shiftModel
+      .findOne({ branchId, status: 'OPEN' })
+      .select('_id')
+      .lean()
+      .exec();
+    if (openShift) {
+      throw new BadRequestException(
+        'Cannot purge orders while a shift is OPEN. Close the current shift first then retry.'
+      );
+    }
+
+    const orderFilter: Record<string, unknown> = { branchId };
+    if (restaurantId) orderFilter.restaurantId = restaurantId;
+
+    const [orderCountBefore, kitchenCountBefore, paymentCountBefore] = await Promise.all([
+      this.orderModel.countDocuments(orderFilter).exec(),
+      this.kitchenOrderModel.countDocuments({ branchId }).exec(),
+      this.paymentModel.countDocuments({ branchId }).exec(),
+    ]);
+
+    // Grab order IDs BEFORE deleteMany so we can cleanup denormalized kitchen/
+    // payment/table_session rows that store orderId as a plain string FK.
+    const orderIdStrings = (
+      await this.orderModel
+        .find(orderFilter, { _id: 1 })
+        .lean()
+        .exec()
+    ).map((o) => String((o as any)._id));
+
+    // Phase 1 — direct link rows we can wipe by branchId alone
+    const [kitchenDeleted, paymentDeleted, ordersDeleted] = await Promise.all([
+      this.kitchenOrderModel
+        .deleteMany({ branchId })
+        .exec()
+        .then((r) => r.deletedCount || 0),
+      this.paymentModel
+        .deleteMany({ branchId })
+        .exec()
+        .then((r) => r.deletedCount || 0),
+      this.orderModel
+        .deleteMany(orderFilter)
+        .exec()
+        .then((r) => r.deletedCount || 0),
+    ]);
+
+    // Phase 2 — Table sessions (running tabs): clear any attached order refs
+    // and close the session. A full table_session DELETE could break the POS
+    // "last 7 open sessions" lookups, so we mark CLOSED + null the order
+    // ledger + zero totals instead. The user will see "fresh zero totals" as
+    // expected after the purge.
+    let tableSessionsClosed = 0;
+    try {
+      if (orderIdStrings.length > 0) {
+        const updateOpen = await this.tableSessionModel
+          .updateMany(
+            { branchId, status: { $nin: ['CLOSED', 'VOIDED'] } },
+            {
+              $set: {
+                status: 'CLOSED',
+                closedAt: new Date(),
+                orders: [],
+                lineItems: [],
+                discountCents: 0,
+                taxCents: 0,
+                tipCents: 0,
+                subtotalCents: 0,
+                totalCents: 0,
+                paidAmountCents: 0,
+                balanceDueCents: 0,
+              },
+            }
+          )
+          .exec();
+        tableSessionsClosed = updateOpen.modifiedCount || 0;
+      }
+    } catch (err) {
+      this.logger.error(
+        `purgeAllOrders: table sessions cleanup failed: ${(err as Error).message}`
+      );
+    }
+
+    // Phase 3 — Shift aggregates: if any CLOSED shifts still exist in this
+    // branch that referenced the (now deleted) order rows, their
+    // orderCount/grossSales/tax totals precomputed fields are stale. We do NOT
+    // delete shift rows (user might want audit trail) but we zero the order-
+    // derived aggregate columns so reports read as "starting fresh" from here.
+    try {
+      await this.shiftModel
+        .updateMany(
+          { branchId },
+          {
+            $set: {
+              orderCount: 0,
+              itemCount: 0,
+              grossSalesCents: 0,
+              discountCents: 0,
+              taxCents: 0,
+              tipCents: 0,
+              netSalesCents: 0,
+              cashSalesCents: 0,
+              cardSalesCents: 0,
+              transferSalesCents: 0,
+              onlineSalesCents: 0,
+              refundCents: 0,
+              voidCents: 0,
+              totalPaidCents: 0,
+              expectedCashCents: 0,
+              varianceCents: 0,
+            },
+          }
+        )
+        .exec();
+    } catch (err) {
+      this.logger.error(
+        `purgeAllOrders: shift aggregate zeroing failed: ${(err as Error).message}`
+      );
+    }
+
+    this.logger.warn(
+      `PURGE ALL ORDERS [branch=${branchId}] by employee=${ctx.employeeId || ctx.userId || 'unknown'} reason=${opts.reason || 'none'} — orders=${ordersDeleted}/${orderCountBefore} kitchen=${kitchenDeleted}/${kitchenCountBefore} payments=${paymentDeleted}/${paymentCountBefore} sessionsClosed=${tableSessionsClosed}`
+    );
+    return {
+      ordersDeleted,
+      kitchenOrdersDeleted: kitchenDeleted,
+      paymentsDeleted: paymentDeleted,
+      tableSessionsClosed,
+    };
   }
 
   /**

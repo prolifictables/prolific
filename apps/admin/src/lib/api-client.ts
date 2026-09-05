@@ -222,14 +222,17 @@ export async function apiPatch<T>(
   return unwrap<T>(res);
 }
 
-export async function apiDelete<T>(path: string, opts?: { headers?: HeadersInit }): Promise<T> {
+export async function apiDelete<T>(path: string, opts?: { headers?: HeadersInit; body?: unknown }): Promise<T> {
+  const hasBody = opts?.body !== undefined;
   const res = await guardedFetch(() =>
     fetch(`${API_BASE}${path}`, {
       method: 'DELETE',
       headers: {
+        'Content-Type': hasBody ? 'application/json' : undefined,
         ...authHeaders(),
         ...(opts?.headers || {}),
-      },
+      } as HeadersInit,
+      ...(hasBody ? { body: JSON.stringify(opts!.body) } : {}),
     })
   );
   return unwrap<T>(res);

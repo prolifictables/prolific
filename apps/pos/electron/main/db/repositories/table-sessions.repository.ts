@@ -142,6 +142,47 @@ export class TableSessionsRepository {
     );
   }
 
+  /** Danger: zero/close running tabs after a full purge. Wipes the ledger
+   *  rows that reference the (now-deleted) order IDs and closes any session
+   *  that isn't already CLOSED or VOIDED to avoid stale open tabs showing up
+   *  in the TablePickerModal. */
+  zeroizeOpenSessions(branchId?: string): { closed: number; ledgerDeleted: number } {
+    const branchClause =
+      typeof branchId === 'string' && branchId ? 'WHERE branch_id = ?' : '';
+    const params: unknown[] = typeof branchId === 'string' && branchId ? [branchId] : [];
+
+    const ledgerResult = this.db.run(
+      `DELETE FROM table_session_ledger
+       WHERE table_session_id IN (
+         SELECT id FROM table_sessions ${branchClause}
+       )`,
+      ...params
+    );
+    const closeResult = this.db.run(
+      `UPDATE table_sessions SET
+         status = 'CLOSED',
+         closed_at = unixepoch('now')*1000,
+         subtotal_cents = 0,
+         discount_cents = 0,
+         tax_cents = 0,
+         tip_cents = 0,
+         total_cents = 0,
+         paid_amount_cents = 0,
+         balance_due_cents = 0,
+         current_order_id = NULL,
+         local_version = local_version + 1,
+         synced = 0,
+         updated_at = unixepoch('now')*1000
+       ${branchClause ? `${branchClause} AND status NOT IN ('CLOSED','VOIDED')`
+         : "WHERE status NOT IN ('CLOSED','VOIDED')"}`,
+      ...params
+    );
+    return {
+      closed: closeResult?.changes ?? 0,
+      ledgerDeleted: ledgerResult?.changes ?? 0,
+    };
+  }
+
   updateStatus(
     id: string,
     status: TableSessionRow['status'],

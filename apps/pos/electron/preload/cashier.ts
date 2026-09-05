@@ -288,6 +288,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       availableYears: (scope?: unknown) =>
         invokeDb('db:reports:availableYears', scope),
     },
+
+    admin: {
+      purgeAllLocalSalesData: (opts?: unknown) =>
+        invokeDb('db:admin:purgeAllLocalSalesData', opts),
+    },
   },
 
   sync: {

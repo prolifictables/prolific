@@ -93,6 +93,53 @@ export class PaymentsRepository {
     );
   }
 
+  /** Danger: wipe all payment rows for the given branch (or every row when no
+   *  branch passed). Pair with orders.deleteAll() so the payment ledger
+   *  totals match the orders totals on the next shift. */
+  deleteAll(branchId?: string): { paymentsDeleted: number; cashAdjustmentsDeleted: number } {
+    const branchClause =
+      typeof branchId === 'string' && branchId ? 'WHERE branch_id = ?' : '';
+    const params: unknown[] = typeof branchId === 'string' && branchId ? [branchId] : [];
+    const cashAdjResult = this.db.run(
+      `DELETE FROM cash_adjustments
+       WHERE shift_id IN (
+         SELECT id FROM shifts ${branchClause}
+       )`,
+      ...params
+    );
+    const paymentsResult = this.db.run(
+      `DELETE FROM payments ${branchClause}`,
+      ...params
+    );
+    return {
+      paymentsDeleted: paymentsResult?.changes ?? 0,
+      cashAdjustmentsDeleted: cashAdjResult?.changes ?? 0,
+    };
+  }
+
+  /** Danger: zero-out order-derived aggregate columns on every shift row for
+   *  the given branch. Preserves the open/closed timestamps + opening cash so
+   *  older closed shifts still appear on the shift audit trail, but KPI sums
+   *  read as "fresh start" on the next close. */
+  zeroizeShiftAggregates(branchId?: string): { updated: number } {
+    const branchClause =
+      typeof branchId === 'string' && branchId ? 'WHERE branch_id = ?' : '';
+    const params: unknown[] = typeof branchId === 'string' && branchId ? [branchId] : [];
+    const r = this.db.run(
+      `UPDATE shifts SET
+         cash_sales_cents = 0,
+         card_sales_cents = 0,
+         other_sales_cents = 0,
+         refunds_cents = 0,
+         expected_cash_cents = COALESCE(opening_cash_cents, 0),
+         variance_cents = 0,
+         updated_at = unixepoch('now')*1000
+       ${branchClause}`,
+      ...params
+    );
+    return { updated: r?.changes ?? 0 };
+  }
+
   listByShiftId(shiftId: string): PaymentRow[] {
     return this.db.all<PaymentRow>(
       'SELECT * FROM payments WHERE shift_id = ? ORDER BY created_at ASC',

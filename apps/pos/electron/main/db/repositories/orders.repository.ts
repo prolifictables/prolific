@@ -188,6 +188,47 @@ export class OrdersRepository {
     this.db.run('DELETE FROM order_items WHERE id = ?', orderItemId);
   }
 
+  /** Danger: cascade-wipe every order + order item + modifier option row in
+   *  the local SQLite database (not the remote server). Used by the Manager
+   *  Tools → "Clear local orders & sales data" action so the POS kiosk can
+   *  start taking 100% fresh orders without the old seeded/demo rows leaking
+   *  into the new shift totals after the server-side purge has already been
+   *  performed on the Admin dashboard. */
+  deleteAll(branchId?: string): {
+    ordersDeleted: number;
+    orderItemsDeleted: number;
+    modifiersDeleted: number;
+  } {
+    const branchClause =
+      typeof branchId === 'string' && branchId ? 'WHERE branch_id = ?' : '';
+    const params: unknown[] = typeof branchId === 'string' && branchId ? [branchId] : [];
+
+    const modifierResult = this.db.run(
+      `DELETE FROM order_item_modifier_options
+       WHERE order_item_id IN (
+         SELECT id FROM order_items WHERE order_id IN (
+           SELECT id FROM orders ${branchClause}
+         )
+       )`,
+      ...params
+    );
+    const itemsResult = this.db.run(
+      `DELETE FROM order_items WHERE order_id IN (
+         SELECT id FROM orders ${branchClause}
+       )`,
+      ...params
+    );
+    const ordersResult = this.db.run(
+      `DELETE FROM orders ${branchClause}`,
+      ...params
+    );
+    return {
+      ordersDeleted: ordersResult?.changes ?? 0,
+      orderItemsDeleted: itemsResult?.changes ?? 0,
+      modifiersDeleted: modifierResult?.changes ?? 0,
+    };
+  }
+
   listByShiftId(shiftId: string, limit = 200): OrderRow[] {
     return this.db.all<OrderRow>(
       `SELECT o.* FROM orders o
