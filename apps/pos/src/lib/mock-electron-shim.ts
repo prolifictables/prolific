@@ -1413,15 +1413,29 @@ export function installMockElectronAPI() {
       : '';
     return `
       ${tearBar}
-      <div class="cut-spacer" role="separator" aria-hidden="true"></div>
+      <div class="cut-spacer" role="separator" aria-hidden="true">&nbsp;</div>
       <div class="feed-lines" aria-hidden="true">${feedLines}</div>
     `;
   };
   const MOCK_PAPER_CUT_CSS = `
     .tear-off { width: 100%; border-top: 1px dashed #000; border-bottom: 1px dashed #000; margin: 6mm 0 2mm 0; padding: 0.5mm 0; text-align: center; }
     .tear-off span { font-family: 'Courier New', Courier, monospace; font-size: 9px; line-height: 1; letter-spacing: 0.2em; color: #000; opacity: 0.75; }
-    .cut-spacer { height: 32mm; width: 100%; visibility: hidden; overflow: hidden; }
-    .feed-lines .feed-line { width: 100%; height: 11px; line-height: 11px; visibility: hidden; font-size: 11px; }
+    /* HYP10 FIX: visibility:hidden → color/background:transparent (fully rasterized, zero visible ink).
+       HYP12 ESCALATION: transparent color still lets some "advanced blank-skip drivers
+       still drop fully-white raster regions. Adding sub-visual 1-ink-dot-per-200px repeating
+       pattern via background-image: every single scan-line now contains ≥1 non-whit non-blank pixel
+       (at 0.2% opacity) → driver cannot skip any line of the spacer/feed region, so
+       paper feed advances full 35mm + 12 feed-lines. Height 35mm (upper of 32-35mm rule). */
+    .cut-spacer {
+      height: 35mm; width: 100%; overflow: hidden; line-height: 1px;
+      color: transparent; background: transparent;
+      background-image: repeating-linear-gradient(90deg, rgba(0,0,0,0.002) 0px, rgba(0,0,0,0.002) 1px, rgba(0,0,0,0) 1px, rgba(0,0,0,0) 200px);
+    }
+    .feed-lines .feed-line {
+      width: 100%; height: 11px; line-height: 11px; font-size: 11px;
+      color: transparent; background: transparent;
+      background-image: repeating-linear-gradient(90deg, rgba(0,0,0,0.002) 0px, rgba(0,0,0,0.002) 1px, rgba(0,0,0,0) 1px, rgba(0,0,0,0) 200px);
+    }
     .tear-off, .cut-spacer, .feed-lines, .feed-line { page-break-inside: avoid; break-inside: avoid; }
   `;
 
@@ -1768,7 +1782,7 @@ export function installMockElectronAPI() {
       iframe.style.right = '-9999px';
       iframe.style.top = '0';
       iframe.style.width = '400px';
-      iframe.style.height = '1200px';
+      iframe.style.height = '30000px';
       iframe.style.border = '0';
       iframe.style.opacity = '0';
       iframe.style.pointerEvents = 'none';

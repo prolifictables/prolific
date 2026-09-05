@@ -206,8 +206,41 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
             let finalPinHash: string | null | undefined;
             const prior = id ? existingPinHash.get(id) : undefined;
             if (prior && isBcryptHash(prior)) {
+              // H7b guard: valid stored bcrypt pin_hash already exists from a
+              // real cashier login via upsertWithPin on this terminal.
+              // Reuse it DIRECTLY without re-entering the else chain so we
+              // never waste 50-100 ms of main-thread CPU on bcrypt.hashSync
+              // for this employee during the 15s idle refresh cycle.
               finalPinHash = prior;
-            } else {
+
+              // Belt-and-suspenders explicit check: even if the outer
+              // conditional somehow regressed, refuse to hash unless the
+              // incoming server payload EXPLICITLY carries a new pin value
+              // or a structural bcrypt pin_hash meant to OVERWRITE what we
+              // have.  The admin server almost never sends a pin_hash over
+              // REST (security) and almost never carries e.pin either, so
+              // this branch is almost always true on routine refreshes.
+              const hasIncomingPinPlaintext =
+                typeof e.pin === 'string' && e.pin.trim().length >= 4;
+              const hasIncomingStructuralPinHash =
+                (typeof e.pinHash === 'string' && isBcryptHash(e.pinHash)) ||
+                (typeof e.pin_hash === 'string' && isBcryptHash(e.pin_hash));
+              if (!hasIncomingPinPlaintext && !hasIncomingStructuralPinHash) {
+                // No explicit pin override from server — keep prior,
+                // return the employee row immediately without falling
+                // through to any hashing or re-resolution below.
+              } else {
+                // Explicit override present on this row.  Let the else-if
+                // resolution logic below run so the override value wins.
+                finalPinHash = undefined;
+              }
+            }
+            if (!finalPinHash) {
+              // First-time processing for this employee OR an explicit pin
+              // override arrived in the server payload.  Resolve pin_hash
+              // from (descending priority): valid bcrypt from server →
+              // plaintext e.pin (hash now) → any raw string (hash now) →
+              // NULL (no offline login for this row until they log in once).
               const rawServerPinHash =
                 e.pinHash != null ? String(e.pinHash) :
                 e.pin_hash != null ? String(e.pin_hash) : undefined;

@@ -526,8 +526,8 @@ function registerPrintHandlers(): void {
   // pushes footer lines past the printer-tear bar on models WITHOUT cutter
   // (staff tears manually at the dashed line).
   const renderPaperCutSpacer = (jobKind: 'receipt' | 'kitchen'): string => {
-    // 12 thin feed lines (about 6–8 mm) + 32mm tall invisible cut spacer
-    // = ~40mm of blank paper after the footer. Adjust amount if cut happens
+    // 12 thin feed lines (about 6–8 mm) + 35mm tall invisible cut spacer
+    // = ~43mm of blank paper after the footer. Adjust amount if cut happens
     // too early or too late on your printer fleet.
     const feedLines = Array.from({ length: 12 }, () => `<div class="feed-line">&nbsp;</div>`).join('');
     // Dashed tear-off cut line (visible on non-cutter printers so staff knows
@@ -537,7 +537,7 @@ function registerPrintHandlers(): void {
       : '';
     return `
       ${tearBar}
-      <div class="cut-spacer" role="separator" aria-hidden="true"></div>
+      <div class="cut-spacer" role="separator" aria-hidden="true">&nbsp;</div>
       <div class="feed-lines" aria-hidden="true">${feedLines}</div>
     `;
   };
@@ -565,25 +565,35 @@ function registerPrintHandlers(): void {
       color: #000;
       opacity: 0.75;
     }
-    /* Blank spacer div (32mm) = tall enough block so Chromium rasterizes a
+    /* Blank spacer div (35mm) = tall enough block so Chromium rasterizes a
        region of empty paper past the last visible line. Thermal auto-cutter
-       fires at last-rasterized scan line; 32mm + 12 feed lines = ~40mm
+       fires at last-rasterized scan line; 35mm + 12 feed lines = ~43mm
        after footer which is the standard "cut here" position on 80mm EPSON /
-       Xprinter / Zjiang / Gprinter hardware. */
+       Xprinter / Zjiang / Gprinter hardware.
+       HYP10 FIX: removed visibility:hidden → color/background:transparent.
+       HYP12 ESCALATION: transparent still leaves scan lines fully-white still blank-skip-optimised by aggressive drivers → inject sub-visual 0.2%-opacity ink dot every 200px horizontally;
+       so every scan line has ≥1 non-blank pixel → driver cannot collapse; paper advances full height.
+       Height: 35mm (upper bound permanent rule) 32-35mm). */
     .cut-spacer {
-      height: 32mm;
+      height: 35mm;
       width: 100%;
-      visibility: hidden;
       overflow: hidden;
+      line-height: 1px;
+      color: transparent;
+      background: transparent;
+      background-image: repeating-linear-gradient(90deg, rgba(0,0,0,0.002) 0px, rgba(0,0,0,0.002) 1px, rgba(0,0,0,0) 1px, rgba(0,0,0,0) 200px);
     }
     /* 12 lines of non-breaking space (≈ 6–8 mm) so 58mm narrow printers
-       without cutter also get enough paper past the tear bar. */
+       without cutter also get enough paper past the tear bar.
+       HYP12: same sub-visual dot pattern (see .cut-spacer above). */
     .feed-lines .feed-line {
       width: 100%;
       height: 11px;
       line-height: 11px;
-      visibility: hidden;
       font-size: 11px;
+      color: transparent;
+      background: transparent;
+      background-image: repeating-linear-gradient(90deg, rgba(0,0,0,0.002) 0px, rgba(0,0,0,0.002) 1px, rgba(0,0,0,0) 1px, rgba(0,0,0,0) 200px);
     }
     /* Ensure spacer blocks don't get page-broken — we want cut offset to
        always be at the very end of the single document page. */

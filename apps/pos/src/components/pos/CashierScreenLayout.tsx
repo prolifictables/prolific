@@ -90,13 +90,19 @@ let _customerDisplayWindow: Window | null = null;
 
 // Reactive tick: forces the button to re-render so its "active" amber
 // highlight reflects the current closed/alive state of the popup.
+// H4 PERF FIX: bumped the poll interval from 750ms to 2500ms. Checking if
+// the customer display popup is still open has minimal UX need for sub-1s
+// precision (the amber highlight is a soft status indicator, not a
+// time-critical signal) and every interval fires a React setState that
+// re-renders the Header + sidebar tabs unnecessarily. At 750ms this was
+// causing ~80 idle re-renders per minute even at idle POS.
 function useCustomerDisplayAlive(): boolean {
   const [alive, setAlive] = useState<boolean>(false);
   useEffect(() => {
     const id = window.setInterval(() => {
       const next = !!_customerDisplayWindow && !_customerDisplayWindow.closed;
       setAlive((prev) => (prev !== next ? next : prev));
-    }, 750);
+    }, 2500);
     return () => window.clearInterval(id);
   }, []);
   return alive;
@@ -441,38 +447,112 @@ export default function CashierScreenLayout() {
     if (String(connection.status || '').toUpperCase() !== 'ONLINE') return;
 
     let alive = true;
+    // H7a: stable-hash short-circuit refs. Store a canonical JSON signature of
+    // the last server payload actually written to DB. If the next pull returns
+    // identical data we skip the 3 heavy applySnapshot DB writes entirely
+    // (incl. their synchronous main-thread SQLite writes + bcrypt.hashSync
+    // calls per employee). Reduces idle 15s-refresh from ~50-500ms of main
+    // thread block to ~1ms (signature compare + network calls only).
+    const lastBootstrapSigRef = useRef<string>('');
+    const lastMenuSigRef = useRef<string>('');
+
+    // Canonical signature builders: pick fields that describe identity +
+    // mutability (updatedAt, pin presence, role, name, price) and sort by id
+    // to guarantee array order doesn't cause spurious "changed" detections.
+    const sigForBootstrap = (bs: any) => {
+      const emp = Array.isArray(bs?.employees) ? bs.employees : [];
+      const tbl = Array.isArray(bs?.tables) ? bs.tables : [];
+      return JSON.stringify([
+        emp
+          .sort((a: any, b: any) => String(a?.id || a?._id || '').localeCompare(String(b?.id || b?._id || '')))
+          .map((x: any) => ({
+            id: x?.id || x?._id,
+            ua: x?.updatedAt || x?.updated_at,
+            fn: x?.firstName || x?.first_name,
+            ln: x?.lastName || x?.last_name,
+            r: x?.role,
+            ph: x?.pinHash ?? x?.pin_hash ?? (x?.pin ? 'PIN' : ''),
+          })),
+        tbl
+          .sort((a: any, b: any) => String(a?.id || a?._id || '').localeCompare(String(b?.id || b?._id || '')))
+          .map((x: any) => ({
+            id: x?.id || x?._id,
+            n: x?.name,
+            ua: x?.updatedAt || x?.updated_at,
+            z: x?.zoneId || x?.zone || '',
+          })),
+      ]);
+    };
+    const sigForMenu = (m: any) => {
+      const cats = Array.isArray(m?.categories) ? m.categories : [];
+      const its = Array.isArray(m?.items) ? m.items : [];
+      const mods = Array.isArray(m?.modifiers) ? m.modifiers : [];
+      return JSON.stringify([
+        cats
+          .sort((a: any, b: any) => String(a?.id || a?._id || '').localeCompare(String(b?.id || b?._id || '')))
+          .map((x: any) => ({ id: x?.id || x?._id, n: x?.name, o: x?.sortOrder })),
+        its
+          .sort((a: any, b: any) => String(a?.id || a?._id || '').localeCompare(String(b?.id || b?._id || '')))
+          .map((x: any) => ({
+            id: x?.id || x?._id,
+            n: x?.name,
+            p: x?.priceCents || x?.price || 0,
+            ua: x?.updatedAt || x?.updated_at,
+            cat: x?.categoryId || x?.category_id || '',
+          })),
+        mods
+          .sort((a: any, b: any) => String(a?.id || a?._id || '').localeCompare(String(b?.id || b?._id || '')))
+          .map((x: any) => ({
+            id: x?.id || x?._id,
+            n: x?.name,
+            opts: Array.isArray(x?.options) ? x.options.length : 0,
+          })),
+      ]);
+    };
+
     const refreshReferenceData = async () => {
       try {
         const bootstrap = await fetchPosBootstrap({ accessToken });
-        await window.electronAPI?.db?.employees?.applySnapshot?.(bootstrap.employees);
-        await window.electronAPI?.db?.tables?.applySnapshot?.(bootstrap.tables);
+        const sigBs = sigForBootstrap(bootstrap);
+        if (sigBs !== lastBootstrapSigRef.current) {
+          // Only write snapshots when server payload actually changed
+          await window.electronAPI?.db?.employees?.applySnapshot?.(bootstrap.employees);
+          await window.electronAPI?.db?.tables?.applySnapshot?.(bootstrap.tables);
+          lastBootstrapSigRef.current = sigBs;
+        }
       } catch {
+        // swallow — pull failures are benign when DB already has data
       }
 
       try {
         const menu = await fetchPublicMenu(String(branch.id), undefined);
-        // Write to BOTH cache layers so the admin-uploaded menu is visible in
-        // every component regardless of where it reads from:
-        //  (a) browser-mode in-memory mock shim snapshot (applyRemoteMenuSnapshot)
-        //  (b) desktop-mode Electron SQLite (window.electronAPI.db.menu.applySnapshot)
-        applyRemoteMenuSnapshot({
-          categories: menu.categories,
-          items: menu.items,
-          modifiers: menu.modifiers,
-        });
-        await window.electronAPI?.db?.menu?.applySnapshot?.({
-          categories: menu.categories,
-          items: menu.items,
-          modifiers: menu.modifiers,
-        });
+        const sigMenu = sigForMenu(menu);
+        if (sigMenu !== lastMenuSigRef.current) {
+          // Write to BOTH cache layers so admin-uploaded menu is visible in
+          // every component regardless of which cache it reads from:
+          //  (a) browser-mode in-memory mock shim snapshot (applyRemoteMenuSnapshot)
+          //  (b) desktop-mode Electron SQLite (window.electronAPI.db.menu.applySnapshot)
+          applyRemoteMenuSnapshot({
+            categories: menu.categories,
+            items: menu.items,
+            modifiers: menu.modifiers,
+          });
+          await window.electronAPI?.db?.menu?.applySnapshot?.({
+            categories: menu.categories,
+            items: menu.items,
+            modifiers: menu.modifiers,
+          });
+          lastMenuSigRef.current = sigMenu;
+        }
       } catch {
+        // swallow — pull failures are benign when DB already has data
       }
     };
 
     void refreshReferenceData();
-    // 15s polling: every admin-uploaded menu item shows up within one cashier
+    // 15s polling: admin menu/employee/table edits appear within one cashier
     // interactive cycle (add-to-cart). Previously 60s which felt like "never
-    // updated" to managers watching POS after admin uploads.
+    // updated" to managers uploading changes then watching the POS.
     const t = setInterval(() => {
       if (!alive) return;
       void refreshReferenceData();

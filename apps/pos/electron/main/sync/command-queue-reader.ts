@@ -13,7 +13,14 @@ import { calculateExponentialBackoff, isRetryableStatusCode } from './retry';
 
 const MAX_ATTEMPTS = 5;
 const BATCH_SIZE = 25;
-const POLL_INTERVAL_MS = 1500;
+// H3 PERF FIX: idle poll interval reduced from 1500ms to 5000ms to reduce
+// main-thread pressure from synchronously running resetStaleClaims + claim
+// queries every 1.5 seconds. On-demand flushes via requestNow() still fire
+// immediately for: (1) OFFLINE→ONLINE reconnects (sync/index.ts status
+// callback), (2) user tapping Sync button, (3) after PaymentModal pushes
+// ORDER + PAYMENT to the queue. This change only slows the idle "check for
+// new work" heartbeat — the critical hot paths still flush instantly.
+const POLL_INTERVAL_MS = 5000;
 const CLAIM_TIMEOUT_MS = 60_000;
 
 type GetAuthFn = () => { accessToken?: string; deviceId?: string; branchId?: string };
@@ -34,6 +41,13 @@ export class QueueReader {
   private running = false;
   private cycleInProgress = false;
   private immediateRequested = false;
+  // H6 PERF FIX: rate-limit resetStaleClaims() to at most once every
+  // CLAIM_TIMEOUT_MS (60_000). Stale PROCESSING rows only become eligible for
+  // reclaim after CLAIM_TIMEOUT_MS anyway; running `db.run(UPDATE...)` more
+  // frequently than once per 60s is pure waste and synchronously blocks the
+  // main event loop on every idle cycle (causing small but repeated freezes
+  // even when the sync queue is empty).
+  private _lastResetStaleClaimsAt = 0;
 
   onBatchSuccess?: () => void;
 
@@ -193,11 +207,27 @@ export class QueueReader {
     if (this.cycleInProgress) return;
     this.cycleInProgress = true;
     try {
-      this.resetStaleClaims();
-
-      if (!this.queueHasWork() && !this.immediateRequested) {
+      // H6 PERF FIX: check for pending work BEFORE any DB mutations. Most
+      // idle cycles have an empty queue; we exit immediately here without
+      // touching the DB at all (previously resetStaleClaims ran a sync
+      // UPDATE every cycle, wasting 1-20 ms on main thread).
+      const hasWork = this.immediateRequested || this.queueHasWork();
+      if (!hasWork) {
+        // H6 PERF FIX: resetStaleClaims is rate-limited to once per
+        // CLAIM_TIMEOUT_MS (60s) even when queue is empty; on-demand flush
+        // calls (immediateRequested === true) reset it immediately.
+        const now = Date.now();
+        if (now - this._lastResetStaleClaimsAt >= CLAIM_TIMEOUT_MS) {
+          this.resetStaleClaims();
+          this._lastResetStaleClaimsAt = now;
+        }
         return;
       }
+      // Reset stale claims immediately whenever there IS pending work (so
+      // rows stuck in PROCESSING after a previous crash can be reclaimed
+      // before this cycle's claimBatch runs).
+      this.resetStaleClaims();
+      this._lastResetStaleClaimsAt = Date.now();
       this.immediateRequested = false;
 
       this.setStatus('SYNCHRONIZING');

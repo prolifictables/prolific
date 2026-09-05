@@ -178,12 +178,18 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
     }
   };
 
-  // Fetch every 8 seconds (faster than before) so admin menu uploads show
-  // within one interactive cycle. Also re-fetch when the caller changes the
-  // branchId prop (switching branches or login context changes).
+  // H3 PERF FIX: removed the 8-second setInterval duplicate refresh that was
+  // re-fetching the menu (SQLite menuCategories.listAll + menuItems.list) every
+  // 8 seconds, on top of CashierScreenLayout's own 15-second
+  // refreshReferenceData() which calls menuCategories.applySnapshot and
+  // menuItems.applySnapshot (same data, same tables, double the DB reads on
+  // the main thread every single minute). MenuGrid now refreshes: (1) on
+  // mount, (2) on branchId change (cashier switches branches), (3) on window
+  // focus (user returns to POS), (4) on document visible after being hidden.
+  // CashierScreenLayout remains the single authoritative periodic refresher
+  // (every 15s) so managers still see menu changes within one interaction.
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 8000);
     const onFocus = () => {
       void refresh();
     };
@@ -193,7 +199,6 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
-      clearInterval(t);
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };

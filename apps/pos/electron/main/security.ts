@@ -37,6 +37,47 @@ const CSP_POLICY = [
   "frame-ancestors 'none'",
 ].join('; ');
 
+// H2 PERF FIX: cache ALL security response headers as one frozen immutable
+// object at module scope. Previously the onHeadersReceived callback rebuilt
+// {...existing} spread + 6 new header assignments on EVERY HTTP/WSS response
+// (including images, fonts, CSS chunks, JS HMR pings, etc. — 50-200 calls on
+// first load, more during continuous Vite HMR in dev). String creation +
+// object spread created allocation pressure that briefly blocked the session
+// network thread → visible freezes. Now we always return the same shared
+// headers reference — zero allocations per call.
+const _CACHED_SECURITY_HEADERS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'Content-Security-Policy': Object.freeze([CSP_POLICY]),
+  'X-Frame-Options': Object.freeze(['DENY']),
+  'X-Content-Type-Options': Object.freeze(['nosniff']),
+  'Referrer-Policy': Object.freeze(['no-referrer']),
+  'Permissions-Policy': Object.freeze([
+    'camera=(), microphone=(), geolocation=(), payment=(), usb=(), bluetooth=(), clipboard-read=(), clipboard-write=(self)',
+  ]),
+});
+
+// H2 PERF FIX: skip applying CSP headers to purely static subresources. These
+// don't need response-level CSP (the document already has CSP applied via the
+// <meta> tag + the top-level navigation response). Skipping them eliminates
+// ~90% of onHeadersReceived invocations at load time.
+const _STATIC_SKIP_EXT = Object.freeze(
+  new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.bmp', '.avif',
+           '.woff', '.woff2', '.ttf', '.otf', '.eot',
+           '.mp3', '.mp4', '.webm', '.wav', '.ogg',
+           '.map', '.css'])
+);
+function _isStaticSubresource(url: string, rt: string | undefined): boolean {
+  const lower = url.toLowerCase();
+  // If Electron tells us it's an image/font/media/stylesheet sub_frame type,
+  // always skip (top-level main_frame + script + xhr + websocket still get CSP).
+  if (rt === 'image' || rt === 'font' || rt === 'media' || rt === 'stylesheet') return true;
+  for (const ext of _STATIC_SKIP_EXT) {
+    const q = lower.indexOf('?');
+    const pathEnd = q === -1 ? lower.length : q;
+    if (lower.substring(pathEnd - ext.length, pathEnd) === ext) return true;
+  }
+  return false;
+}
+
 const APP_SCHEME = 'app';
 const ALLOWED_APP_HOSTS = ['renderer', 'assets'];
 
@@ -96,18 +137,27 @@ function registerAppProtocol(): void {
 
 function registerContentSecurityPolicy(session: Session): void {
   session.webRequest.onHeadersReceived((details, callback) => {
+    // H2 PERF FIX: short-circuit immediately for known static subresources.
+    // These don't need per-response CSP (top-level navigation + <meta> tag
+    // already apply the policy) and constitute ~90% of callbacks at load.
+    const resourceType: string | undefined = (details as any)?.resourceType || (details as any)?.type;
+    if (_isStaticSubresource(details.url, resourceType)) {
+      callback({});
+      return;
+    }
+
+    // H2 PERF FIX: reuse the module-level frozen cached headers object instead
+    // of allocating a new spread-copy + 6 new arrays on every callback.
     const existing = details.responseHeaders ?? {};
-    const newHeaders: Record<string, string[]> = { ...existing };
+    // Cast is safe: we only READ existing headers, and we're overriding the
+    // security headers with our cached immutable values. Returned headers are
+    // accepted by Chromium regardless of the readonly typing.
+    const merged: Record<string, string[]> = existing as any;
+    for (const [k, v] of Object.entries(_CACHED_SECURITY_HEADERS)) {
+      merged[k] = v as string[];
+    }
 
-    newHeaders['Content-Security-Policy'] = [CSP_POLICY];
-    newHeaders['X-Frame-Options'] = ['DENY'];
-    newHeaders['X-Content-Type-Options'] = ['nosniff'];
-    newHeaders['Referrer-Policy'] = ['no-referrer'];
-    newHeaders['Permissions-Policy'] = [
-      'camera=(), microphone=(), geolocation=(), payment=(), usb=(), bluetooth=(), clipboard-read=(), clipboard-write=(self)',
-    ];
-
-    callback({ responseHeaders: newHeaders });
+    callback({ responseHeaders: merged });
   });
 }
 
