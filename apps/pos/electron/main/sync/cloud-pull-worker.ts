@@ -627,6 +627,16 @@ export class PullWorker {
       assignCents('totalCents', 'totalAmount', 'total_amount', 'total_cents');
       assignCents('tipCents', 'tipAmount', 'tip_amount', 'tip_cents');
       assignCents('changeDueCents', 'changeDueAmount', 'change_due_amount', 'change_due_cents');
+      // GLOBAL ZERO-TAX OVERRIDE: ANY server-created order (Admin, QR website,
+      // public API) must reconcile with POS-originated orders at ₦0 tax. Force
+      // tax_cents = 0 unconditionally and re-derive total_cents from
+      // (subtotal - discount + tip). Without this, ShiftClosure reports would
+      // show mixed totals between channel-A and channel-B orders.
+      o.tax_cents = 0;
+      const sub = typeof o.subtotal_cents === 'number' ? o.subtotal_cents : 0;
+      const disc = typeof o.discount_cents === 'number' ? o.discount_cents : 0;
+      const tip = typeof o.tip_cents === 'number' ? o.tip_cents : 0;
+      o.total_cents = Math.max(0, sub - disc + tip);
       // 3 v33 migration columns (payment_method, paid_amount_cents, balance_due_cents)
       if (o.paymentMethod && !o.payment_method) o.payment_method = o.paymentMethod;
       assignCents('paidCents', 'paidAmount', 'paid_amount', 'paid_amount_cents');

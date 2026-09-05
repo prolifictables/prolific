@@ -291,12 +291,10 @@ export const useCartStore = create<CartState>((set, get) => ({
       const subtotal = lines.reduce((sum, l) => sum + l.subtotalCents, 0);
       const discount = Math.min(discountAmountCents, subtotal);
       const taxableBase = subtotal - discount;
-      let tax = 0;
-      for (const t of taxes || []) {
-        const rate = t.rate || 0;
-        if (t.isIncludedInPrice) continue;
-        tax += Math.round(taxableBase * (rate / 100));
-      }
+      // GLOBAL ZERO-TAX OVERRIDE: all channels (POS web + desktop, customer
+      // display, receipts, shift closures, reports) must show ₦0 tax regardless
+      // of branch tax defaults. Merchants in Nigeria manage VAT independently.
+      const tax = 0;
       const total = taxableBase + tax;
       return {
         subtotal,

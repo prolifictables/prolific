@@ -59,7 +59,9 @@ export function CheckoutSheet({
   const tax = defaultTax?.rate ?? 0;
 
   const subtotal = totals.subtotalCents;
-  const taxCents = Math.round(subtotal * (tax / 100));
+  // GLOBAL ZERO-TAX OVERRIDE (see POS cart-store.ts): no VAT / tax charged on
+  // QR-online orders. Merchant settles tax independently.
+  const taxCents = 0;
   const total = subtotal + taxCents;
 
   const handleSubmit = async () => {

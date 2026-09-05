@@ -164,7 +164,10 @@ export const useCart = create<CartState>((set, get) => ({
       (s, i) => s + i.perUnitTotalCents * i.quantity,
       0
     );
-    const tax = Math.round(subtotal * (taxRatePercent / 100));
+    // GLOBAL ZERO-TAX OVERRIDE (mirrors POS cart-store.ts): QR online ordering
+    // cart totals always use ₦0 tax so every channel (POS + website + admin
+    // reports) reconciles to the same post-discount figure.
+    const tax = 0;
     return {
       subtotalCents: subtotal,
       taxCents: tax,

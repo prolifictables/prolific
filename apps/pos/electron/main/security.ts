@@ -15,7 +15,7 @@ const CSP_POLICY = [
   "script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:5173 ws://localhost:5173",
   "style-src 'self' 'unsafe-inline'",
   // img-src: allow remote hosts (Render slugs, Prolific subdomains) plus local dev
-  "img-src 'self' data: blob: app: http://localhost:* http://127.0.0.1:* https://*.onrender.com https://*.prolifictables.com",
+  "img-src 'self' data: blob: app: http://localhost:* http://127.0.0.1:* https://*.onrender.com https://*.prolifictables.com https://prolifictables.com https://coresg-normal.trae.ai https://*.coresg-normal.trae.ai",
   "font-src 'self' data:",
   // connect-src (fetch/XHR/WebSocket): whitelist production hosts (wildcards cover any
   // Render free-tier slug + all Prolific subdomains on both REST + WS transports).

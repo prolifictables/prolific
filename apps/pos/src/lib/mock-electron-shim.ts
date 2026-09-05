@@ -1331,13 +1331,9 @@ function recalcMockTotals(sessionId: string, taxRates: any[] = SEEDED_TAXES): Mo
   const items = bucket ? bucket.items : [];
   const subtotal = items.reduce((s, it) => s + (Number(it.subtotalCents) || 0), 0);
   const taxableBase = Math.max(0, subtotal - Number(sess.discountCents || 0));
-  let tax = 0;
-  for (const t of taxRates || []) {
-    const rate = Number(t.rate_percent ?? t.rate ?? 0);
-    const inclusive = Boolean(t.is_inclusive ?? t.isIncludedInPrice);
-    if (inclusive) continue;
-    tax += Math.round(taxableBase * (rate / 100));
-  }
+  // GLOBAL ZERO-TAX OVERRIDE (see cart-store.ts): keep table sessions at ₦0 tax
+  // so website QR orders → server → POS sync all reconcile to the same totals.
+  const tax = 0;
   sess.subtotalCents = subtotal;
   sess.taxCents = tax;
   sess.totalCents = taxableBase + tax + Number(sess.tipCents || 0);
@@ -4021,11 +4017,10 @@ export function installMockElectronAPI() {
           ? raw.subtotalCents
           : lines.reduce((s, l) => s + l.totalCents, 0);
         const discountCents = typeof raw?.discountCents === 'number' ? raw.discountCents : 0;
-        const taxCents = typeof raw?.taxCents === 'number'
-          ? raw.taxCents
-          : totalCents >= subtotalCents - discountCents
-            ? totalCents - (subtotalCents - discountCents)
-            : 0;
+        // GLOBAL ZERO-TAX OVERRIDE: customer display preview always shows ₦0 tax
+        // regardless of upstream cents, so cashiers + patrons see the same total
+        // as the printed receipt (aligns with cart-store.ts + recalcMockTotals).
+        const taxCents = 0;
         const preview: CustomerOrderPreview = {
           orderNumber: String(raw?.orderNumber ?? '#00000'),
           table: typeof raw?.table === 'string' ? raw.table : undefined,
