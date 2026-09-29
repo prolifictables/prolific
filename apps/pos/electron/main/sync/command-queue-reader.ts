@@ -23,7 +23,7 @@ const BATCH_SIZE = 25;
 const POLL_INTERVAL_MS = 5000;
 const CLAIM_TIMEOUT_MS = 60_000;
 
-type GetAuthFn = () => { accessToken?: string; deviceId?: string; branchId?: string };
+type GetAuthFn = () => { accessToken?: string; deviceId?: string; branchId?: string; restaurantId?: string; employeeId?: string };
 
 export class QueueReader {
   private readonly repos: ReposBundle;
@@ -36,6 +36,7 @@ export class QueueReader {
     cmd: SyncCommand,
     result: SyncCommandResult
   ) => void;
+  private readonly phpStagingSync: boolean;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
@@ -58,7 +59,8 @@ export class QueueReader {
     deviceId: string,
     getAuthFn: GetAuthFn,
     onChangeStatus?: (s: ConnectionStatus) => void,
-    onConflict?: (cmd: SyncCommand, result: SyncCommandResult) => void
+    onConflict?: (cmd: SyncCommand, result: SyncCommandResult) => void,
+    phpStagingSync = false
   ) {
     this.repos = repos;
     this.db = db;
@@ -67,6 +69,7 @@ export class QueueReader {
     this.getAuthFn = getAuthFn;
     this.onChangeStatus = onChangeStatus;
     this.onConflict = onConflict;
+    this.phpStagingSync = phpStagingSync;
   }
 
   start(): void {
@@ -189,7 +192,78 @@ export class QueueReader {
       payload,
       idempotencyKey: row.idempotency_key ?? row.op_id ?? `idem_${row.id}`,
       localEntityVersion: row.local_entity_version ?? 1,
+      clientTimestamp: row.created_at ? new Date(row.created_at).toISOString() : undefined,
     };
+  }
+
+  private dependencyDone(cmd: SyncCommand): boolean {
+    if (!this.phpStagingSync || !this.db) return true;
+    const auth = this.getAuthFn();
+    const orderId = cmd.entityType === 'ORDER' ? cmd.entityId : cmd.payload?.orderId;
+    const local = orderId ? this.db.get<any>('SELECT * FROM orders WHERE id = ?', orderId) : null;
+    const scope = local || (cmd.entityType === 'SHIFT' ? this.db.get<any>('SELECT * FROM shifts WHERE id = ?', cmd.entityId) : null);
+    if (scope && (scope.branch_id !== auth.branchId || scope.restaurant_id !== auth.restaurantId || (auth.employeeId && scope.employee_id !== auth.employeeId))) return false;
+    if (cmd.entityType === 'SHIFT' && cmd.operation === 'CREATE') {
+      // A later offline shift cannot open server-side until the earlier one closes.
+      const blocked = this.db.get<any>("SELECT id FROM sync_queue WHERE entity_type = 'SHIFT' AND id < (SELECT id FROM sync_queue WHERE op_id = ?) AND status != 'DONE' LIMIT 1", cmd.opId);
+      if (blocked) return false;
+    }
+    if (cmd.entityType === 'SHIFT' && cmd.operation === 'UPDATE') {
+      const serverShiftId = this.repos.shifts.getById(cmd.entityId)?.serverShiftId;
+      if (!serverShiftId) return false;
+      cmd.payload = { ...cmd.payload, serverShiftId };
+    }
+    let predecessor: string | null = null;
+    if (cmd.entityType === 'PAYMENT' && cmd.operation === 'CREATE') {
+      predecessor = String(cmd.payload?.orderId || '');
+      if (!predecessor) return false;
+      const create = this.db.get<{ status: string }>("SELECT status FROM sync_queue WHERE op_id = ?", `order_${predecessor}`);
+      if (create?.status !== 'DONE') return false;
+      // Only new commands explicitly record this association. Do not reinterpret
+      // historical payloads: a previously attempted command has a fixed fingerprint.
+      const { localShiftId, ...payload } = cmd.payload;
+      if (!localShiftId && !payload.shiftId) {
+        const recorded = this.db.get<{ shift_id: string | null }>('SELECT shift_id FROM payments WHERE id = ?', cmd.entityId);
+        // Older queued commands did not carry their shift. Hold them for review:
+        // changing an already attempted payload would change its replay fingerprint.
+        if (recorded?.shift_id) return false;
+      }
+      if (localShiftId) {
+        const shift = this.repos.shifts.getById(String(localShiftId));
+        if (!shift?.serverShiftId || shift.device_id !== this.deviceId ||
+            shift.restaurant_id !== auth.restaurantId || shift.branch_id !== auth.branchId ||
+            shift.employee_id !== auth.employeeId) return false;
+        cmd.payload = { ...payload, shiftId: shift.serverShiftId };
+      }
+      return true;
+    }
+    if (cmd.entityType === 'ORDER' && cmd.operation === 'UPDATE') {
+      if (cmd.payload?.status === 'READY') {
+        const payments = this.db.all<{ status: string }>("SELECT status FROM sync_queue WHERE entity_type = 'PAYMENT' AND operation = 'CREATE' AND json_valid(payload) AND json_extract(payload, '$.orderId') = ?", cmd.entityId);
+        return payments.length > 0 && payments.every((p) => p.status === 'DONE');
+      }
+      if (cmd.payload?.status === 'COMPLETED') {
+        const ready = this.db.get<{ status: string }>('SELECT status FROM sync_queue WHERE op_id = ?', `phpstg_ready_${cmd.entityId}`);
+        return ready?.status === 'DONE';
+      }
+    }
+    return true;
+  }
+
+  private queueLocalCompletionAfterPayment(cmd: SyncCommand): void {
+    if (!this.phpStagingSync || !this.db || cmd.entityType !== 'PAYMENT' || cmd.operation !== 'CREATE') return;
+    const orderId = String(cmd.payload?.orderId || '');
+    const local = this.db.get<{ status: string }>('SELECT status FROM orders WHERE id = ?', orderId);
+    if (local?.status !== 'COMPLETED') return;
+    for (const [status, version] of [['READY', 2], ['COMPLETED', 3]] as const) {
+      this.repos.syncQueue.push({
+        op_id: `phpstg_${status.toLowerCase()}_${orderId}`,
+        entity_type: 'ORDER', operation: 'UPDATE', entity_id: orderId,
+        payload: JSON.stringify({ status }),
+        idempotency_key: `phpstg_${status.toLowerCase()}_${orderId}`,
+        local_entity_version: version,
+      });
+    }
   }
 
   private queueHasWork(): boolean {
@@ -197,8 +271,7 @@ export class QueueReader {
     return (
       counts.QUEUED > 0 ||
       counts.RETRYING > 0 ||
-      counts.PROCESSING > 0 ||
-      counts.FAILED > 0
+      counts.PROCESSING > 0
     );
   }
 
@@ -211,6 +284,10 @@ export class QueueReader {
       // idle cycles have an empty queue; we exit immediately here without
       // touching the DB at all (previously resetStaleClaims ran a sync
       // UPDATE every cycle, wasting 1-20 ms on main thread).
+      if (this.phpStagingSync && !this.getAuthFn().accessToken) {
+        this.setStatus('OFFLINE');
+        return; // Keep durable commands untouched until a server-authenticated session exists.
+      }
       const hasWork = this.immediateRequested || this.queueHasWork();
       if (!hasWork) {
         // H6 PERF FIX: resetStaleClaims is rate-limited to once per
@@ -230,34 +307,41 @@ export class QueueReader {
       this._lastResetStaleClaimsAt = Date.now();
       this.immediateRequested = false;
 
-      this.setStatus('SYNCHRONIZING');
-
-      const claimedRows = this.repos.syncQueue.claimBatch(BATCH_SIZE, this.deviceId);
-      if (claimedRows.length === 0) {
-        this.setStatus('ONLINE');
-        return;
-      }
+      const claimedRows = this.repos.syncQueue.claimBatch(BATCH_SIZE, this.deviceId, this.phpStagingSync);
+      if (claimedRows.length === 0) return;
 
       const commands: SyncCommand[] = [];
       const rowByOpId = new Map<string, { row: SyncQueueRow; cmd: SyncCommand }>();
       for (const row of claimedRows) {
         const cmd = this.rowToCommand(row);
         if (!cmd) continue;
+        if (!this.dependencyDone(cmd)) {
+          this.db?.run("UPDATE sync_queue SET status = 'QUEUED', claimed_at = NULL, next_attempt_at = ? WHERE id = ?", Date.now() + 1000, row.id);
+          continue;
+        }
         commands.push(cmd);
         rowByOpId.set(cmd.opId, { row, cmd });
       }
 
-      if (commands.length === 0) {
-        this.setStatus('ONLINE');
-        return;
-      }
+      if (commands.length === 0) return;
+
+      this.setStatus('SYNCHRONIZING');
 
       try {
         const batchResult = await this.httpClient.postBatch(commands);
         await this.processResults(commands, batchResult.results, rowByOpId);
       } catch (err) {
-        const processingIds = claimedRows.map((r) => r.id).filter(Boolean) as number[];
-        this.resetProcessingToQueued(processingIds);
+        const processingIds = [...rowByOpId.values()].map(({ row }) => row.id).filter(Boolean) as number[];
+        if (this.phpStagingSync && err instanceof ApiError && [400, 401, 403].includes(err.statusCode)) {
+          for (const cmd of commands) this.permanentlyFail(cmd.opId, `HTTP ${err.statusCode}: authentication or request rejected`);
+        } else if (this.phpStagingSync) {
+          for (const { row, cmd } of rowByOpId.values()) {
+            const delay = calculateExponentialBackoff(Math.min(row.attempts, MAX_ATTEMPTS));
+            this.repos.syncQueue.markFailed(cmd.opId, 'Temporary network/server failure; retry with the same key', Date.now() + delay);
+          }
+        } else {
+          this.resetProcessingToQueued(processingIds);
+        }
         const isNetError =
           err instanceof NetworkError ||
           (err instanceof ApiError && isRetryableStatusCode(err.statusCode));
@@ -280,42 +364,51 @@ export class QueueReader {
     let successCount = 0;
     let nonRetriableFailCount = 0;
     let retriableFailCount = 0;
+    const answered = new Set<string>();
 
     for (const result of results) {
       const entry = rowByOpId.get(result.opId);
       if (!entry) continue;
+      answered.add(result.opId);
       const { row, cmd } = entry;
 
       switch (result.status) {
         case 'SUCCESS':
         case 'IDEMPOTENT_HIT': {
-          this.repos.syncQueue.markDone(cmd.opId);
-          this.repos.syncRecords.insert({
-            device_id: this.deviceId,
-            idempotency_key: cmd.idempotencyKey,
-            entity_type: cmd.entityType,
-            operation: cmd.operation,
-            entity_id: cmd.entityId,
-            status: result.status,
-            attempt_count: row.attempts,
-            response_snapshot: result.responseSnapshot
-              ? JSON.stringify(result.responseSnapshot)
-              : null,
-            applied_at: Date.now(),
-          });
-          this.markSourceEntitySynced(
-            cmd.entityType,
-            cmd.entityId,
-            result.serverEntityVersion
-          );
+          this.repos.db.transaction(() => {
+            this.queueLocalCompletionAfterPayment(cmd);
+            if (!this.repos.syncRecords.find(this.deviceId, cmd.idempotencyKey)) this.repos.syncRecords.insert({
+              device_id: this.deviceId,
+              idempotency_key: cmd.idempotencyKey,
+              entity_type: cmd.entityType,
+              operation: cmd.operation,
+              entity_id: cmd.entityId,
+              status: result.status,
+              attempt_count: row.attempts,
+              response_snapshot: result.responseSnapshot
+                ? JSON.stringify(result.responseSnapshot)
+                : null,
+              applied_at: Date.now(),
+            });
+            if (!this.phpStagingSync || cmd.entityType !== 'ORDER' || (cmd.operation === 'UPDATE' && cmd.payload?.status === 'COMPLETED')) {
+              this.markSourceEntitySynced(cmd.entityType, cmd.entityId, result.serverEntityVersion);
+            }
+            this.repos.syncQueue.markDone(cmd.opId);
+          })();
           successCount++;
+          break;
+        }
+        case 'RETRYING': {
+          const delay = Math.max(1000, Math.min(300000, result.retryAfterMs || calculateExponentialBackoff(row.attempts)));
+          this.repos.syncQueue.markFailed(cmd.opId, `${result.resultCode || 'RETRY'}: ${result.errorMessage || 'Temporary server failure'}`, Date.now() + delay);
+          retriableFailCount++;
           break;
         }
         case 'CONFLICT': {
           const resolution: SyncConflictResolution =
             result.conflictResolution ?? 'MANUAL';
           const currentAttempts = row.attempts;
-          const canRetry = resolution !== 'MANUAL' && currentAttempts < MAX_ATTEMPTS;
+          const canRetry = !this.phpStagingSync && resolution !== 'MANUAL' && currentAttempts < MAX_ATTEMPTS;
           const nextAttemptAt = canRetry
             ? Date.now() + calculateExponentialBackoff(currentAttempts + 1)
             : null;
@@ -324,7 +417,7 @@ export class QueueReader {
             result.errorMessage ?? 'CONFLICT',
             nextAttemptAt
           );
-          this.repos.syncRecords.insert({
+          if (!this.repos.syncRecords.find(this.deviceId, cmd.idempotencyKey)) this.repos.syncRecords.insert({
             device_id: this.deviceId,
             idempotency_key: cmd.idempotencyKey,
             entity_type: cmd.entityType,
@@ -349,7 +442,7 @@ export class QueueReader {
         }
         case 'FAILED': {
           const currentAttempts = row.attempts;
-          const canRetry = currentAttempts < MAX_ATTEMPTS;
+          const canRetry = !this.phpStagingSync && currentAttempts < MAX_ATTEMPTS;
           const nextAttemptAt = canRetry
             ? Date.now() + calculateExponentialBackoff(currentAttempts + 1)
             : null;
@@ -358,7 +451,7 @@ export class QueueReader {
             result.errorMessage ?? 'FAILED',
             nextAttemptAt
           );
-          this.repos.syncRecords.insert({
+          if (!this.repos.syncRecords.find(this.deviceId, cmd.idempotencyKey)) this.repos.syncRecords.insert({
             device_id: this.deviceId,
             idempotency_key: cmd.idempotencyKey,
             entity_type: cmd.entityType,
@@ -379,6 +472,15 @@ export class QueueReader {
           }
           break;
         }
+      }
+    }
+
+    if (this.phpStagingSync) {
+      for (const cmd of commands) {
+        if (answered.has(cmd.opId)) continue;
+        const row = rowByOpId.get(cmd.opId)?.row;
+        this.repos.syncQueue.markFailed(cmd.opId, 'Missing command result; retry with the same key', Date.now() + calculateExponentialBackoff(row?.attempts || 1));
+        retriableFailCount++;
       }
     }
 

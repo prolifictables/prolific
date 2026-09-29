@@ -22,6 +22,7 @@ type GetAuthFn = () => {
   deviceId?: string;
   branchId?: string;
   restaurantId?: string;
+  employeeId?: string;
 };
 
 type BroadcastFn = (channel: string, payload: unknown) => void;
@@ -45,6 +46,8 @@ export interface SyncEngineOptions {
   ipcMain: IpcMain;
   onStatusChange?: (status: ConnectionStatus) => void;
   deviceId: string;
+  /** Historical option name; enables the canonical PHP contract in desktop production too. */
+  phpStagingSync?: boolean;
   broadcastToRenderers?: BroadcastFn;
 }
 
@@ -57,6 +60,7 @@ export class SyncEngine {
   private readonly onStatusChange?: (status: ConnectionStatus) => void;
   private readonly broadcastToRenderers?: BroadcastFn;
   private readonly ipcMain: IpcMain;
+  private readonly phpStagingSync: boolean;
 
   private readonly monitor: ConnectionMonitor;
   private readonly queueReader: QueueReader;
@@ -73,14 +77,17 @@ export class SyncEngine {
     this.onStatusChange = options.onStatusChange;
     this.broadcastToRenderers = options.broadcastToRenderers;
     this.ipcMain = options.ipcMain;
+    this.phpStagingSync = options.phpStagingSync === true;
 
     this.httpClient = new SyncHttpClient(options.httpBaseUrl, () => {
       const auth = this.getAuthFn();
       return {
         accessToken: auth.accessToken,
         deviceId: auth.deviceId ?? this.deviceId,
+        branchId: auth.branchId,
+        restaurantId: auth.restaurantId,
       };
-    });
+    }, options.phpStagingSync === true);
 
     this.monitor = new ConnectionMonitor(
       this.repos.connectionEvents,
@@ -89,43 +96,13 @@ export class SyncEngine {
       (payload) => {
         this.broadcastToRenderers?.('sync:status-changed', payload);
         this.onStatusChange?.(payload.status);
-        // ——— OFFLINE → ONLINE auto-flush trigger, hardened ———
-        // The ConnectionMonitor ping-health loop detects internet restoration
-        // (transition OFFLINE→ONLINE every 10s) and emits setStatus here.
-        // Without this explicit requestNow() call, the QueueReader only flushes
-        // on its internal POLL_INTERVAL_MS timer or an explicit user click.
-        // That violates the user requirement "data syncs when the internet is
-        // connected" — the cashier expects pending orders to upload immediately
-        // the moment Wi-Fi comes back, not 30 seconds later.
-        //
-        // Second-pass hardening (v2): two extra guarantees
-        //   (A) The original pingHealth() only emits setStatus ONLINE when the
-        //       previous monitor state was OFFLINE. If monitor is already
-        //       ONLINE (stale because previous health pings resolved but the
-        //       queue cycle threw a transient network / DNS error), we still
-        //       want flush on ANY ONLINE emit that carries a "positive" reason
-        //       (health-ping-ok or sync-success).
-        //   (B) If getCounts() reports QUEUED + RETRYING work, bypass the
-        //       reason-based gate entirely for status=ONLINE. This catches the
-        //       edge where monitor is "ONLINE" because of old state but the
-        //       queue never retried after an auth-token refresh.
-        if (payload.status === 'ONLINE') {
-          const counts = this.repos.syncQueue.getCounts() as any;
-          const pendingWork =
-            Number(counts?.QUEUED ?? 0) +
-            Number(counts?.RETRYING ?? 0) +
-            Number(counts?.PROCESSING ?? 0);
-          const positiveReason =
-            typeof payload.reason === 'string' &&
-            (payload.reason.startsWith('health-ping-ok') ||
-              payload.reason === 'sync-success');
-          if (positiveReason || pendingWork > 0) {
-            void Promise.resolve()
-              .then(() => this.queueReader.requestNow())
-              .catch((err) =>
-                console.warn('[sync] online-transition flush error:', err?.message || err)
-              );
-          }
+        // Only an external health check may trigger an automatic flush.
+        // Reader ONLINE transitions also occur when all rows are deferred or
+        // blocked; feeding those back into requestNow creates a microtask loop.
+        if (payload.status === 'ONLINE' && payload.reason?.startsWith('health-ping-ok')) {
+          void Promise.resolve()
+            .then(() => this.queueReader.requestNow())
+            .catch((err) => console.warn('[sync] health-recovery flush error:', err?.message || err));
         }
       }
     );
@@ -139,12 +116,13 @@ export class SyncEngine {
       (s) => this.handleReaderStatusChange(s),
       (cmd, result) => {
         this.broadcastToRenderers?.('sync:conflict', { cmd, result });
-      }
+      },
+      options.phpStagingSync === true
     );
 
     this.queueReader.onBatchSuccess = () => {
       this.monitor.markSyncSuccess();
-      this.pullWorker.requestNow();
+      if (!this.phpStagingSync) this.pullWorker.requestNow();
     };
 
     this.pullWorker = new PullWorker(
@@ -178,22 +156,20 @@ export class SyncEngine {
     this.registerIpc();
     this.monitor.start();
     this.queueReader.start();
-    this.pullWorker.start();
+    if (!this.phpStagingSync) this.pullWorker.start();
   }
 
   stop(): void {
     if (!this.started) return;
     this.started = false;
     this.queueReader.stop();
-    this.pullWorker.stop();
+    if (!this.phpStagingSync) this.pullWorker.stop();
     this.monitor.stop();
   }
 
   async syncNow(): Promise<void> {
-    await Promise.all([
-      this.queueReader.requestNow(),
-      Promise.resolve(this.pullWorker.requestNow()),
-    ]);
+    await this.queueReader.requestNow();
+    if (!this.phpStagingSync) this.pullWorker.requestNow();
   }
 
   requestNow(): Promise<void> {

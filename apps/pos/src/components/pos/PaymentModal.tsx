@@ -5,6 +5,8 @@ import { useCartStore } from '../../lib/cart-store';
 import { useAuthStore } from '../../lib/auth-store';
 import { formatCentsToNgn, padZero } from '../../lib/ui-helpers';
 import { resolveApiBase } from '../../lib/remote-auth';
+import { buildPosSaleSyncRows, phpPaymentCreatePayload } from '../../lib/pos-sale-sync-rows';
+import { isWebPhpMode, isNativeDesktop, isPhpPosMode } from '../../lib/web-php-config';
 
 type PaymentMethod = 'PHYSICAL_POS' | 'BANK_TRANSFER';
 
@@ -57,6 +59,13 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
   const [method, setMethod] = useState<PaymentMethod>('PHYSICAL_POS');
   const [processing, setProcessing] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  // Keep the same local identity if a transient save/queue error requires the
+  // cashier to retry this modal. PHP sync uses it as the idempotency identity.
+  const [checkoutIdentity] = useState(() => ({
+    orderId: (crypto.randomUUID && crypto.randomUUID()) || `ord_${Date.now()}_${Math.random()}`,
+    paymentId: (crypto.randomUUID && crypto.randomUUID()) || `pay_${Date.now()}_${Math.random()}`,
+    orderNumber: '#' + (10000 + Math.floor(Math.random() * 90000)).toString(),
+  }));
   // Admin-uploaded bank details (bankName, accountName, accountNumber, caption)
   // from the branch customer-display settings. Strict rule: visible on POS for
   // BANK_TRANSFER payments AND on the customer display for every payment
@@ -131,13 +140,14 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
     let realOrderId = '';
     let realOrderNumber = '';
     try {
-      const open: any = await window.electronAPI?.db?.shifts?.getOpen?.().catch(() => null);
+      const open: any = isWebPhpMode()
+        ? await window.electronAPI?.db?.shifts?.getOpen?.()
+        : await window.electronAPI?.db?.shifts?.getOpen?.().catch(() => null);
       const shiftId = open?.id || open?.shiftId || null;
+      if (isWebPhpMode() && !shiftId) throw new Error('Open a PHP-backed shift before taking payment.');
 
       const now = Date.now();
-      const orderId =
-        (crypto.randomUUID && crypto.randomUUID()) || `ord_${now}_${Math.random()}`;
-      const orderNumber = '#' + (10000 + Math.floor(Math.random() * 90000)).toString();
+      const { orderId, orderNumber } = checkoutIdentity;
       realOrderId = orderId;
       realOrderNumber = orderNumber;
       const normalizedOrderType = orderType === 'TAKEOUT' ? 'TAKEAWAY' : orderType;
@@ -209,6 +219,53 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
         updated_at: now,
       };
 
+      const paymentId = checkoutIdentity.paymentId;
+      const paymentMethod =
+        method === 'PHYSICAL_POS' ? 'CARD' : 'BANK_TRANSFER';
+      const referenceNote = `${METHODS.find((m) => m.id === method)?.label}`;
+
+      const paymentRow: any = {
+        id: paymentId,
+        order_id: realOrderId,
+        employee_id: employee?.id ?? null,
+        shift_id: shiftId,
+        branch_id: branch?.id ?? null,
+        restaurant_id: restaurant?.id ?? null,
+        method: paymentMethod,
+        provider: paymentMethod === 'CARD' ? 'pos_card' : null,
+        transaction_reference: null,
+        amount_cents: totals.total,
+        currency: restaurant?.currency || 'NGN',
+        tip_cents: totals.tip,
+        change_due_cents: 0,
+        // User rule: cashier confirmation is final. ATM + Bank Transfer are
+        // marked PAID / completed immediately — no later "Mark as Paid" step.
+        status: 'PAID',
+        verification_source: 'LOCAL',
+        completed_at: now,
+        reference_note: referenceNote,
+        idempotency_key: paymentId,
+        synced: 0,
+        created_at: now,
+        updated_at: now,
+      };
+
+      if (isPhpPosMode() && lines.some(l => l.modifiers?.some(m => m.optionIds?.length))) {
+        throw new Error('Modifiers are not supported by PHP checkout yet. Remove the selections before taking payment.');
+      }
+      if (isNativeDesktop()) {
+        const saveSale = window.electronAPI?.db?.orders?.saveSale;
+        if (!saveSale) throw new Error('Desktop checkout is unavailable. Restart the updated POS.');
+        await saveSale({ order: orderRow, payment: paymentRow, items: lines.map(l => ({
+          id: l.lineId, menu_item_id: l.menuItem.id, name_snapshot: l.menuItem.name,
+          price_snapshot_cents: l.perUnitPriceCents, quantity: l.quantity,
+          subtotal_cents: l.subtotalCents, tax_cents: 0, discount_cents: 0,
+          total_cents: l.subtotalCents, special_instructions: l.notes || null,
+          preparation_status: 'NEW',
+        })) });
+        orderPersisted = true;
+        paymentPersisted = true;
+      } else {
       // Defensive: orders.repository already handles idempotency non-throwingly
       // (SELECT pre-check + INSERT OR IGNORE + fallback lookup), but wrap in a
       // broad guard anyway so an unexpected SQLite schema/constraint error from
@@ -312,37 +369,6 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       // confirm when the earlier kitchen-ticket block and the later block
       // both fire for the same order.
 
-      const paymentId =
-        (crypto.randomUUID && crypto.randomUUID()) || `pay_${now}_${Math.random()}`;
-      const paymentMethod =
-        method === 'PHYSICAL_POS' ? 'CARD' : 'BANK_TRANSFER';
-      const referenceNote = `${METHODS.find((m) => m.id === method)?.label}`;
-
-      const paymentRow: any = {
-        id: paymentId,
-        order_id: realOrderId,
-        employee_id: employee?.id ?? null,
-        shift_id: shiftId,
-        branch_id: branch?.id ?? null,
-        restaurant_id: restaurant?.id ?? null,
-        method: paymentMethod,
-        provider: paymentMethod === 'CARD' ? 'pos_card' : null,
-        transaction_reference: null,
-        amount_cents: totals.total,
-        tip_cents: totals.tip,
-        change_due_cents: 0,
-        // User rule: cashier confirmation is final. ATM + Bank Transfer are
-        // marked PAID / completed immediately — no later "Mark as Paid" step.
-        status: 'PAID',
-        verification_source: 'LOCAL',
-        completed_at: now,
-        reference_note: referenceNote,
-        idempotency_key: paymentId,
-        synced: 0,
-        created_at: now,
-        updated_at: now,
-      };
-
       // ——— Defensive: payments.create guard + persisted? verify ———
       // If payment-row insert throws (e.g. SQLite UNIQUE clash, missing column,
       // etc.) we MUST still continue to the onPaid callback and skip the generic
@@ -365,6 +391,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       } catch {
         paymentPersisted = false;
       }
+      if (isWebPhpMode() && !paymentPersisted) throw new Error('Payment could not be safely saved for PHP sync.');
 
       // ——— Defensive wrap: entire sync-queue build + push block ———
       // Building server payloads walks menuModifiers.listForItemId,
@@ -375,7 +402,9 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       // still attempt delivery later (the order is already persisted locally).
       try {
         if (window.electronAPI?.db?.syncQueue?.push) {
-          const taxIds = taxes.map((t) => String(t.id ?? t._id ?? '')).filter(Boolean);
+          // The existing POS totals policy is tax-exclusive (cart tax = 0).
+          // Do not ask PHP to add a default VAT that was not shown or charged.
+          const taxIds = isWebPhpMode() ? [] : taxes.map((t) => String(t.id ?? t._id ?? '')).filter(Boolean);
           const serverItems = await Promise.all(
             lines.map(async (l) => {
               try {
@@ -461,7 +490,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
             items: serverItems,
           };
 
-          const serverPaymentPayload = {
+          const paymentCreationInput = {
             restaurantId: restaurant?.id,
             branchId: branch?.id,
             orderId: realOrderId,
@@ -479,31 +508,31 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
             completedAt: new Date(now),
           };
 
+          const serverPaymentPayload = isWebPhpMode() ? phpPaymentCreatePayload(paymentCreationInput) : paymentCreationInput;
+
+          const syncRows = buildPosSaleSyncRows(orderId, paymentId, serverOrderPayload, serverPaymentPayload);
           try {
-            await window.electronAPI?.db?.syncQueue?.push?.({
-              op_id: `order_${orderId}`,
-              entity_type: 'ORDER',
-              operation: 'CREATE',
-              entity_id: orderId,
-              payload: JSON.stringify(serverOrderPayload),
-              idempotency_key: orderId,
-              local_entity_version: 1,
-            });
+            await window.electronAPI?.db?.syncQueue?.push?.(syncRows.order);
           } catch (sqErr) {
+            if (isWebPhpMode()) throw sqErr;
             console.warn('[pay] syncQueue.push ORDER failed (deferred to later cycle)', sqErr);
           }
           try {
-            await window.electronAPI?.db?.syncQueue?.push?.({
-              op_id: `payment_${paymentId}`,
-              entity_type: 'PAYMENT',
-              operation: 'CREATE',
-              entity_id: paymentId,
-              payload: JSON.stringify(serverPaymentPayload),
-              idempotency_key: paymentId,
-              local_entity_version: 1,
-            });
+            await window.electronAPI?.db?.syncQueue?.push?.(syncRows.payment);
           } catch (sqErr) {
+            if (isWebPhpMode()) throw sqErr;
             console.warn('[pay] syncQueue.push PAYMENT failed (deferred to later cycle)', sqErr);
+          }
+          if (isWebPhpMode()) {
+            for (const [status, version] of [['READY', 2], ['COMPLETED', 3]] as const) {
+              await window.electronAPI?.db?.syncQueue?.push?.({
+                op_id: `order_${status.toLowerCase()}_${orderId}`,
+                entity_type: 'ORDER', operation: 'UPDATE', entity_id: orderId,
+                payload: JSON.stringify({ status }),
+                idempotency_key: `order-${status.toLowerCase()}-${orderId}`,
+                local_entity_version: version,
+              });
+            }
           }
 
           // Inline POST to sync-batch endpoint (best-effort, optional). Keep this
@@ -512,7 +541,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           // syncBlockErr catch (immediately below) guards the whole block so
           // JSON.stringify / API-base resolution / fetch errors all continue
           // the checkout flow instead of showing "Payment not recorded".
-          if (typeof window !== 'undefined') {
+          if (!isWebPhpMode() && typeof window !== 'undefined') {
             try {
               const apiBaseRaw = resolveApiBase?.()
                 ?? (typeof import.meta !== 'undefined'
@@ -576,8 +605,11 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           }
         }
       } catch (syncBlockErr) {
+        if (isWebPhpMode()) throw syncBlockErr;
         console.warn('[pay] outer sync-queue block caught — continuing checkout', syncBlockErr);
       }
+
+      } // Browser persistence path; native checkout committed atomically above.
 
       try {
         // Resolve latest cached bank details (manager-editable via Admin portal,
@@ -684,11 +716,27 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       // this build. Adding a kitchen ticket here would make 3 pages and
       // violate the rule that was explicitly requested.
       try {
-        await window.electronAPI?.print?.receipt?.(realOrderId, 2);
-        setToast && setToast(`🧾 Receipt ${orderNumber || '#'} printed`);
-        setTimeout(() => setToast && setToast(null), 2200);
+        const printResult = await window.electronAPI?.print?.receipt?.(realOrderId, 2);
+        const failed =
+          printResult &&
+          typeof printResult === 'object' &&
+          'queued' in printResult &&
+          (printResult as any).queued === false;
+
+        if (failed) {
+          const errorMessage =
+            String((printResult as any).error || 'Receipt printing failed');
+          console.warn('[pay] print receipt error:', errorMessage);
+          setToast && setToast(`🖨️ ${errorMessage}`);
+        } else {
+          setToast && setToast(`🧾 Receipt ${orderNumber || '#'} printed`);
+        }
+
+        setTimeout(() => setToast && setToast(null), 3000);
       } catch (e: any) {
         console.warn('[pay] print receipt error', e);
+        setToast && setToast(`🖨️ ${e?.message || 'Receipt printing failed'}`);
+        setTimeout(() => setToast && setToast(null), 3000);
       }
       setTimeout(
         () =>
@@ -705,6 +753,11 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
       );
     } catch (e: any) {
       console.warn('[pay] confirm failed', e);
+      if (isWebPhpMode()) {
+        setToast(e?.message || 'Checkout was not confirmed by PHP. Inspect pending sync before retrying.');
+        setTimeout(() => setToast(null), 7000);
+        return;
+      }
 
       // ——— Toast gate: only the hard "Payment not recorded" toast when
       // NEITHER order nor payment rows could be persisted locally. For ANY
@@ -729,7 +782,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           200
         );
       } else {
-        setToast('Payment not recorded. Try again.');
+        setToast(isNativeDesktop() ? (e?.message || 'Payment was not saved. Please retry.') : 'Payment not recorded. Try again.');
         setTimeout(() => setToast(null), 2600);
       }
     } finally {
@@ -744,7 +797,7 @@ export default function PaymentModal({ totals, taxes, onClose, onPaid }: Payment
           <div>
             <h2 className="text-xl font-bold text-white">Accept Payment</h2>
             <p className="text-sm text-slate-400 mt-0.5">
-              {lines.length} line · Order #{Date.now().toString().slice(-6)}
+              {lines.length} line · Order {checkoutIdentity.orderNumber}
             </p>
           </div>
           <button

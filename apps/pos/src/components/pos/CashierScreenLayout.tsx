@@ -18,6 +18,7 @@ import { pinLogin } from '../../lib/remote-auth';
 import { fetchPublicMenu } from '../../lib/remote-menu';
 import { fetchPosBootstrap } from '../../lib/remote-pos';
 import { applyRemoteMenuSnapshot } from '../../lib/mock-electron-shim';
+import { isWebPhpMode } from '../../lib/web-php-config';
 import Header from './Header';
 import MenuGrid from './MenuGrid';
 import CartPanel from './CartPanel';
@@ -175,9 +176,11 @@ export default function CashierScreenLayout() {
 
   // --- Mark-as-Paid modal state (for QR table "Pay at Counter" and Website
   // online orders that the attendant manually confirms as paid at the POS).
-  type CounterTender = 'CASH' | 'CARD_POS' | 'BANK_TRANSFER';
+  // Permanent rule 2026-09-05: only two tender types ever accepted at counter —
+  // same set as PaymentModal customer-side (ATM Card + Bank Transfer).
+  type CounterTender = 'CARD_POS' | 'BANK_TRANSFER';
   const [markPaidTarget, setMarkPaidTarget] = useState<any | null>(null);
-  const [markPaidMethod, setMarkPaidMethod] = useState<CounterTender>('CASH');
+  const [markPaidMethod, setMarkPaidMethod] = useState<CounterTender>('CARD_POS');
   const [markPaidAmountCents, setMarkPaidAmountCents] = useState<number>(0);
   const [markPaidNote, setMarkPaidNote] = useState<string>('');
   const [markPaidBusy, setMarkPaidBusy] = useState<boolean>(false);
@@ -192,7 +195,7 @@ export default function CashierScreenLayout() {
   // The interval is registered in a useEffect([]) once and would otherwise
   // close over the very first render's state forever (stale-closure bug).
   // Refs have a single mutable .current identity so stale closures are safe.
-  /** Which external (non-POS) order ids we've already surfaced to the rail. */
+  /** Which external (non-POS) order ids we have observed, including history. */
   const seenExternalOrderIdsRef = useRef<Set<string>>(new Set());
   /** False only on the VERY first hydration. Prevents spamming 20 historical
    *  order notifications on POS login; flipped once (true) after first call. */
@@ -573,7 +576,40 @@ export default function CashierScreenLayout() {
   // Date range filter for History — null = no range (all time). Stored as ISO strings yyyy-mm-dd for <input type=date>.
   const [historyDateStart, setHistoryDateStart] = useState<string | null>(null);
   const [historyDateEnd, setHistoryDateEnd] = useState<string | null>(null);
+  const [historyPage, setHistoryPage] = useState(0);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [tablesZone, setTablesZone] = useState<string>('ALL');
+
+  // The live-order tick keeps the recent window current. Older history is
+  // fetched only on demand, from authenticated PHP/MongoDB pages.
+  const loadHistoryPage = useCallback(async (page: number, from = historyDateStart, to = historyDateEnd) => {
+    if (!isWebPhpMode()) return;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const result: any = await (window.electronAPI as any).db.orders.historyPage(page, 100, from, to);
+      const hydrated = await hydrateOrders(result.data || [], tables);
+      setOrders((previous) => {
+        const byId = new Map(previous.map((order: any) => [String(order.id), order]));
+        for (const order of hydrated) byId.set(String(order.id), order);
+        return [...byId.values()].sort((a: any, b: any) => (b.createdAt || 0) - (a.createdAt || 0));
+      });
+      setHistoryPage(page);
+      setHistoryHasMore(result.meta?.hasMore === true);
+    } catch {
+      // Retain the last visible result; never turn a network error into an
+      // apparently empty authoritative history.
+      setHistoryError('History could not be refreshed. Check the connection and retry.');
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [historyDateStart, historyDateEnd, hydrateOrders, tables]);
+
+  useEffect(() => {
+    if (activeTab === 'HISTORY' && isWebPhpMode()) void loadHistoryPage(0);
+  }, [activeTab, historyDateStart, historyDateEnd]);
   // Dedicated tab-details modal. Opened either from the Cart rail "View Tab" or
   // directly by tapping the tab-number badge on an occupied table card.
   const [tabDetails, setTabDetails] = useState<{
@@ -593,10 +629,18 @@ export default function CashierScreenLayout() {
 
   useEffect(() => {
     let alive = true;
+    let bootstrapComplete = false;
+    let tickInFlight = false;
     (async () => {
       try {
         const syncSub = (s: any) => {
           if (!alive) return;
+          console.log('[pos][sync-status-event]', {
+            status: s?.status,
+            reason: s?.reason,
+            lastSyncAt: s?.lastSyncAt,
+            lastSuccessfulAt: s?.lastSuccessfulAt,
+          });
           setConnection((prev) => ({
             ...prev,
             status: s?.status || prev.status,
@@ -704,6 +748,8 @@ export default function CashierScreenLayout() {
         } catch { /* ignore */ }
       } catch (e) {
         console.warn('[pos] init error', e);
+      } finally {
+        bootstrapComplete = true;
       }
     })();
 
@@ -716,7 +762,10 @@ export default function CashierScreenLayout() {
     // to 30s (pull) + 8s (interval tick) = 38s worst case.
     // ---------------------------------------------------------------
     async function doTick() {
-      if (!alive) return;
+      // Startup owns the baseline; interval/socket refreshes cannot overlap it
+      // or each other and apply older snapshots after newer ones.
+      if (!alive || !bootstrapComplete || tickInFlight) return;
+      tickInFlight = true;
       try {
         // Read FRESH tables this tick, then pass into hydrateOrders so
         // table-name badges resolve correctly (never built from stale
@@ -761,6 +810,8 @@ export default function CashierScreenLayout() {
         }
       } catch {
         /* ignore */
+      } finally {
+        tickInFlight = false;
       }
     }
 
@@ -801,7 +852,7 @@ export default function CashierScreenLayout() {
         'http://localhost:4000';
       const jwt = useAuthStore.getState().accessToken;
       const branchId = branch?.id;
-      if (jwt && branchId) {
+      if (jwt && branchId && !isWebPhpMode()) {
         socket = io(serverBase, {
           transports: ['websocket', 'polling'],
           reconnectionDelay: 5000,
@@ -860,14 +911,8 @@ export default function CashierScreenLayout() {
         socket = null;
       }
       window.electronAPI?.sync?.unsubscribeStatus?.();
-      // Reset notification-diffing refs on unmount. In development, React 18
-      // StrictMode runs effect -> cleanup -> effect on every mount, simulating
-      // unmount/remount to catch cleanup bugs. If we do NOT reset these refs
-      // here, the discarded mount #1 flips initialHydrationDone=true and
-      // populates seenExternalOrderIds, so mount #2 (the real one) sees
-      // firstTime=false + newlyArrived=[] and incomingWebOrders stays empty
-      // forever = NO NOTIFICATION RAIL on login. Resetting gives each mount
-      // its own "first login" surface as expected.
+      // Each mount establishes a silent baseline. The alive guard prevents
+      // discarded StrictMode/HMR requests from mutating the next mount's refs.
       seenExternalOrderIdsRef.current = new Set();
       initialHydrationDoneRef.current = false;
     };
@@ -1102,76 +1147,28 @@ export default function CashierScreenLayout() {
     } catch { /* audio best-effort only */ }
   };
 
-  // Given the freshly hydrated order list, diff against the REF-held set of
-  // seen external order ids, push new arrivals into the notification card
-  // stack, and play the bell.
-  //
-  // BEHAVIOR:
-  //   First-time call (cashier just logged in):
-  //     • Prime the seenExternalOrderIdsRef (prevents duplicates on re-renders)
-  //     • Push ALL currently UNPAID / PARTIALLY_PAID external orders into the
-  //       rail, but WITHOUT the bell. A cashier clocking in at 11:29 needs to
-  //       see the Pay-at-Counter QR table orders that arrived at 11:20.
-  //     • Do NOT push already-PAID / REFUNDED completed external orders to the
-  //       rail on login — those are informational only in the History tab.
-  //     • No toast flash / no bell so the POS doesn't ring on login.
-  //
-  //   Subsequent 8s refresh calls:
-  //     • Only push genuinely NEW ids (not in the ref) into the rail.
-  //     • Ring bell + flash toast for each new arrival batch.
-  //
-  // Uses ONLY refs for diffing state so this function is 100% safe to call
-  // from the 8s setInterval (which captures a stale first-render closure and
-  // would otherwise always see "no seen ids yet / firstTime=true" forever).
+  // The first successful hydration is a silent baseline, not a new-order batch.
+  // Keep every observed external ID in refs, even paid/refunded or dismissed
+  // orders, so polling and stale React closures cannot reclassify them as new.
   const detectAndQueueExternalOrders = (freshOrders: any[]) => {
-    const external = freshOrders.filter(
-      (o: any) => String(o.sourceChannel || 'POS').toUpperCase() !== 'POS'
-    );
     const previous = seenExternalOrderIdsRef.current;
-    const newlyArrived: any[] = [];
     const newSeen = new Set(previous);
-    for (const o of external) {
-      if (!o?.id) continue;
-      newSeen.add(String(o.id));
-      if (!previous.has(String(o.id))) newlyArrived.push(o);
+    const newlyArrived: any[] = [];
+    for (const order of freshOrders) {
+      if (String(order.sourceChannel || order.source || 'POS').toUpperCase() === 'POS') continue;
+      if (!order?.id) continue;
+      const id = String(order.id);
+      if (newSeen.has(id)) continue;
+      newSeen.add(id);
+      const paymentStatus = String(order.paymentStatus || 'UNPAID').toUpperCase();
+      if (!['PAID', 'REFUNDED', 'PARTIALLY_REFUNDED'].includes(paymentStatus)) {
+        newlyArrived.push(order);
+      }
     }
     seenExternalOrderIdsRef.current = newSeen;
-    // ----- Belt-and-suspenders silent surface-of-unpaid on EVERY tick ------
-    // Runs regardless of firstTime to ensure no unpaid external order ever
-    // silently sits in the DB with no notification card showing. Catches
-    // edge cases (StrictMode double-mount ref poisoning, HMR, race
-    // conditions between init/interval hydration) where the firstTime
-    // branch is swallowed and leaves incomingWebOrders empty even though
-    // there are unpaid QR/website orders. This merge is silent: NO bell,
-    // NO toast. Only brand-new *post-login* arrivals get the bell/toast.
-    const unpaidExternal = freshOrders.filter((o: any) => {
-      if (String(o.sourceChannel || 'POS').toUpperCase() === 'POS') return false;
-      const ps = String(o.paymentStatus || 'UNPAID').toUpperCase();
-      return ps !== 'PAID' && ps !== 'REFUNDED';
-    });
-    if (unpaidExternal.length > 0) {
-      setIncomingWebOrders((prev) => {
-        const alreadyTracked = new Set(prev.map((p: any) => String(p.id)));
-        const toAdd = unpaidExternal.filter((n) => !alreadyTracked.has(String(n.id)));
-        if (toAdd.length === 0) return prev;
-        return [...toAdd, ...prev].slice(0, 10);
-      });
-    }
-    // -----------------------------------------------------------------------
     const firstTime = !initialHydrationDoneRef.current;
     initialHydrationDoneRef.current = true;
-    if (firstTime) {
-      // On POS login: surface any still-open (not PAID / not REFUNDED) external
-      // orders into the notification rail. Skip already completed orders — if
-      // the order is already fully paid, notification is unnecessary noise on
-      // login (it's still visible in the History tab if they need to look).
-      // Bell + toast are suppressed — they only ring for *new arrivals while
-      // the cashier is actively on shift*.
-      // NOTE: actual merging of unpaid orders is now handled by the
-      // belt-and-suspenders block above; this branch exists purely to
-      // short-circuit the bell/toast for the login tick.
-      return;
-    }
+    if (firstTime) return;
     if (newlyArrived.length > 0) {
       playOrderBell();
       setIncomingWebOrders((prev) => {
@@ -1186,6 +1183,14 @@ export default function CashierScreenLayout() {
   // Shortcut handlers for notification card actions.
   const ackIncomingOrder = (orderId: string) => {
     setIncomingWebOrders((prev) => prev.filter((p: any) => String(p.id) !== String(orderId)));
+  };
+  // POS attendant explicitly confirms the external order: bump status from
+  // PENDING/AWAITING_PAYMENT into PREPARING (writes to DB + sync queue) then
+  // removes the notification card. This IS step (2) of the user's required
+  // 3-step workflow: view → confirm order → confirm payment.
+  const confirmIncomingOrder = async (order: any) => {
+    await bumpOrderStatus(order);
+    ackIncomingOrder(order.id);
   };
   const recallIncomingOrder = async (order: any) => {
     ackIncomingOrder(order.id);
@@ -1224,11 +1229,25 @@ export default function CashierScreenLayout() {
     }
   };
 
-  // Transition order status
+  // Transition order status. Normalizes external QR/website statuses
+  // (PENDING / AWAITING_PAYMENT / RECEIVED / ON_HOLD) into the core flow
+  // so they never skip to COMPLETED (previously a CastError-style bug
+  // because those weren't in the flow[] array at all). Normalized flow:
+  //   external-ack → PREPARING → READY → DELIVERED → CLOSED.
   const bumpOrderStatus = async (order: any) => {
     const flow = ['NEW', 'PREPARING', 'READY', 'DELIVERED', 'CLOSED'];
-    const cur = order.status || 'NEW';
-    const idx = flow.indexOf(cur);
+    const cur = String(order.status || 'NEW').toUpperCase();
+    // Treat external/QR-origin statuses as "NEW" for the first bump, so
+    // clicking Confirm jumps straight to PREPARING (kitchen notified).
+    const normalizeExternal: Record<string, string> = {
+      AWAITING_PAYMENT: 'NEW',
+      PENDING: 'NEW',
+      RECEIVED: 'NEW',
+      ON_HOLD: 'NEW',
+      ACCEPTED: 'NEW',
+    };
+    const normalized = normalizeExternal[cur] ?? cur;
+    const idx = flow.indexOf(normalized);
     const next = idx >= 0 && idx < flow.length - 1 ? flow[idx + 1] : 'COMPLETED';
     try {
       await window.electronAPI?.db?.orders?.updateStatus?.(order.id, next);
@@ -1248,7 +1267,9 @@ export default function CashierScreenLayout() {
     const priorPaid = Math.round((order.paidAmount || 0) * 100);
     const remaining = Math.max(0, totalCents - priorPaid);
     setMarkPaidTarget(order);
-    setMarkPaidMethod('CASH');
+    // Permanent 2-method rule: default to ATM card for counter payments
+    // so attendants never accidentally select a removed tender type.
+    setMarkPaidMethod('CARD_POS');
     setMarkPaidAmountCents(remaining > 0 ? remaining : totalCents);
     setMarkPaidNote('');
     setMarkPaidBusy(false);
@@ -1399,8 +1420,7 @@ export default function CashierScreenLayout() {
       }
 
       const methodLabel: Record<string, string> = {
-        CASH: '💵 CASH',
-        CARD_POS: '💳 CARD',
+        CARD_POS: '💳 ATM CARD',
         BANK_TRANSFER: '🏦 TRANSFER',
       };
       const statusAfter = patched?.paymentStatus || patched?.payment_status || 'PAID';
@@ -1411,9 +1431,22 @@ export default function CashierScreenLayout() {
       // Auto-print 2 receipt copies (CUSTOMER + CASHIER) to match the exact
       // behavior of PaymentModal when paying for new in-POS orders.
       try {
-        await window.electronAPI?.print?.receipt?.(oid, 2);
-      } catch (printErr) {
+        const printResult = await window.electronAPI?.print?.receipt?.(oid, 2);
+        const failed =
+          printResult &&
+          typeof printResult === 'object' &&
+          'queued' in printResult &&
+          (printResult as any).queued === false;
+
+        if (failed) {
+          const errorMessage =
+            String((printResult as any).error || 'Receipt printing failed');
+          console.warn('[pos] mark-paid receipt print error (non-fatal):', errorMessage);
+          flashToast(`🖨️ ${errorMessage}`);
+        }
+      } catch (printErr: any) {
         console.warn('[pos] mark-paid receipt print error (non-fatal):', printErr);
+        flashToast(`🖨️ ${printErr?.message || 'Receipt printing failed'}`);
       }
       // Auto-print kitchen ticket for newly paid QR/web orders so the kitchen
       // picks up paid items immediately. Fire-and-forget; printer failures are
@@ -1657,29 +1690,45 @@ export default function CashierScreenLayout() {
                       </div>
                     </div>
 
-                    {/* Three action buttons inline */}
-                    <div className="grid grid-cols-3 gap-2">
+                    {/* 4 action buttons covering the required 3-step workflow:
+                          (1) View order details, (2) Confirm order (status→PREPARING, DB write),
+                          (3) Process/recall for edits, and (4) Record payment / mark paid. */}
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {/* Step 1: VIEW — dismiss rail + jump to HISTORY tab (full detail) */}
                       <button
-                        onClick={() => ackIncomingOrder(o.id)}
-                        className="btn-secondary !min-h-9 !px-2 !py-2 !text-[11px] !font-black"
-                        title="Acknowledge — keep in Orders tab, hide from rail"
+                        onClick={() => {
+                          ackIncomingOrder(o.id);
+                          setActiveTab('HISTORY');
+                        }}
+                        className="btn-secondary !min-h-8 !px-1.5 !py-1.5 !text-[10px] !font-black"
+                        title="View full order details in Orders tab"
                       >
-                        ✅ Ack
+                        👁 View
                       </button>
+                      {/* Step 2: CONFIRM ORDER — write status bump (PENDING → PREPARING) */}
+                      <button
+                        onClick={() => void confirmIncomingOrder(o)}
+                        className="btn-primary !min-h-8 !px-1.5 !py-1.5 !text-[10px] !font-black shadow-glow-restaurant"
+                        title="Attendant confirms this order — kitchen notified, status bumped to PREPARING"
+                      >
+                        ✅ Confirm
+                      </button>
+                      {/* Step 3: PROCESS — recall lines into cart for modification / re-checkout */}
                       <button
                         onClick={() => void recallIncomingOrder(o)}
-                        className="btn-primary !min-h-9 !px-2 !py-2 !text-[11px] !font-black"
-                        title="Load into cart to edit / process / reprint"
+                        className="btn-secondary !min-h-8 !px-1.5 !py-1.5 !text-[10px] !font-black"
+                        title="Load into cart to edit / re-print / re-process"
                       >
                         📂 Process
                       </button>
+                      {/* Step 4: RECORD PAYMENT — mark paid modal (ATM Card / Transfer) */}
                       {unpaid ? (
                         <button
                           onClick={() => markPaidIncomingOrder(o)}
-                          className="btn-neon-cyan !min-h-9 !px-2 !py-2 !text-[11px] !font-black shadow-glow-restaurant animate-neon-pulse"
-                          title="Record counter payment — cash / card POS terminal / bank transfer"
+                          className="btn-neon-cyan !min-h-8 !px-1.5 !py-1.5 !text-[10px] !font-black shadow-glow-restaurant animate-neon-pulse"
+                          title="Record counter payment — ATM Card terminal or Bank transfer"
                         >
-                          💵 Mark Paid
+                          💵 Paid
                         </button>
                       ) : (
                         <button
@@ -1687,10 +1736,10 @@ export default function CashierScreenLayout() {
                             ackIncomingOrder(o.id);
                             setActiveTab('HISTORY');
                           }}
-                          className="btn-secondary !min-h-9 !px-2 !py-2 !text-[11px] !font-black"
+                          className="btn-secondary !min-h-8 !px-1.5 !py-1.5 !text-[10px] !font-black"
                           title="Already paid — view in Orders tab"
                         >
-                          👁 View
+                          👁 Seen
                         </button>
                       )}
                     </div>
@@ -1759,7 +1808,6 @@ export default function CashierScreenLayout() {
                 const existing = _customerDisplayWindow;
                 if (existing && !existing.closed) {
                   try { existing.focus(); } catch {}
-                  window.electronAPI?.customerDisplay?.showIdle?.().catch(() => {});
                   flashToast('🖥️ Customer display: Refocused');
                   return;
                 }
@@ -1781,8 +1829,9 @@ export default function CashierScreenLayout() {
                   `width=${w}`, `height=${h}`, `left=${left}`, `top=${top}`,
                   'menubar=no', 'toolbar=no',
                 ].join(',');
+                const baseHref = window.location.href.split('#')[0] || window.location.href;
                 const popup = window.open(
-                  '/#/customer-display',
+                  `${baseHref}#/customer-display`,
                   'prolific-customer-display',
                   features,
                 );
@@ -1800,8 +1849,8 @@ export default function CashierScreenLayout() {
                 popup.addEventListener?.('beforeunload', () => {
                   if (_customerDisplayWindow === popup) _customerDisplayWindow = null;
                 });
-                window.electronAPI?.customerDisplay?.showIdle?.().catch(() => {});
-                flashToast('🖥️ Customer display: Launched on second monitor');
+                // The popup requests the current cart state; opening it must not clear that state.
+                flashToast('🖥️ Customer display: Launched');
               }}
               className={[
                 'w-full min-h-[3rem] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-all relative group',
@@ -1866,7 +1915,7 @@ export default function CashierScreenLayout() {
             )}
             {activeTab === 'HISTORY' && (
               <HistoryPanel
-                orders={orders}
+                orders={isWebPhpMode() ? orders.filter((order: any) => order.branchId === branch?.id) : orders}
                 filter={historyFilter}
                 setFilter={setHistoryFilter}
                 dateStart={historyDateStart}
@@ -1874,6 +1923,11 @@ export default function CashierScreenLayout() {
                 setDateStart={setHistoryDateStart}
                 setDateEnd={setHistoryDateEnd}
                 clearDateRange={() => { setHistoryDateStart(null); setHistoryDateEnd(null); }}
+                historyHasMore={historyHasMore}
+                historyLoading={historyLoading}
+                historyError={historyError}
+                onLoadMore={() => void loadHistoryPage(historyPage + 1)}
+                onRetry={() => void loadHistoryPage(historyPage)}
                 onRecall={recallOrder}
                 onBumpStatus={bumpOrderStatus}
                 onOpenTable={(tblId, tblName) => {
@@ -1886,11 +1940,24 @@ export default function CashierScreenLayout() {
                   if (!oid) return;
                   (async () => {
                     try {
-                      await window.electronAPI?.print?.receipt?.(oid, 1);
-                      flashToast(`🧾 Receipt ${o.orderNumber || o.id?.slice(-5).toUpperCase() || '#'} printed`);
-                    } catch (e) {
+                      const printResult = await window.electronAPI?.print?.receipt?.(oid, 1);
+                      const failed =
+                        printResult &&
+                        typeof printResult === 'object' &&
+                        'queued' in printResult &&
+                        (printResult as any).queued === false;
+
+                      if (failed) {
+                        const errorMessage =
+                          String((printResult as any).error || 'Receipt printing failed');
+                        console.warn('[pos] print history receipt failed:', errorMessage);
+                        flashToast(`🖨️ ${errorMessage}`);
+                      } else {
+                        flashToast(`🧾 Receipt ${o.orderNumber || o.id?.slice(-5).toUpperCase() || '#'} printed`);
+                      }
+                    } catch (e: any) {
                       console.warn('[pos] print history receipt failed', e);
-                      flashToast('🖨️ Receipt print failed — try again');
+                      flashToast(`🖨️ ${e?.message || 'Receipt print failed — try again'}`);
                     }
                   })();
                 }}
@@ -2119,15 +2186,14 @@ export default function CashierScreenLayout() {
               </div>
             </div>
 
-            {/* 3 Tender method buttons */}
+            {/* 2 Tender method buttons (Permanent 2-method rule 2026-09-05) */}
             <div className="relative mb-5">
               <div className="text-[10px] uppercase tracking-[0.16em] font-black text-ink-400 mb-2.5">Payment Method · Tender Type</div>
-              <div className="grid grid-cols-3 gap-2.5">
-                {(['CASH', 'CARD_POS', 'BANK_TRANSFER'] as const).map((m) => {
+              <div className="grid grid-cols-2 gap-2.5">
+                {(['CARD_POS', 'BANK_TRANSFER'] as const).map((m) => {
                   const active = markPaidMethod === m;
                   const meta: Record<string, { icon: string; label: string; sub: string }> = {
-                    CASH: { icon: '💵', label: 'Cash', sub: 'Notes & coins' },
-                    CARD_POS: { icon: '💳', label: 'Card POS', sub: 'Terminal swipe' },
+                    CARD_POS: { icon: '💳', label: 'ATM Card', sub: 'Terminal tap / insert' },
                     BANK_TRANSFER: { icon: '🏦', label: 'Transfer', sub: 'Bank / mobile' },
                   };
                   const t = meta[m];
@@ -2142,11 +2208,9 @@ export default function CashierScreenLayout() {
                           : 'ring-white/10 bg-white/5 text-white hover:ring-cyan-400/30'
                       }`}
                       style={active ? {
-                        background: m === 'CASH'
-                          ? 'linear-gradient(135deg, #FFD700 0%, #D4AF37 55%, #CD7F32 100%)'
-                          : m === 'CARD_POS'
-                            ? 'linear-gradient(135deg, #22D3EE 0%, #0EA5E9 55%, #6366F1 100%)'
-                            : 'linear-gradient(135deg, #A78BFA 0%, #8B5CF6 55%, #7C3AED 100%)',
+                        background: m === 'CARD_POS'
+                          ? 'linear-gradient(135deg, #22D3EE 0%, #0EA5E9 55%, #6366F1 100%)'
+                          : 'linear-gradient(135deg, #A78BFA 0%, #8B5CF6 55%, #7C3AED 100%)',
                       } : {}}
                     >
                       <div className="text-2xl sm:text-3xl leading-none">{t.icon}</div>
@@ -2676,6 +2740,11 @@ function HistoryPanel({
   setDateStart,
   setDateEnd,
   clearDateRange,
+  historyHasMore,
+  historyLoading,
+  historyError,
+  onLoadMore,
+  onRetry,
   onRecall,
   onBumpStatus,
   onOpenTable,
@@ -2691,6 +2760,11 @@ function HistoryPanel({
   setDateStart: (s: string | null) => void;
   setDateEnd: (s: string | null) => void;
   clearDateRange: () => void;
+  historyHasMore: boolean;
+  historyLoading: boolean;
+  historyError: string | null;
+  onLoadMore: () => void;
+  onRetry: () => void;
   onRecall: (o: any) => void;
   onBumpStatus: (o: any) => void;
   onOpenTable: (id: string, name?: string) => void;
@@ -2840,15 +2914,10 @@ function HistoryPanel({
       const s = String(o.status || '').toUpperCase();
       const ps = String(o.paymentStatus || '').toUpperCase();
       m[s] = (m[s] || 0) + 1;
-      // Aggregate a separate payment-status-only bucketing too so tab
-      // counts reflect the real pipeline even when rows share a status.
-      if (ps === 'PARTIALLY_PAID') m.PARTIALLY_PAID = (m.PARTIALLY_PAID || 0) + 1;
-      if (ps === 'PAID' || s === 'PAID') m.PAID = (m.PAID || 0) + 1;
+      if (ps === 'PARTIALLY_PAID' && s !== 'PARTIALLY_PAID') m.PARTIALLY_PAID = (m.PARTIALLY_PAID || 0) + 1;
     }
-    m.COMPLETED =
-      (m.COMPLETED || 0) +
-      (m.PAID || 0) +
-      (m.CLOSED || 0);
+    m.PAID = orders.filter((o) => String(o.status || '').toUpperCase() === 'PAID' || String(o.paymentStatus || '').toUpperCase() === 'PAID').length;
+    m.COMPLETED = orders.filter((o) => ['COMPLETED', 'PAID', 'CLOSED'].includes(String(o.status || '').toUpperCase())).length;
     m.AWAITING_PAYMENT =
       (m.AWAITING_PAYMENT || 0) +
       (m.SERVED || 0) +
@@ -3040,6 +3109,12 @@ function HistoryPanel({
 
       {/* Order list */}
       <div className="flex-1 overflow-y-auto min-h-0">
+        {historyLoading && <div role="status" className="p-4 text-center text-sm text-ink-300">Loading sales history from PHP…</div>}
+        {historyError && (
+          <div role="alert" className="m-4 rounded-xl bg-rose-500/10 p-3 text-sm text-rose-200">
+            {historyError} <button onClick={onRetry} className="underline">Retry</button>
+          </div>
+        )}
         {filtered.length === 0 ? (
           <div className="flex flex-col items-center justify-center text-center py-16 sm:py-24 px-6">
             <div className="text-5xl sm:text-6xl mb-4 animate-float-slow">📋</div>
@@ -3260,8 +3335,14 @@ function HistoryPanel({
             })}
           </div>
         )}
+        {historyHasMore && (
+          <div className="p-4 text-center">
+            <button onClick={onLoadMore} disabled={historyLoading} className="btn-secondary !min-h-11 !px-5">
+              {historyLoading ? 'Loading history…' : 'Load older sales'}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
 }
-

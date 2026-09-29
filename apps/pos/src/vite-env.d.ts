@@ -92,6 +92,7 @@ declare global {
         chrome: string;
         electron: string;
       }>;
+      isNativeDesktop?: boolean;
       getDeviceId: () => Promise<{ deviceId: string; deviceKey: string }>;
       getConnectionStatus: () => Promise<unknown>;
       db: {
@@ -147,6 +148,7 @@ declare global {
           findOrCreate: (data: unknown) => Promise<unknown>;
         };
         orders: {
+          saveSale?: (input: { order: any; payment: any; items: any[] }) => Promise<any>;
           create: (draft: unknown) => Promise<unknown>;
           updateStatus: (id: string, status: unknown) => Promise<unknown>;
           updatePaymentStatus: (

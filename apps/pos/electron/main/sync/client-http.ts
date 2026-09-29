@@ -31,14 +31,17 @@ const DEFAULT_TIMEOUT_MS = 12_000;
 
 export class SyncHttpClient {
   private readonly apiBase: string;
-  private readonly getAuth: () => { accessToken?: string; deviceId?: string };
+  private readonly getAuth: () => { accessToken?: string; deviceId?: string; branchId?: string; restaurantId?: string };
+  private readonly phpStaging: boolean;
 
   constructor(
     apiBase: string,
-    getAuth: () => { accessToken?: string; deviceId?: string }
+    getAuth: () => { accessToken?: string; deviceId?: string; branchId?: string; restaurantId?: string },
+    phpStaging = false
   ) {
     this.apiBase = apiBase.replace(/\/+$/, '');
     this.getAuth = getAuth;
+    this.phpStaging = phpStaging;
   }
 
   private buildIdempotencyKey(commands: SyncCommand[]): string {
@@ -126,7 +129,49 @@ export class SyncHttpClient {
   }
 
   async postBatch(commands: SyncCommand[]): Promise<SyncBatchResult> {
-    const idemKey = this.buildIdempotencyKey(commands);
+    if (this.phpStaging) {
+      const auth = this.getAuth();
+      if (!auth.accessToken || !auth.deviceId || !auth.branchId || !auth.restaurantId) throw new ApiError('Server authentication and terminal scope are required', 401);
+      const shifts = commands.filter(c => c.entityType === 'SHIFT');
+      if (shifts.length) {
+        const results: SyncBatchResult['results'] = [];
+        for (const cmd of shifts) {
+          const opening = cmd.operation === 'CREATE';
+          const p = cmd.payload || {};
+          if (p.deviceId && p.deviceId !== auth.deviceId) {
+            results.push({ opId: cmd.opId, status: 'FAILED', errorMessage: 'Shift device differs from the authenticated terminal.' });
+            continue;
+          }
+          if (!opening && !p.serverShiftId) {
+            results.push({ opId: cmd.opId, status: 'CONFLICT', errorMessage: 'Shift OPEN must sync before CLOSE.' });
+            continue;
+          }
+          try {
+            const response = await this.request<any>(`${this.apiBase}/shifts/${opening ? 'open' : `${encodeURIComponent(p.serverShiftId)}/close`}`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json', ...this.authHeaders() },
+              body: JSON.stringify({ idempotencyKey: cmd.idempotencyKey, restaurantId: auth.restaurantId, branchId: auth.branchId,
+                ...(opening ? { deviceId: auth.deviceId, openingCash: p.openingCash ?? p.openingCashCents } : { closingCash: p.closingCash ?? p.closingCashCents }) }),
+            });
+            const shift = response?.data?.shift;
+            if (!shift?._id && !shift?.id) throw new NetworkError('Missing shift response; retry with the same key');
+            results.push({ opId: cmd.opId, status: 'SUCCESS', responseSnapshot: shift });
+          } catch (err) {
+            results.push({ opId: cmd.opId, status: err instanceof NetworkError ? 'RETRYING' : 'FAILED', errorMessage: err instanceof Error ? err.message : 'Shift sync failed' });
+          }
+        }
+        const rest = commands.filter(c => c.entityType !== 'SHIFT');
+        if (rest.length) results.push(...(await this.postBatch(rest)).results);
+        return { results };
+      }
+      const unsupported = commands.filter(c => c.entityType === 'ORDER' && c.operation === 'CREATE' && c.payload?.items?.some((i: any) => i.modifierOptions?.length));
+      if (unsupported.length) {
+        const results: SyncBatchResult['results'] = unsupported.map(c => ({ opId: c.opId, status: 'CONFLICT', errorMessage: 'PHP does not support modifier pricing. Review this queued sale.' }));
+        const rest = commands.filter(c => !unsupported.includes(c));
+        if (rest.length) results.push(...(await this.postBatch(rest)).results);
+        return { results };
+      }
+    }
+    const idemKey = this.phpStaging ? undefined : this.buildIdempotencyKey(commands);
     // The JWT-guarded endpoint (`/sync/batch`) is the primary destination —
     // works great once a POS user has authenticated via pin (accessToken set).
     // When there is no valid JWT (401/403 from server), fall back to the same
@@ -149,14 +194,19 @@ export class SyncHttpClient {
       entityId: c.entityId,
       payload: c.payload,
       localEntityVersion: c.localEntityVersion,
+      ...(this.phpStaging && c.clientTimestamp ? { clientTimestamp: c.clientTimestamp } : {}),
     }));
 
     const baseHeaders: Record<string, string> = {
       'Content-Type': 'application/json',
-      'X-Idempotency-Key': idemKey,
+      ...(idemKey ? { 'X-Idempotency-Key': idemKey } : {}),
     };
     const authHeaders = this.authHeaders();
-    const body = JSON.stringify({ deviceId, commands: serverCommands });
+    const body = JSON.stringify({
+      deviceId,
+      ...(this.phpStaging ? { restaurantId: auth.restaurantId, branchId: auth.branchId } : {}),
+      commands: serverCommands,
+    });
 
     const parseResponse = (resp: unknown): SyncBatchResult => {
       const data = (resp as any)?.data || (resp as any)?.results || [];
@@ -171,10 +221,14 @@ export class SyncHttpClient {
               ? 'SUCCESS'
               : statusRaw === 'CONFLICT'
                 ? 'CONFLICT'
+                : this.phpStaging && statusRaw === 'RETRYING'
+                  ? 'RETRYING'
                 : 'FAILED';
           return {
             opId,
             status,
+            resultCode: this.phpStaging ? String(r.resultCode || '') : undefined,
+            retryAfterMs: this.phpStaging && Number.isFinite(Number(r.retryAfterMs)) ? Number(r.retryAfterMs) : undefined,
             serverEntityVersion: r.serverEntityVersion,
             errorMessage: r.errorMessage,
             responseSnapshot: r.serverSnapshot ?? null,
@@ -195,13 +249,14 @@ export class SyncHttpClient {
         method: 'POST',
         headers: { ...baseHeaders, ...authHeaders },
         body,
+        timeoutMs: this.phpStaging ? 120_000 : DEFAULT_TIMEOUT_MS,
       });
       return parseResponse(resp);
     } catch (primaryErr) {
       const needsFallback =
         primaryErr instanceof ApiError &&
         (primaryErr.statusCode === 401 || primaryErr.statusCode === 403);
-      if (!needsFallback) throw primaryErr;
+      if (!needsFallback || this.phpStaging) throw primaryErr;
 
       // (2) Auth failed / no JWT present → retry against the public endpoint
       // without the Authorization header. This mirrors the browser POS path.

@@ -595,18 +595,36 @@ export class ShiftsRepository {
     );
   }
 
+  /** Identity comes exclusively from this local shift's acknowledged OPEN response. */
+  getById(id: string): ShiftRow | undefined {
+    const shift = this.db.get<ShiftRow>('SELECT * FROM shifts WHERE id = ?', id);
+    return this.withServerIdentity(shift);
+  }
+
+  private withServerIdentity(shift: ShiftRow | undefined): ShiftRow | undefined {
+    if (!shift) return shift;
+    const record = this.db.get<{ response_snapshot: string | null }>(`
+      SELECT r.response_snapshot FROM sync_queue q
+      JOIN sync_records r ON r.idempotency_key = q.idempotency_key AND r.device_id = ?
+      WHERE q.entity_type = 'SHIFT' AND q.operation = 'CREATE' AND q.entity_id = ?
+        AND q.status = 'DONE' AND r.status IN ('SUCCESS', 'IDEMPOTENT_HIT') LIMIT 1`, shift.device_id, shift.id);
+    let serverShiftId: unknown;
+    try { const snapshot = JSON.parse(record?.response_snapshot || 'null'); serverShiftId = snapshot?._id || snapshot?.id; } catch { /* Unresolved identity must keep payments queued. */ }
+    return { ...shift, serverShiftId: typeof serverShiftId === 'string' && serverShiftId ? serverShiftId : undefined };
+  }
+
   getOpen(deviceId: string, employeeId?: string): ShiftRow | undefined {
     if (employeeId) {
-      return this.db.get<ShiftRow>(
+      return this.withServerIdentity(this.db.get<ShiftRow>(
         `SELECT * FROM shifts WHERE device_id = ? AND employee_id = ? AND status = 'OPEN' LIMIT 1`,
         deviceId,
         employeeId
-      );
+      ));
     }
-    return this.db.get<ShiftRow>(
+    return this.withServerIdentity(this.db.get<ShiftRow>(
       `SELECT * FROM shifts WHERE device_id = ? AND status = 'OPEN' LIMIT 1`,
       deviceId
-    );
+    ));
   }
 
   listByEmployee(employeeId: string, limit = 50): ShiftRow[] {

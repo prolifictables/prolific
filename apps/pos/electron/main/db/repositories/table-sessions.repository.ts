@@ -324,13 +324,8 @@ export class TableSessionService {
     );
     const discount = Number(sess.discount_cents) || 0;
     const taxableBase = Math.max(0, subtotal - discount);
-    let tax = 0;
-    for (const t of taxRates || []) {
-      const rate = Number(t.rate_percent ?? t.rate ?? 0);
-      const inclusive = Boolean(t.is_inclusive ?? t.isIncludedInPrice);
-      if (inclusive) continue;
-      tax += Math.round(taxableBase * (rate / 100));
-    }
+    // Same zero-tax policy as the shared POS cart.
+    const tax = 0;
     const tip = Number(sess.tip_cents) || 0;
     const total = taxableBase + tax + tip;
     const paid = Number(sess.paid_amount_cents) || 0;

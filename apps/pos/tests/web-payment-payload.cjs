@@ -1,0 +1,17 @@
+const assert=require('node:assert/strict');
+const {buildSync}=require('esbuild');
+const path=require('node:path');
+const vm=require('node:vm');
+const fs=require('node:fs');
+const filename=path.resolve(__dirname,'../src/lib/pos-sale-sync-rows.ts');
+const sandbox={exports:{},module:{exports:{}}};
+vm.runInNewContext(buildSync({entryPoints:[filename],bundle:true,platform:'node',format:'cjs',write:false}).outputFiles[0].text,sandbox);
+const {phpPaymentCreatePayload,buildPosSaleSyncRows}=sandbox.module.exports;
+const local={orderId:'order',employeeId:'employee',shiftId:'server_A',amountCents:400000,currency:'NGN',method:'CARD',idempotencyKey:'payment',status:'PAID',verificationSource:'LOCAL',providerResponse:{},completedAt:'date'};
+const request=JSON.parse(buildPosSaleSyncRows('order','payment',{},phpPaymentCreatePayload(local)).payment.payload);
+for(const key of ['status','verificationSource','providerResponse','completedAt'])assert.equal(key in request,false);
+for(const key of ['orderId','employeeId','shiftId','amountCents','currency','method','idempotencyKey'])assert.equal(request[key],local[key]);
+assert.equal(local.status,'PAID');
+const modal=fs.readFileSync(path.resolve(__dirname,'../src/components/pos/PaymentModal.tsx'),'utf8');
+assert.match(modal,/isWebPhpMode\(\) \? phpPaymentCreatePayload\(paymentCreationInput\)/);
+console.log('PASS: Web PHP creation excludes server-owned fields, retains server shift/key/currency, preserves local state.');

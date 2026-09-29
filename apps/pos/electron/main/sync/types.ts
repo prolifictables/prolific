@@ -47,11 +47,14 @@ export interface SyncCommand {
   payload: any;
   idempotencyKey: string;
   localEntityVersion: number;
+  clientTimestamp?: string;
 }
 
 export interface SyncCommandResult {
   opId: string;
-  status: 'SUCCESS' | 'CONFLICT' | 'FAILED' | 'IDEMPOTENT_HIT';
+  status: 'SUCCESS' | 'CONFLICT' | 'FAILED' | 'IDEMPOTENT_HIT' | 'RETRYING';
+  resultCode?: string;
+  retryAfterMs?: number;
   serverEntityVersion?: number;
   conflictResolution?: SyncConflictResolution;
   errorMessage?: string;

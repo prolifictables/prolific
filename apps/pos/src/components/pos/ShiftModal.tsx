@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useAuthStore } from '../../lib/auth-store';
 import { formatCentsToNgn, padZero } from '../../lib/ui-helpers';
+import { isWebPhpMode, isNativeDesktop } from '../../lib/web-php-config';
 import type { OpenShiftState } from '../../lib/types';
 
 type Mode = 'OPEN' | 'CLOSE';
@@ -640,7 +641,7 @@ export default function ShiftModal({ mode, openShift, onClose, onDone }: ShiftMo
         // (FIFO by id ASC, 1.5s poll interval) and forwards the shift open
         // to Render Mongo — no network required at open time.
         // =================================================================
-        try {
+        if (!isWebPhpMode() && !isNativeDesktop()) try {
           const serverShapePayload = {
             id: resolvedId,
             deviceId: deviceId || undefined,
@@ -663,7 +664,7 @@ export default function ShiftModal({ mode, openShift, onClose, onDone }: ShiftMo
             localEntityVersion: 1,
           };
           await (window as any).electronAPI?.db?.syncQueue?.push?.({
-            op_id: `shift_open_${resolvedId}_${now}`,
+            op_id: `shift_open_${resolvedId}`,
             entity_type: 'SHIFT',
             operation: 'CREATE',
             entity_id: resolvedId,
@@ -742,15 +743,15 @@ export default function ShiftModal({ mode, openShift, onClose, onDone }: ShiftMo
         // After persisting to SQLite, enqueue SHIFT UPDATE with the same
         // server-shape payload so sync queue forwards it on reconnect.
         // =================================================================
-        try {
+        if (!isWebPhpMode() && !isNativeDesktop()) try {
           const serverShapeClose = {
             id: openShift.shiftId,
             branchId: String(branch?.id || ''),
             restaurantId: String(restaurant?.id || ''),
             employeeId: String(employee?.id || ''),
-            deviceId: (() => {
+            deviceId: await (async () => {
               try {
-                const did: any = window.electronAPI?.getDeviceId?.();
+                const did: any = await window.electronAPI?.getDeviceId?.();
                 if (typeof did === 'string' && did) return did;
                 if (did && typeof did === 'object' && did.deviceId) return String(did.deviceId);
               } catch {}
@@ -780,12 +781,12 @@ export default function ShiftModal({ mode, openShift, onClose, onDone }: ShiftMo
             localEntityVersion: 1,
           };
           await (window as any).electronAPI?.db?.syncQueue?.push?.({
-            op_id: `shift_close_${openShift.shiftId}_${now}`,
+            op_id: `shift_close_${openShift.shiftId}`,
             entity_type: 'SHIFT',
             operation: 'UPDATE',
             entity_id: openShift.shiftId,
             payload: JSON.stringify(serverShapeClose),
-            idempotency_key: `shift_update_${openShift.shiftId}_closed_${now}`,
+            idempotency_key: `shift_update_${openShift.shiftId}_closed`,
             local_entity_version: 1,
           });
         } catch (syncQueueErr) {

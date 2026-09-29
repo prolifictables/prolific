@@ -25,6 +25,7 @@ import {
   applyRemoteMenuSnapshot,
   readOfflineMenuSnapshotMirror,
 } from '../../lib/mock-electron-shim';
+import { isWebPhpMode } from '../../lib/web-php-config';
 import { formatCentsToNgn } from '../../lib/ui-helpers';
 
 // =========================================================================
@@ -263,9 +264,7 @@ export default function ManagerTools(props: ManagerToolsProps) {
 
   const online = connectionStatus === 'ONLINE';
 
-  // Resolve a current access token. Kept intact for future hybrid-mode
-  // reuse (online-REST reads may be re-enabled as an opt-in overlay).
-  // Currently unused for reads/writes — all I/O is local-first SQLite.
+  // Resolve a current access token for PHP-web menu item updates.
   const resolveToken = async (): Promise<string> => {
     if (accessToken) return accessToken;
     if (!reauthAccessToken) {
@@ -276,8 +275,7 @@ export default function ManagerTools(props: ManagerToolsProps) {
     return await reauthAccessToken('', 'missing access token');
   };
 
-  // Wrap the raw reauthAccessToken callback to pass through opts.
-  // Kept intact so callers can re-enable REST calls in a future hybrid mode.
+  // Retry an authenticated update once if its access token needs refreshing.
   const callOpts = () => (reauthAccessToken ? { reauth: reauthAccessToken } : {});
 
   // ===== Sync queue helper =====
@@ -707,6 +705,11 @@ export default function ManagerTools(props: ManagerToolsProps) {
       const isUpdate = !!itemEditing;
       const id = isUpdate ? String(itemEditing.id || (itemEditing as any)._id) : crypto.randomUUID();
       const now = Date.now();
+      // PHP sync accepts orders/payments, not MENU_ITEM commands. Persist edits
+      // first so a rejected update cannot masquerade as a successful local save.
+      const savedItem = isWebPhpMode() && isUpdate
+        ? await updateAdminMenuItem(await resolveToken(), id, input, callOpts())
+        : null;
 
       const row = {
         id,
@@ -725,6 +728,7 @@ export default function ManagerTools(props: ManagerToolsProps) {
         scheduledAvailability: input.scheduledAvailability ?? null,
         createdAt: isUpdate ? itemEditing?.createdAt ?? now : now,
         updatedAt: now,
+        ...(savedItem ? normItem(savedItem as unknown as AnyRow) : {}),
       };
 
       const ipc = (window as any).electronAPI?.db?.menuItems;
@@ -755,7 +759,7 @@ export default function ManagerTools(props: ManagerToolsProps) {
         restaurantId: restaurantId,
         ...input,
       };
-      await pushSyncQueue({
+      if (!savedItem) await pushSyncQueue({
         entity_type: 'MENU_ITEM',
         operation: isUpdate ? 'UPDATE' : 'CREATE',
         entity_id: id,
@@ -765,8 +769,14 @@ export default function ManagerTools(props: ManagerToolsProps) {
 
       setItemEditorOpen(false);
       setItemEditing(null);
-      if (!online) flashToast('Saved locally. Syncs to Admin when online returns.');
-      await triggerCrossTally();
+      if (savedItem) {
+        // Avoid the legacy cross-tally callback writing a stale items snapshot.
+        await onMenuChanged();
+        await refreshItems(true);
+      } else {
+        if (!online) flashToast('Saved locally. Syncs to Admin when online returns.');
+        await triggerCrossTally();
+      }
     } catch (e: any) {
       const msg = e?.message || 'Save failed';
       alert(/expired|invalid token|logged out|not authorized|unauthorized/i.test(String(msg))
@@ -1623,6 +1633,9 @@ function ItemEditor({
     if (!categoryId) errs.categoryId = 'Category is required';
     const priceNum = Number(priceNgn);
     if (!Number.isFinite(priceNum) || priceNum < 0) errs.price = 'Enter a valid price';
+    if (isWebPhpMode() && (Math.round(priceNum * 100) < 1 || Math.round(priceNum * 100) > 1000000000)) {
+      errs.price = 'Price must be between ₦0.01 and ₦10,000,000';
+    }
     setErrors(errs);
     if (Object.keys(errs).length > 0) return;
 

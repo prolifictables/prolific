@@ -335,6 +335,8 @@ export interface PaymentRow {
 }
 
 export interface ShiftRow {
+  /** Derived from the persisted SHIFT OPEN response, never from the SQLite ID. */
+  serverShiftId?: string;
   id: string;
   device_id: string | null;
   branch_id: string | null;
@@ -551,6 +553,7 @@ export interface PromotionRow {
 }
 
 export interface LastAuthPayload {
+  mode?: 'ONLINE' | 'OFFLINE_PIN';
   employeeId?: string;
   accessToken?: string;
   refreshToken?: string;

@@ -69,11 +69,29 @@ function safeOn<T extends Parameters<typeof ipcMain.on>>(
 
 const isDev = !app.isPackaged;
 const isProd = app.isPackaged;
+// Explicit local-only PHP trial. It uses its own SQLite/store directory so no
+// existing POS credentials, outbox rows or device identity can cross over.
+const phpStagingTest = process.env.PROLIFIC_PHP_STAGING_TEST === '1';
+if (phpStagingTest && !isDev) {
+  throw new Error('PHP staging test mode is unavailable in packaged POS builds');
+}
+function stagingApiBase(): string {
+  const raw = process.env.PROLIFIC_PHP_STAGING_URL;
+  if (!raw) throw new Error('PROLIFIC_PHP_STAGING_URL is required for PHP staging test mode');
+  const url = new URL(raw);
+  if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(url.hostname) ||
+      !url.port || url.username || url.password || url.search || url.hash ||
+      url.pathname.replace(/\/+$/, '') !== '/api/v1') {
+    throw new Error('PHP staging test URL must be a loopback HTTP /api/v1 URL with an explicit port');
+  }
+  return url.toString().replace(/\/+$/, '');
+}
+const phpStagingUrl = phpStagingTest ? stagingApiBase() : null;
 
 // Redirect the Electron userData directory to a project-local folder during
 // development so the app keeps working even when the sandbox blocks writes
 // under ~/Library/Application Support (common in restricted dev sandboxes).
-const PROJECT_USERDATA_NAME = '.userData';
+const PROJECT_USERDATA_NAME = phpStagingTest ? '.userData-php-staging' : '.userData';
 function resolveDevUserDataDir(): string {
   // Walk up from electron/main/ to apps/pos/.userData
   const here = __dirname; // dist-electron/main (built) OR electron/main (uncommon)
@@ -158,8 +176,16 @@ function isAllowedOrigin(url: string): boolean {
 }
 
 function ensureDeviceId(): { deviceId: string; deviceKey: string } {
-  let deviceId = store.get('deviceId');
+  const configuredDeviceId = process.env.PROLIFIC_POS_DEVICE_ID?.trim();
+  if (configuredDeviceId && !/^[A-Za-z0-9_-]{8,128}$/.test(configuredDeviceId)) throw new Error('Invalid provisioned POS device ID.');
+  if (configuredDeviceId && !phpStagingTest) store.set('deviceId', configuredDeviceId);
+  let deviceId = configuredDeviceId || store.get('deviceId');
   let deviceKey = store.get('deviceKey');
+
+  if (phpStagingTest && deviceId !== 'STAGING_SYNC_DEVICE_A') {
+    deviceId = 'STAGING_SYNC_DEVICE_A';
+    store.set('deviceId', deviceId);
+  }
 
   if (!deviceId) {
     deviceId = `dev_${crypto.randomBytes(8).toString('hex')}`;
@@ -387,7 +413,7 @@ safeHandle(
     const controller = new AbortController();
     // Match guardedFetch's per-attempt PIN budget (8 seconds) so renderers
     // see the same timeout behavior regardless of which path runs.
-    const timeoutId = setTimeout(() => controller.abort(), 8_000);
+    const timeoutId = setTimeout(() => controller.abort(), phpStagingTest ? 120_000 : 8_000);
     try {
       const resp = await fetch(url, {
         method: 'POST',
@@ -395,7 +421,7 @@ safeHandle(
           'Content-Type': 'application/json',
           'User-Agent': `ProlificPOS-ElectronMain/${app.getVersion()}`,
         },
-        body: JSON.stringify(payload ?? {}),
+        body: JSON.stringify({ ...payload, deviceId: ensureDeviceId().deviceId }),
         signal: controller.signal,
         cache: 'no-store' as RequestCache,
       }).finally(() => clearTimeout(timeoutId));
@@ -438,6 +464,33 @@ safeHandle(
 // getHttpBaseUrl() (the same canonical URL used by the sync daemon and
 // getConnectionStatus). Returns { status, ok, headers, body (json), text }
 // so callers can drop in wherever fetch() was used.
+// Share refresh rotation between the renderer and the durable sync worker.
+let desktopRefreshInFlight: Promise<any> | null = null;
+let desktopRefreshAttemptAt = 0;
+async function refreshDesktopSession(): Promise<any> {
+  if (desktopRefreshInFlight) return desktopRefreshInFlight;
+  const previous = repos?.meta.getLastAuth();
+  if (previous?.mode !== 'ONLINE' || !previous.refreshToken) throw new Error('Sign in online to synchronize.');
+  desktopRefreshAttemptAt = Date.now();
+  desktopRefreshInFlight = (async () => {
+    const response = await fetch(`${getHttpBaseUrl()}/auth/refresh`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: previous.refreshToken, deviceId: ensureDeviceId().deviceId }),
+      signal: AbortSignal.timeout(12000),
+    });
+    const body = await response.json() as any;
+    if (!response.ok || !body?.data?.accessToken) throw new Error('Online session refresh failed. Please sign in again.');
+    const current = repos?.meta.getLastAuth();
+    if (current?.mode !== 'ONLINE' || current.refreshToken !== previous.refreshToken) throw new Error('Session changed while refreshing.');
+    const data = body.data;
+    repos?.meta.setLastAuth({ ...current, accessToken: data.accessToken, refreshToken: data.refreshToken,
+      expiresAt: Date.now() + Number(data.expiresIn || 900) * 1000 });
+    return data;
+  })();
+  try { return await desktopRefreshInFlight; } finally { desktopRefreshInFlight = null; }
+}
+safeHandle('auth:refresh', () => refreshDesktopSession());
+
 safeHandle(
   'public:http-get',
   async (_event, args: { path: string }) => {
@@ -1198,6 +1251,13 @@ function registerPrintHandlers(): void {
       const modifiers = repos.orderItemModifierOptions.listByOrderId(orderId);
       const payments = repos.payments.listByOrderId(orderId);
       const printers = await posWin.webContents.getPrintersAsync();
+      if (!printers || printers.length === 0) {
+        return {
+          queued: false,
+          error: 'No receipt printer detected. Connect a printer and try again.',
+        };
+      }
+
       const defaultPrinter = printers.find((pr) => (pr as any).isDefault) ?? printers[0];
       const printedAt = Date.now();
       const header = resolveBranchHeader(order);
@@ -1498,6 +1558,7 @@ function broadcastSync(channel: string, payload: unknown): void {
  *   4. Dev fallback — `http://localhost:4000/api/v1` (local Nest server).
  */
 function getHttpBaseUrl(): string {
+  if (phpStagingUrl) return phpStagingUrl;
   // (1) Runtime overrides — electron-store settings take the absolute
   // highest precedence so ops teams can reroute packaged builds without
   // recompiling or editing shell-env files.
@@ -1522,10 +1583,8 @@ function getHttpBaseUrl(): string {
     return envUrl.replace(/\/+$/, '');
   }
 
-  // (3) Production packaged build → canonical Render URL.
-  // The old fallback `https://api.prolificpos.com/api` never existed and is
-  // replaced with the confirmed live production deployment.
-  if (!isDev) return 'https://prolific-api.onrender.com/api/v1';
+  // (3) Production desktop uses the canonical PHP API.
+  if (!isDev) return 'https://prolifictables.com/api/v1';
 
   // (4) Dev-only fallback → local Nest server.
   return 'http://localhost:4000/api/v1';
@@ -1594,15 +1653,20 @@ app.on('ready', async () => {
       httpBaseUrl: getHttpBaseUrl(),
       getAuthFn: () => {
         const lastAuth = repos?.meta.getLastAuth();
+        if (lastAuth?.mode === 'ONLINE' && lastAuth.refreshToken && (!lastAuth.expiresAt || lastAuth.expiresAt < Date.now() + 30000) && Date.now() - desktopRefreshAttemptAt > 30000) {
+          void refreshDesktopSession().catch(() => { /* Retain commands until online sign-in succeeds. */ });
+        }
         return {
-          accessToken: lastAuth?.accessToken,
-          deviceId,
+          accessToken: lastAuth?.mode === 'ONLINE' && lastAuth.deviceId === deviceId && (!lastAuth.expiresAt || lastAuth.expiresAt > Date.now()) ? lastAuth.accessToken : undefined,
+          deviceId: lastAuth?.deviceId || deviceId,
+          employeeId: lastAuth?.employeeId,
           branchId: lastAuth?.branchId,
           restaurantId: lastAuth?.restaurantId,
         };
       },
       ipcMain,
       deviceId,
+      phpStagingSync: true,
       broadcastToRenderers: broadcastSync,
     });
     syncEngine.start();

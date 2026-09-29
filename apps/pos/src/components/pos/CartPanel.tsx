@@ -7,6 +7,7 @@ import { formatCentsToNgn } from '../../lib/ui-helpers';
 import TablePickerModal from './TablePickerModal';
 import PaymentModal from './PaymentModal';
 import TableTabDetailsModal from './TableTabDetailsModal';
+import { isWebPhpMode } from '../../lib/web-php-config';
 
 type OrderType = 'DINE_IN' | 'TAKEOUT' | 'PICKUP' | 'DELIVERY';
 
@@ -269,7 +270,8 @@ export default function CartPanel() {
       }
 
       if (window.electronAPI?.db?.syncQueue?.push) {
-        const taxIds = taxes.map((t) => String(t.id ?? t._id ?? '')).filter(Boolean);
+        // The cart's zero-tax policy must also apply to held PHP orders.
+        const taxIds = isWebPhpMode() ? [] : taxes.map((t) => String(t.id ?? t._id ?? '')).filter(Boolean);
         const serverOrderPayload = {
           restaurantId: restaurant?.id,
           branchId: branch?.id,

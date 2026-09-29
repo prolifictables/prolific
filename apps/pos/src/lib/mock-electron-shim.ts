@@ -14,6 +14,9 @@ import type {
 } from '../vite-env';
 import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
 import { beginWake, endWake, publishApiWake } from './api-wake';
+import { isWebPhpMode, webPhpDeviceId, webPhpPinLoginPayload } from './web-php-config';
+import { webPhpRequest } from './web-php-api';
+import { useAuthStore } from './auth-store';
 
 // ---------------------------------------------------------------------------
 // Customer Display state bus (BroadcastChannel, browser-mode only)
@@ -50,7 +53,7 @@ function getCustomerChannel(): BroadcastChannel | null {
       const msg = ev.data;
       if (!msg || typeof msg !== 'object') return;
       // POS window replies to late-subscriber popup requests with latest state.
-      if (msg.type === 'customer-latest-request') {
+      if (msg.type === 'customer-latest-request' && window.location.hash !== '#/customer-display') {
         const payload: CustomerStatePayload = { ..._latestCustomerState };
         try {
           _customerChannel?.postMessage({ type: 'customer-state', payload });
@@ -140,6 +143,12 @@ function emitCustomerState(partial: Partial<CustomerStatePayload>): void {
     _latestCustomerState.screen = partial.screen;
   }
   const payload: CustomerStatePayload = { ..._latestCustomerState };
+  // The customer popup is a subscriber, never an authoritative cart writer.
+  // Its branding bootstrap must not broadcast an idle state over the cashier's cart.
+  if (window.location.hash === '#/customer-display') {
+    _customerSubscribers.forEach((cb) => { try { cb(payload); } catch {} });
+    return;
+  }
   const ch = getCustomerChannel();
   try {
     ch?.postMessage({ type: 'customer-state', payload });
@@ -169,6 +178,25 @@ function emitCustomerState(partial: Partial<CustomerStatePayload>): void {
 // Used by shimGuardedFetch for every backend call in this shim.
 // =========================================================================
 function resolvePublicApiBase(): string {
+  if ((import.meta as any).env?.VITE_WEB_PHP_MODE === '1') {
+    const configured = String((import.meta as any).env?.VITE_WEB_PHP_API_BASE_URL || '').trim();
+    const inferred =
+      !configured && typeof window !== 'undefined' && window.location?.origin
+        ? `${window.location.origin.replace(/\/+$/, '')}/api/v1`
+        : '';
+    const raw = String(configured || inferred).trim().replace(/\/+$/, '');
+    if (!raw || !/^https:\/\/[^/]+\/api\/v1$|^http:\/\/(?:localhost|127\.0\.0\.1):\d+\/api\/v1$/.test(raw)) {
+      throw new Error('Web PHP mode requires an explicit PHP API URL.');
+    }
+    return raw;
+  }
+  if ((import.meta as any).env?.VITE_PHP_STAGING_TEST === '1') {
+    const base = (window as any)?.electronAPI?.getApiBaseUrlSync?.();
+    if (typeof base !== 'string' || !/^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1\/?$/.test(base)) {
+      throw new Error('PHP staging mode requires the isolated Electron loopback API');
+    }
+    return base.replace(/\/+$/, '');
+  }
   const REAL_PRODUCTION_API_BASE = 'https://prolific-api.onrender.com/api/v1';
 
   const detectElectron = (): boolean => {
@@ -772,7 +800,7 @@ const SEEDED_TAXES = [
 //   (3) Localhost-only: SEEDED_* demo data (dev preview only — production hostnames
 //       never fall to SEEDED because they'd show stale demo items that never
 //       correspond to the admin-uploaded menu)
-const OFFLINE_MENU_KEY = 'pos_offline_menu_snapshot_v1';
+const OFFLINE_MENU_KEY = isWebPhpMode() ? 'pos_php_offline_menu_snapshot_v1' : 'pos_offline_menu_snapshot_v1';
 
 type OfflineMenuStoreShape = {
   // keyed by branchId
@@ -982,7 +1010,7 @@ function resolveMenuSource<TKey extends 'categories' | 'items' | 'modifiers'>(
     const v = offline[key];
     if (Array.isArray(v)) return v;
   }
-  if (isLocalhostHostname()) {
+  if (isLocalhostHostname() && !isWebPhpMode()) {
     switch (key) {
       case 'categories': return [...SEEDED_CATEGORIES];
       case 'items': return [...SEEDED_MENU_ITEMS];
@@ -1013,7 +1041,7 @@ function ensureRemoteSnapshotWritable(): NonNullable<typeof remoteMenuSnapshot> 
     const existing = readOfflineSnapshotForBranch();
     if (existing) {
       remoteMenuSnapshot = existing;
-    } else if (isLocalhostHostname()) {
+    } else if (isLocalhostHostname() && !isWebPhpMode()) {
       remoteMenuSnapshot = {
         categories: SEEDED_CATEGORIES.map((c) => ({ ...c })),
         items: SEEDED_MENU_ITEMS.map((m) => ({ ...m })),
@@ -1219,10 +1247,185 @@ const mockOrders: any[] = [
     updatedAt: Date.now() - 10 * 60 * 1000,
   },
 ];
+if (isWebPhpMode()) mockOrders.length = 0;
+
+// PHP/MongoDB is the authoritative browser history. This is only a bounded,
+// in-memory view cache; no completed sale is persisted in browser storage.
+async function fetchPhpHistoryPage(page: number, limit: number, from?: string | null, to?: string | null): Promise<{ data: any[]; meta: { page: number; hasMore: boolean } }> {
+  const params = new URLSearchParams({ page: String(page), limit: String(limit) });
+  if (from) params.set('from', from);
+  if (to) params.set('to', to);
+  const result = await webPhpRequest<{ data: any[]; meta: { page: number; hasMore: boolean } }>(`/orders?${params}`);
+  const branchId = useAuthStore.getState().branch?.id;
+  const records = Array.isArray(result?.data) ? result.data : [];
+  const rows = records.filter((remote: any) => remote?.branchId === branchId).map((remote: any) => {
+    const id = String(remote._id ?? remote.id);
+    const totalCents = Number(remote.totalCents ?? 0);
+    const paidCents = typeof remote.paidCents === 'number' ? remote.paidCents : remote.paymentStatus === 'PAID' ? totalCents : 0;
+    const items = Array.isArray(remote.items) ? remote.items.map((item: any) => ({
+      menuItemId: item.menuItemId,
+      name: item.menuItemName ?? item.name ?? '',
+      quantity: Number(item.quantity ?? 1),
+      unitPrice: Number(item.unitPriceCents ?? 0) / 100,
+      unitPriceCents: Number(item.unitPriceCents ?? 0),
+      subtotalCents: Number(item.subtotalCents ?? 0),
+      totalCents: Number(item.totalCents ?? 0),
+      selectedModifiers: [],
+    })) : [];
+    const row = {
+      id,
+      orderNumber: String(remote.clientOrderNumber ?? remote.orderNumber ?? `#${id.slice(-6)}`),
+      serverOrderNumber: remote.orderNumber,
+      clientOrderNumber: remote.clientOrderNumber,
+      restaurantId: remote.restaurantId,
+      branchId: remote.branchId,
+      employeeId: remote.employeeId,
+      deviceId: remote.deviceId,
+      orderType: remote.type ?? remote.orderType ?? 'DINE_IN',
+      status: remote.status ?? 'PENDING',
+      paymentStatus: remote.paymentStatus ?? 'UNPAID',
+      source: remote.source ?? 'POS',
+      sourceChannel: remote.source ?? 'POS',
+      tableId: remote.tableId,
+      subtotalCents: Number(remote.subtotalCents ?? 0),
+      discountCents: Number(remote.discountCents ?? 0),
+      taxCents: Number(remote.taxCents ?? 0),
+      totalCents,
+      paidCents,
+      balanceDueCents: Math.max(0, totalCents - paidCents),
+      subtotalAmount: Number(remote.subtotalCents ?? 0) / 100,
+      discountAmount: Number(remote.discountCents ?? 0) / 100,
+      taxAmount: Number(remote.taxCents ?? 0) / 100,
+      totalAmount: totalCents / 100,
+      paidAmount: paidCents / 100,
+      balanceDue: Math.max(0, totalCents - paidCents) / 100,
+      items,
+      notes: remote.notes ?? null,
+      createdAt: Date.parse(String(remote.createdAt ?? '')) || 0,
+      updatedAt: Date.parse(String(remote.updatedAt ?? '')) || 0,
+    };
+    const localDuplicate = mockOrders.findIndex((order: any) => order.id !== id &&
+      remote.clientOrderNumber && order.orderNumber === remote.clientOrderNumber &&
+      order.status === 'COMPLETED' && remote.status === 'COMPLETED');
+    if (localDuplicate >= 0) mockOrders.splice(localDuplicate, 1);
+    const current = mockOrders.findIndex((order: any) => order.id === id);
+    if (current >= 0) mockOrders[current] = { ...mockOrders[current], ...row };
+    else mockOrders.push(row);
+    return row;
+  });
+  return { data: rows, meta: { page, hasMore: result?.meta?.hasMore === true } };
+}
+
+let phpRecentHistoryAt = 0;
+let phpRecentHistoryRequest: Promise<void> | null = null;
+let phpRecentHistoryBranchId = '';
+async function refreshPhpRecentHistory(limit: number): Promise<void> {
+  const branchId = useAuthStore.getState().branch?.id ?? '';
+  if (branchId !== phpRecentHistoryBranchId) {
+    phpRecentHistoryBranchId = branchId;
+    phpRecentHistoryAt = 0;
+  }
+  if (Date.now() - phpRecentHistoryAt < 30_000) return;
+  if (!phpRecentHistoryRequest) {
+    phpRecentHistoryRequest = fetchPhpHistoryPage(0, limit)
+      .then(() => { phpRecentHistoryAt = Date.now(); })
+      .finally(() => { phpRecentHistoryRequest = null; });
+  }
+  await phpRecentHistoryRequest;
+}
+
+const PHP_TABLES_KEY = 'prolific-web-php-tables-v1';
+const PHP_OPEN_SHIFT_KEY = 'prolific-web-php-open-shift-v1';
+function cachePhpOpenShift(shift: any | null): void {
+  if (!isWebPhpMode()) return;
+  if (!shift) { localStorage.removeItem(PHP_OPEN_SHIFT_KEY); return; }
+  localStorage.setItem(PHP_OPEN_SHIFT_KEY, JSON.stringify({
+    shift, deviceId: webPhpDeviceId(), verifiedAt: Date.now(),
+  }));
+}
+function cachedPhpOpenShift(): any | null {
+  try {
+    const record = JSON.parse(localStorage.getItem(PHP_OPEN_SHIFT_KEY) || 'null');
+    const auth = useAuthStore.getState();
+    const restaurantId = auth.restaurant?.id || auth.branch?.restaurantId;
+    if (record?.deviceId !== webPhpDeviceId() || !record?.shift ||
+        record.shift.status !== 'OPEN' || Date.now() - record.verifiedAt > 12 * 60 * 60 * 1000 ||
+        !auth.accessToken || (auth.expiresAt && auth.expiresAt <= Date.now()) ||
+        record.shift.branchId !== auth.branch?.id || record.shift.restaurantId !== restaurantId) {
+      console.warn('[shift] previously verified shift is not eligible for offline use', {
+        cached: !!record?.shift, deviceMatch: record?.deviceId === webPhpDeviceId(),
+        status: record?.shift?.status, branchMatch: record?.shift?.branchId === auth.branch?.id,
+        restaurantMatch: record?.shift?.restaurantId === restaurantId,
+        tokenPresent: !!auth.accessToken, tokenUnexpired: !auth.expiresAt || auth.expiresAt > Date.now(),
+      });
+      return null;
+    }
+    return record.shift;
+  } catch { return null; }
+}
+let webPhpTables: any[] = (() => {
+  if (!isWebPhpMode()) return [];
+  try { const rows = JSON.parse(localStorage.getItem(PHP_TABLES_KEY) || '[]'); return Array.isArray(rows) ? rows : []; }
+  catch { return []; }
+})();
 
 const mockPayments: any[] = [];
 const mockCashAdjustments: any[] = [];
-const mockSyncQueue: any[] = [];
+// Browser PHP mode must not depend on an in-memory-only outbox. Keep its queue
+// separate from legacy Node browser data so switching the target cannot replay
+// commands to the wrong backend. Recover rows claimed before a page crash.
+const PHP_SYNC_QUEUE_KEY = 'prolific-web-php-sync-queue-v1';
+const mockSyncQueue: any[] = (() => {
+  if (!isWebPhpMode()) return [];
+  try {
+    const rows = JSON.parse(localStorage.getItem(PHP_SYNC_QUEUE_KEY) || '[]');
+    if (!Array.isArray(rows)) return [];
+    const cleaned = rows.filter((row: any) => row && typeof row === 'object').map((row: any) => ({
+      ...row,
+      status: row.status === 'PROCESSING' ? 'PENDING' : row.status,
+    }));
+    const resolveOrderId = (row: any): string => {
+      if (row?.entity_type === 'ORDER') return String(row.entity_id || '');
+      if (row?.entity_type === 'PAYMENT') {
+        try {
+          const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+          return String(payload?.orderId || '');
+        } catch { return ''; }
+      }
+      return '';
+    };
+    const blockerByOrder = new Map<string, any>();
+    for (const row of cleaned) {
+      const orderId = resolveOrderId(row);
+      const blocker = orderId ? blockerByOrder.get(orderId) : null;
+      if (blocker && row.status !== 'DONE' && row.status !== 'FAILED') {
+        row.status = 'FAILED';
+        row.error = `Blocked by failed ${String(blocker.entity_type || '').toUpperCase()} ${String(blocker.operation || '').toUpperCase()}: ${String(blocker.error || 'FAILED')}`;
+        delete row.nextRetryAt;
+      }
+      if (row.status === 'FAILED' && orderId) blockerByOrder.set(orderId, row);
+    }
+    return cleaned;
+  } catch { return []; }
+})();
+
+function persistPhpSyncQueue(): void {
+  if (!isWebPhpMode()) return;
+  // A quota/storage failure is fatal to enqueue: never acknowledge a sale as
+  // safely queued when the only browser copy would disappear on refresh.
+  localStorage.setItem(PHP_SYNC_QUEUE_KEY, JSON.stringify(mockSyncQueue));
+}
+
+function phpSyncOrderIdentity(row: any): string {
+  if (row?.entity_type === 'ORDER') return String(row.entity_id || '');
+  if (row?.entity_type === 'PAYMENT') {
+    try {
+      const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+      return String(payload?.orderId || '');
+    } catch { return ''; }
+  }
+  return '';
+}
 // Mock order_items + order_item_modifier_options tables (mirror SQLite in browser mode).
 // Used so receipts/kitchen tickets render modifiers and line items correctly on Vite dev.
 const mockOrderItems: any[] = [];
@@ -1377,7 +1580,15 @@ const delay = (ms = 50) => new Promise((r) => setTimeout(r, ms));
 
 export function installMockElectronAPI() {
   if (typeof window === 'undefined') return;
-  if (window.electronAPI) return; // already provided by real Electron preload
+  const isElectronRenderer =
+    typeof (window as any).process === 'object' && !!(window as any).process?.versions?.electron;
+  if (window.electronAPI && (window.electronAPI.isNativeDesktop || isElectronRenderer)) return;
+
+  try {
+    if (isWebPhpMode()) {
+      (window as any).__prolificWebPhpOutboxKey = 'prolific-web-php-sync-queue-v1';
+    }
+  } catch { /* ignore */ }
 
   // -------------------------------------------------------------------------
   // Browser-mode printing helpers. Mirrors the registerPrintHandlers() logic
@@ -1764,10 +1975,6 @@ export function installMockElectronAPI() {
   };
 
   const mockPrintHtml = async (html: string): Promise<void> => {
-    // Render into a clean iframe, then trigger native window.print() through
-    // the iframe's content window. Clobber the same iframe slot each print so
-    // we don't leak iframes. Uses srcdoc + Promise.race(onload, timeout) for
-    // cross-browser reliability regardless of whether onload fires reliably.
     if (typeof document === 'undefined' || typeof window === 'undefined') return;
     const iframeId = 'pos-shim-print-frame';
     let iframe: HTMLIFrameElement | null = document.getElementById(iframeId) as HTMLIFrameElement | null;
@@ -1802,24 +2009,23 @@ export function installMockElectronAPI() {
       };
 
       try {
-        // srcdoc is more reliable cross-browser than manual doc.open/write/close
-        // (some browsers suppress onload when the same iframe is re-written).
-        // We fall through to the timeout resolver even if onload never fires.
         try {
           iframe.srcdoc = html;
         } catch {
-          // Legacy fallback for very old browsers without srcdoc support.
-          const doc = iframe.contentWindow?.document;
-          if (doc) {
-            doc.open();
-            doc.write(html);
-            doc.close();
+          try {
+            const blobUrl = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+            iframe.src = blobUrl;
+            setTimeout(() => { try { URL.revokeObjectURL(blobUrl); } catch { /* noop */ } }, 5000);
+          } catch {
+            const doc = iframe.contentWindow?.document;
+            if (doc) {
+              doc.open();
+              doc.write(html);
+              doc.close();
+            }
           }
         }
 
-        // Promise.race-equivalent: fire finalize as soon as either the iframe
-        // finishes loading OR 500ms elapses (whichever comes first). This
-        // ensures we never hang waiting for a suppressed onload event.
         const timeoutId = setTimeout(() => finalize(), 500);
         const prevOnload = iframe.onload;
         iframe.onload = () => {
@@ -1834,6 +2040,7 @@ export function installMockElectronAPI() {
   };
 
   const api: any = {
+    getDeviceId: async () => ({ deviceId: isWebPhpMode() ? webPhpDeviceId() : (localStorage.getItem('pos_device_id') || 'browser-demo-device') }),
     // Parity with real Electron preload cashiers.ts getApiBaseUrlSync/getApiBaseUrl:
     // the renderer resolveApiBase in remote-auth.ts asks for these FIRST so
     // browser mock-shim mode and real Electron packaged mode share an
@@ -1860,7 +2067,7 @@ export function installMockElectronAPI() {
         const resp = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload ?? {}),
+          body: JSON.stringify(isWebPhpMode() ? webPhpPinLoginPayload(payload.pin) : (payload ?? {})),
           signal: controller.signal,
           cache: 'no-store' as RequestCache,
         }).finally(() => clearTimeout(timeoutId));
@@ -1954,6 +2161,18 @@ export function installMockElectronAPI() {
           await delay(25);
           const resolvedPin: string =
             typeof pin === 'string' && pin !== undefined ? pin : pinOrBranchId;
+          if (isWebPhpMode()) {
+            const response = await fetch(`${resolvePublicApiBase()}/auth/pin/login`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(webPhpPinLoginPayload(resolvedPin)),
+            });
+            if (response.status === 400 || response.status === 401 || response.status === 403) return null;
+            if (!response.ok) throw new Error(`PIN verification unavailable (HTTP ${response.status}).`);
+            const body = await response.json();
+            const data = body?.data ?? body;
+            return data?.employee && data?.user ? { ...data.employee, firstName: data.user.firstName, lastName: data.user.lastName } : null;
+          }
 
           // -------------------------------------------------------------------
           // PRIMARY-OFFLINE POLICY: local cache FIRST, network LAST.
@@ -2036,39 +2255,55 @@ export function installMockElectronAPI() {
           //   (1) VITE_API_BASE_URL / VITE_API_URL / VITE_PUBLIC_API_URL / API_BASE_URL
           //   (2) prod hostname → https://api.prolifictables.com/api/v1
           //   (3) localhost → http://localhost:4000/api/v1
-          const resolveShimApiBase = (): string => {
-            // (0) localStorage operator override — HIGHEST priority.
-            if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
-              try {
-                const override = window.localStorage.getItem('prolific_api_base');
-                if (typeof override === 'string' && override.trim().length > 3) {
-                  const trimmed = override.trim().replace(/\/+$/, '');
-                  if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
-                    return trimmed;
-                  }
-                  return `${trimmed}/api/v1`;
-                }
-              } catch {
-                // localStorage blocked (Safari private, etc.) → fall through
-              }
-            }
-            // (1) Vite build env
-            const viteExplicit =
-              (typeof import.meta !== 'undefined' &&
-                (import.meta as any).env &&
-                ((import.meta as any).env.VITE_API_BASE_URL ||
-                  (import.meta as any).env.VITE_API_URL ||
-                  (import.meta as any).env.VITE_PUBLIC_API_URL ||
-                  (import.meta as any).env.API_BASE_URL)) ||
-              null;
-            if (viteExplicit) return viteExplicit;
-            // (2) Prod hostname → REAL confirmed Render API slug.
-            // NOTE: User explicitly confirmed the API is hosted at
-            //       https://prolific-api.onrender.com.
-            if (prodHostname) return 'https://prolific-api.onrender.com/api/v1';
-            // (3) Dev localhost
-            return 'http://localhost:4000/api/v1';
-          };
+         const resolveShimApiBase = (): string => {
+  // Web PHP production mode — always use the explicit PHP API.
+  if ((import.meta as any).env?.VITE_WEB_PHP_MODE === '1') {
+    const configured = String((import.meta as any).env?.VITE_WEB_PHP_API_BASE_URL || '').trim();
+    const inferred =
+      !configured && typeof window !== 'undefined' && window.location?.origin
+        ? `${window.location.origin.replace(/\/+$/, '')}/api/v1`
+        : '';
+    const raw = String(configured || inferred).trim().replace(/\/+$/, '');
+    if (!raw || !/^https:\/\/[^/]+\/api\/v1$|^http:\/\/(?:localhost|127\.0\.0\.1):\d+\/api\/v1$/.test(raw)) {
+      throw new Error('Web PHP mode requires an explicit HTTPS API URL (or loopback HTTP) ending in /api/v1.');
+    }
+    return raw;
+  }
+
+  // (0) localStorage operator override — HIGHEST priority.
+  if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
+    try {
+      const override = window.localStorage.getItem('prolific_api_base');
+      if (typeof override === 'string' && override.trim().length > 3) {
+        const trimmed = override.trim().replace(/\/+$/, '');
+        if (/\/api\/v\d+\/?$/.test(trimmed) || trimmed.endsWith('/v1') || trimmed.endsWith('/v0')) {
+          return trimmed;
+        }
+        return `${trimmed}/api/v1`;
+      }
+    } catch {
+      // localStorage blocked (Safari private, etc.) → fall through
+    }
+  }
+
+  // (1) Vite build env
+  const viteExplicit =
+    (typeof import.meta !== 'undefined' &&
+      (import.meta as any).env &&
+      ((import.meta as any).env.VITE_API_BASE_URL ||
+        (import.meta as any).env.VITE_API_URL ||
+        (import.meta as any).env.VITE_PUBLIC_API_URL ||
+        (import.meta as any).env.API_BASE_URL)) ||
+    null;
+
+  if (viteExplicit) return viteExplicit;
+
+  // (2) Prod hostname → REAL confirmed Render API slug.
+  if (prodHostname) return 'https://prolific-api.onrender.com/api/v1';
+
+  // (3) Dev localhost
+  return 'http://localhost:4000/api/v1';
+};
 
           try {
             const API_BASE_FOR_SHIM = resolveShimApiBase();
@@ -2194,6 +2429,7 @@ export function installMockElectronAPI() {
           return true;
         },
         upsertWithPin: async (employee: unknown, pin: string) => {
+          if (isWebPhpMode()) throw new Error('PHP browser mode never caches a plaintext PIN.');
           await delay(10);
           // Mirror Electron SQLite: persist the employee + plaintext pin into
           // the browser shim's localStorage mirror so findByPin's local check
@@ -2435,6 +2671,14 @@ export function installMockElectronAPI() {
 
       taxes: {
         listActiveDefaults: async () => {
+          if (isWebPhpMode()) {
+            const { useAuthStore } = await import('./auth-store');
+            const token = await useAuthStore.getState().actions.refreshAccessToken({ deviceId: webPhpDeviceId() });
+            const response = await fetch(`${resolvePublicApiBase()}/taxes`, { headers: { Authorization: `Bearer ${token}` } });
+            if (!response.ok) throw new Error(`Unable to load PHP taxes (HTTP ${response.status}).`);
+            const body = await response.json();
+            return (Array.isArray(body?.data) ? body.data : []).filter((tax: any) => tax.isActive !== false && tax.isDefault === true);
+          }
           await delay(10);
           return [...SEEDED_TAXES];
         },
@@ -2443,20 +2687,28 @@ export function installMockElectronAPI() {
       diningTables: {
         listAll: async () => {
           await delay(15);
-          return [...SEEDED_TABLES];
+          return isWebPhpMode() ? [...webPhpTables] : [...SEEDED_TABLES];
         },
-        listByZone: async () => [...SEEDED_TABLES],
+        listByZone: async () => isWebPhpMode() ? [...webPhpTables] : [...SEEDED_TABLES],
         update: async () => true,
       },
 
       orders: {
         list: async () => {
-          await delay(15);
-          return [...mockOrders].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          if (isWebPhpMode()) await refreshPhpRecentHistory(100);
+          else await delay(15);
+          const branchId = useAuthStore.getState().branch?.id;
+          return mockOrders.filter((o) => !isWebPhpMode() || o.branchId === branchId).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         },
         listRecent: async (_limit?: number) => {
-          await delay(15);
-          return [...mockOrders].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          if (isWebPhpMode()) await refreshPhpRecentHistory(Math.min(Math.max(_limit ?? 100, 1), 300));
+          else await delay(15);
+          const branchId = useAuthStore.getState().branch?.id;
+          return mockOrders.filter((o) => !isWebPhpMode() || o.branchId === branchId).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        },
+        historyPage: async (page: number, limit = 100, from?: string | null, to?: string | null) => {
+          if (!isWebPhpMode()) throw new Error('History pages are available in PHP browser mode only.');
+          return fetchPhpHistoryPage(page, limit, from, to);
         },
         get: async (id: string) => mockOrders.find((o) => o.id === id) || null,
         getById: async (id: string) => mockOrders.find((o) => o.id === id) || null,
@@ -2906,7 +3158,8 @@ export function installMockElectronAPI() {
             const itemQty =
               typeof o.item_qty === 'number' ? o.item_qty :
               typeof o.itemQty === 'number' ? o.itemQty :
-              Number(o.quantity || 0);
+              Array.isArray(o.items) ? o.items.reduce((sum: number, item: any) => sum + Number(item.quantity || 0), 0) :
+              mockOrderItems.filter((item: any) => String(item.order_id) === String(o.id ?? o._id)).reduce((sum: number, item: any) => sum + Number(item.quantity || 0), 0);
             paidItemQty += itemQty;
             subtotalCents +=
               typeof o.subtotal_cents === 'number' ? o.subtotal_cents :
@@ -2999,13 +3252,18 @@ export function installMockElectronAPI() {
       tables: {
         list: async () => {
           await delay(10);
-          return [...SEEDED_TABLES];
+          return isWebPhpMode() ? [...webPhpTables] : [...SEEDED_TABLES];
         },
         listAll: async () => {
           await delay(10);
-          return [...SEEDED_TABLES];
+          return isWebPhpMode() ? [...webPhpTables] : [...SEEDED_TABLES];
         },
         applySnapshot: async (_tables: unknown) => {
+          if (isWebPhpMode()) {
+            if (!Array.isArray(_tables)) throw new Error('Invalid PHP table snapshot.');
+            webPhpTables = _tables;
+            localStorage.setItem(PHP_TABLES_KEY, JSON.stringify(webPhpTables));
+          }
           await delay(10);
           return true;
         },
@@ -3022,6 +3280,29 @@ export function installMockElectronAPI() {
         // shift open-shift restore on same device), employee/branch filters are skipped
         // explicitly passed through the SAME device-level comparisons take precedence.
         getOpen: async (filter?: { deviceId?: string; employeeId?: string; branchId?: string; restaurantId?: string }) => {
+          if (isWebPhpMode()) {
+            let shift: any;
+            try {
+              shift = await webPhpRequest<any>(`/shifts/current?deviceId=${encodeURIComponent(webPhpDeviceId())}`);
+            } catch (error) {
+              // A short transport outage may use a previously server-verified
+              // shift while its authenticated session is still unexpired.
+              // Never fall back after a PHP 401/403 or business rejection.
+              if (error instanceof TypeError) return cachedPhpOpenShift();
+              console.warn('[shift] PHP current-shift request rejected offline fallback', error);
+              throw error;
+            }
+            if (!shift) { cachePhpOpenShift(null); return null; }
+            const normalized = {
+              ...shift,
+              id: shift._id,
+              opening_cash_cents: shift.openingCash,
+              opened_at: Date.parse(shift.openingTimestamp || shift.createdAt || '') || Date.now(),
+              openedAt: Date.parse(shift.openingTimestamp || shift.createdAt || '') || Date.now(),
+            };
+            cachePhpOpenShift(normalized);
+            return normalized;
+          }
           await delay(10);
           // Refresh in-memory copy from storage so multi-tab scenarios and page
           // refreshes all see the latest authoritative open shift.
@@ -3057,6 +3338,25 @@ export function installMockElectronAPI() {
           return open;
         },
         open: async (payload: any) => {
+          if (isWebPhpMode()) {
+            const result = await webPhpRequest<{ shift: any }>('/shifts/open', {
+              method: 'POST',
+              headers: { 'Idempotency-Key': String(payload.idempotency_key) },
+              body: JSON.stringify({
+                deviceId: webPhpDeviceId(),
+                openingCash: Number(payload.opening_cash_cents),
+                idempotencyKey: String(payload.idempotency_key),
+              }),
+            });
+            const normalized = {
+              ...result.shift,
+              id: result.shift._id,
+              opening_cash_cents: result.shift.openingCash,
+              opened_at: Date.parse(result.shift.openingTimestamp || '') || Date.now(),
+            };
+            cachePhpOpenShift(normalized);
+            return normalized;
+          }
           await delay(15);
           // Idempotency guard: mirror the Electron SQLite partial UNIQUE
           // index idx_shifts_device_open ON shifts(device_id) WHERE status =
@@ -3089,6 +3389,19 @@ export function installMockElectronAPI() {
           return mockOpenShift;
         },
         close: async (payload: any) => {
+          if (isWebPhpMode()) {
+            const id = String(payload.id || '');
+            if (!id) throw new Error('An open server shift is required.');
+            const result = await webPhpRequest<{ shift: any }>(`/shifts/${encodeURIComponent(id)}/close`, {
+              method: 'POST',
+              body: JSON.stringify({
+                closingCash: Number(payload.closing_cash_cents),
+                idempotencyKey: `pos-close-${id}`,
+              }),
+            });
+            cachePhpOpenShift(null);
+            return result.shift;
+          }
           await delay(15);
           if (mockOpenShift) {
             const closed = { ...mockOpenShift, closedAt: Date.now(), ...payload, status: 'CLOSED' };
@@ -3173,7 +3486,150 @@ export function installMockElectronAPI() {
             failed: mockSyncQueue.filter((q) => q.status === 'FAILED').length,
           };
         },
+        peek: async (limit?: number) => {
+          await delay(8);
+          const cap = typeof limit === 'number' && isFinite(limit) ? Math.min(250, Math.max(1, Math.floor(limit))) : 50;
+          const persistedStatusByOpId = new Map<string, string>();
+          if (isWebPhpMode()) {
+            try {
+              const stored = JSON.parse(localStorage.getItem(PHP_SYNC_QUEUE_KEY) || '[]');
+              if (Array.isArray(stored)) for (const row of stored) {
+                persistedStatusByOpId.set(String(row?.op_id ?? row?.opId ?? ''), String(row?.status ?? ''));
+              }
+            } catch { /* inspection still works from memory if storage is unreadable */ }
+          }
+          return mockSyncQueue
+            .slice()
+            .sort((a, b) => Number(b?.createdAt ?? 0) - Number(a?.createdAt ?? 0))
+            .slice(0, cap)
+            .map((row) => {
+              const orderId = phpSyncOrderIdentity(row);
+              const index = mockSyncQueue.indexOf(row);
+              const prior = orderId ? mockSyncQueue.slice(0, index).filter((candidate) => phpSyncOrderIdentity(candidate) === orderId) : [];
+              const dependency = prior[prior.length - 1];
+              const blocker = prior.find((candidate) => candidate.status === 'FAILED');
+              const error = String(row?.error ?? '');
+              const errorCode = !error ? null :
+                error.startsWith('QUARANTINED_TOTAL_MISMATCH') ? 'QUARANTINED_TOTAL_MISMATCH' :
+                error.startsWith('Blocked by failed') ? 'BLOCKED_BY_FAILED_COMMAND' :
+                (error.includes('price/tax/discount total differs') || error.includes('authoritative server total')) ? 'SERVER_TOTAL_MISMATCH' :
+                'SYNC_FAILED_DETAILS_REDACTED';
+              // Never return the raw command payload or backend error text:
+              // either may contain customer details or credential material.
+              return {
+                opId: String(row?.op_id ?? row?.opId ?? ''),
+                status: String(row?.status ?? ''),
+                persistedStatus: persistedStatusByOpId.get(String(row?.op_id ?? row?.opId ?? '')) ?? null,
+                entityType: String(row?.entity_type ?? row?.entityType ?? ''),
+                operation: String(row?.operation ?? ''),
+                entityId: String(row?.entity_id ?? row?.entityId ?? ''),
+                orderId,
+                dependencyOpId: dependency ? String(dependency.op_id ?? dependency.opId ?? '') : null,
+                blockedByFailedOpId: blocker ? String(blocker.op_id ?? blocker.opId ?? '') : null,
+                attemptCount: Number.isFinite(Number(row?.attemptCount ?? row?.attempts)) ? Number(row.attemptCount ?? row.attempts) : null,
+                createdAt: typeof row?.createdAt === 'number' ? row.createdAt : null,
+                nextRetryAt: typeof row?.nextRetryAt === 'number' ? row.nextRetryAt : null,
+                ackedAt: typeof row?.ackedAt === 'number' ? row.ackedAt : null,
+                errorCode,
+              };
+            });
+        },
+        claimBatch: async (batchSize?: number) => {
+          await delay(8);
+          const cap = typeof batchSize === 'number' && isFinite(batchSize) ? Math.max(1, Math.floor(batchSize)) : 25;
+          const claimed: any[] = [];
+          for (const row of mockSyncQueue) {
+            if (claimed.length >= cap) break;
+            if (row.status !== 'PENDING') continue;
+            if (row.nextRetryAt && row.nextRetryAt > Date.now()) continue;
+            row.status = 'PROCESSING';
+            claimed.push({ ...row });
+          }
+          try { persistPhpSyncQueue(); } catch { /* ignore */ }
+          return claimed;
+        },
+        markDone: async (opId: string) => {
+          await delay(6);
+          const key = String(opId || '');
+          const row = mockSyncQueue.find((q) => String(q?.op_id ?? q?.opId ?? '') === key);
+          if (!row) return false;
+          row.status = 'DONE';
+          row.ackedAt = Date.now();
+          delete row.error;
+          delete row.nextRetryAt;
+          try { persistPhpSyncQueue(); } catch { /* ignore */ }
+          return true;
+        },
+        markFailed: async (opId: string, error: string) => {
+          await delay(6);
+          const key = String(opId || '');
+          const row = mockSyncQueue.find((q) => String(q?.op_id ?? q?.opId ?? '') === key);
+          if (!row) return false;
+          row.status = 'FAILED';
+          row.error = String(error || 'FAILED');
+          delete row.nextRetryAt;
+          try { persistPhpSyncQueue(); } catch { /* ignore */ }
+          return true;
+        },
+        resetByOpId: async (opId: string) => {
+          await delay(6);
+          const key = String(opId || '');
+          const row = mockSyncQueue.find((q) => String(q?.op_id ?? q?.opId ?? '') === key);
+          if (!row) return false;
+          row.status = 'PENDING';
+          delete row.error;
+          row.nextRetryAt = 0;
+          try { persistPhpSyncQueue(); } catch { /* ignore */ }
+          return true;
+        },
+        resetFailed: async () => {
+          await delay(6);
+          let resetCount = 0;
+          for (const row of mockSyncQueue) {
+            if (row.status !== 'FAILED') continue;
+            row.status = 'PENDING';
+            delete row.error;
+            row.nextRetryAt = 0;
+            resetCount += 1;
+          }
+          try { persistPhpSyncQueue(); } catch { /* ignore */ }
+          return { reset: resetCount };
+        },
         push: async (item: any) => {
+          if (isWebPhpMode()) {
+            const kind = String(item?.entity_type ?? item?.entityType ?? '');
+            const operation = String(item?.operation ?? '').toUpperCase();
+            if (!['ORDER', 'PAYMENT'].includes(kind) || !['CREATE', 'UPDATE'].includes(operation)) {
+              throw new Error(`PHP browser sync does not support ${kind}/${operation}; operation was not queued.`);
+            }
+            let payload: any;
+            try { payload = typeof item.payload === 'string' ? JSON.parse(item.payload) : item.payload; }
+            catch { throw new Error('POS sync payload is not valid JSON.'); }
+            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('POS sync payload must be an object.');
+            if (kind === 'ORDER' && operation === 'UPDATE') {
+              if (!payload.status && payload.paymentStatus) return true; // payment CREATE reconciles this authoritatively
+              if (payload.status === 'DELIVERED') {
+                const orderId = String(item.entity_id || '');
+                for (const [status, version] of [['READY', 2], ['COMPLETED', 3]] as const) {
+                  const derived = { ...item, op_id: `order_${status.toLowerCase()}_${orderId}`, payload: JSON.stringify({ status }), idempotency_key: `order-${status.toLowerCase()}-${orderId}`, local_entity_version: version };
+                  await api.db.syncQueue.push(derived);
+                }
+                return true;
+              }
+              if (!['READY', 'COMPLETED'].includes(String(payload.status))) throw new Error(`PHP does not support order transition ${String(payload.status)}.`);
+            }
+            if (kind === 'PAYMENT' && operation === 'CREATE') {
+              const method = String(payload.method || '');
+              if (payload.provider && payload.provider !== 'LOCAL_POS') throw new Error('Provider-backed payment cannot use PHP offline sync.');
+              payload.method = method === 'PHYSICAL_POS' || method === 'CARD_POS' || method === 'POS_CARD' ? 'CARD' : method === 'TRANSFER' ? 'BANK_TRANSFER' : method;
+              if (!['CASH', 'CARD', 'BANK_TRANSFER', 'OTHER'].includes(payload.method)) throw new Error('Unsupported PHP local payment method.');
+              delete payload.provider;
+              delete payload.status;
+              delete payload.verificationSource;
+              delete payload.providerResponse;
+              item = { ...item, payload: JSON.stringify(payload) };
+            }
+          }
           const opId =
             typeof item?.op_id === 'string' && item.op_id
               ? String(item.op_id)
@@ -3186,7 +3642,10 @@ export function installMockElectronAPI() {
             });
             if (idx >= 0) return true;
           }
-          mockSyncQueue.push({ ...item, status: 'PENDING', createdAt: Date.now() });
+          const row = { ...item, status: 'PENDING', createdAt: Date.now() };
+          mockSyncQueue.push(row);
+          try { persistPhpSyncQueue(); }
+          catch (error) { mockSyncQueue.pop(); throw error; }
           return true;
         },
       },
@@ -4180,7 +4639,12 @@ export function installMockElectronAPI() {
             console.warn(`[mock print] receipt skipped: order ${orderId} not found in mock DB`);
             return true;
           }
-          const items = mockOrderItems.filter((i) => i.order_id === orderId || i.orderId === orderId);
+          const cachedItems = mockOrderItems.filter((i) => i.order_id === orderId || i.orderId === orderId);
+          // PHP-hydrated history survives a reload, but the old browser-only
+          // order-item cache does not. Reprint from the server's item snapshot.
+          const items = isWebPhpMode() && Array.isArray(order.items) && order.items.length > 0
+            ? order.items
+            : cachedItems;
           const mods = mockOrderItemModifiers.filter((m) => m.order_id === orderId || m.orderId === orderId);
           const payments = mockPayments.filter((p) => p.order_id === orderId || p.orderId === orderId);
           const printedAt = Date.now();
@@ -4302,7 +4766,8 @@ export function installMockElectronAPI() {
     })(),
   };
 
-  window.electronAPI = api;
+  if (window.electronAPI) Object.assign(window.electronAPI as any, api);
+  else window.electronAPI = api;
   console.log('[POS] mock ElectronAPI installed — seeded cashiers PIN: 1234 or supervisor 0000 or manager 9999');
 
   // -------------------------------------------------------------------------
@@ -4398,21 +4863,30 @@ export function installMockElectronAPI() {
 
       const upsertBackendExternalOrders = async () => {
         try {
-          const url = `${API_BASE}/public/recent-orders?branchId=${encodeURIComponent(BRANCH_ID)}&sinceHours=24`;
-          const resp = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' }, credentials: 'omit' });
-          if (!resp.ok) {
-            if (resp.status !== 404) {
-              console.debug(`[mock sync] pull skipped (HTTP ${resp.status})`);
+          let orders: any[] = [];
+          if (isWebPhpMode()) {
+            // PHP has no Socket.IO gateway. This authenticated, branch-scoped
+            // 30-second pull is an explicit temporary bridge for new/updated
+            // external orders; the cashier's existing 8-second local tick then
+            // hydrates the rail/history from these rows.
+            const result = await webPhpRequest<{ data: any[] }>('/orders?limit=200');
+            orders = Array.isArray(result?.data) ? result.data.filter((order: any) =>
+              String(order?.source ?? order?.sourceChannel ?? '').toUpperCase() !== 'POS') : [];
+          } else {
+            const url = `${API_BASE}/public/recent-orders?branchId=${encodeURIComponent(BRANCH_ID)}&sinceHours=24`;
+            const resp = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' }, credentials: 'omit' });
+            if (!resp.ok) {
+              if (resp.status !== 404) console.debug(`[mock sync] pull skipped (HTTP ${resp.status})`);
+              return;
             }
-            return;
+            const payload: any = await resp.json().catch(() => ({}));
+            orders = Array.isArray(payload?.orders) ? payload.orders : Array.isArray(payload?.data?.orders) ? payload.data.orders : [];
           }
-          const payload: any = await resp.json().catch(() => ({}));
-          const orders = Array.isArray(payload?.orders) ? payload.orders : Array.isArray(payload?.data?.orders) ? payload.data.orders : [];
           if (!orders.length) return;
           let upserted = 0;
           for (const remote of orders) {
-            if (!remote?.id) continue;
-            const id = String(remote.id);
+            if (!remote?.id && !remote?._id) continue;
+            const id = String(remote.id ?? remote._id);
             // Currency normalization.
             // The public endpoint can return ALREADY cents integers (short Mongo
             // names: subtotalCents, discountCents, ... ending in "Cents") OR
@@ -4501,8 +4975,8 @@ export function installMockElectronAPI() {
               tax: taxAmount,
               tip: tipAmount,
               notes: remote.notes ?? remote.note ?? null,
-              createdAt: typeof remote.createdAt === 'number' ? remote.createdAt : remote.createdAt instanceof Date ? remote.createdAt.getTime() : Date.now() - 60_000,
-              updatedAt: typeof remote.updatedAt === 'number' ? remote.updatedAt : remote.updatedAt instanceof Date ? remote.updatedAt.getTime() : Date.now(),
+              createdAt: typeof remote.createdAt === 'number' ? remote.createdAt : typeof remote.createdAt === 'string' ? Date.parse(remote.createdAt) || Date.now() - 60_000 : Date.now() - 60_000,
+              updatedAt: typeof remote.updatedAt === 'number' ? remote.updatedAt : typeof remote.updatedAt === 'string' ? Date.parse(remote.updatedAt) || Date.now() : Date.now(),
               items: Array.isArray(remote.items) ? remote.items : [],
             };
             if (idx >= 0) {
@@ -4590,7 +5064,7 @@ export function installMockElectronAPI() {
             }
           }
           if (upserted) {
-            console.log(`[mock sync] pulled ${upserted} backend website/QR order(s) into POS mock stores`);
+            console.log(`[mock sync] pulled ${upserted} external order(s) into POS browser stores`);
           }
         } catch (e: any) {
           if (e?.name !== 'AbortError') {
@@ -4628,15 +5102,27 @@ export function installMockElectronAPI() {
 
         const processSyncPushBatch = async () => {
           if (claimCursor !== 0) return; // skip if prior cycle is still running
-          const pending = mockSyncQueue.filter((q) => q.status === 'PENDING').slice(0, 25);
+          const phpMode = isWebPhpMode();
+          // A failed command blocks its own order chain, not every later,
+          // unrelated sale on the terminal. Preserve FIFO within each order.
+          const firstUnacked = phpMode ? mockSyncQueue.find((q, index) => {
+            if (q.status !== 'PENDING') return false;
+            const orderId = phpSyncOrderIdentity(q);
+            return !mockSyncQueue.slice(0, index).some((prior) =>
+              orderId && phpSyncOrderIdentity(prior) === orderId && prior.status !== 'DONE');
+          }) : null;
+          const pending = phpMode
+            ? (firstUnacked?.status === 'PENDING' && (!firstUnacked.nextRetryAt || firstUnacked.nextRetryAt <= Date.now()) ? [firstUnacked] : [])
+            : mockSyncQueue.filter((q) => q.status === 'PENDING').slice(0, 25);
           if (pending.length === 0) return;
           claimCursor = pending.length;
 
           try {
             // Mark claimed (PREPARING) so next tick doesn't pick them up
             pending.forEach((q) => { q.status = 'PROCESSING'; });
+            persistPhpSyncQueue();
 
-            const deviceId =
+            const deviceId = phpMode ? webPhpDeviceId() :
               (env.VITE_DEVICE_ID as string) ||
               (env.NEXT_PUBLIC_DEVICE_ID as string) ||
               `browser-${Date.now()}`;
@@ -4660,20 +5146,67 @@ export function installMockElectronAPI() {
             // use the dedicated /public/pos-sync-batch unauthenticated endpoint
             // which mirrors /sync/batch but accepts POS-origin ORDER UPDATE +
             // PAYMENT CREATE commands without JWT.
-            const url = `${API_BASE}/public/pos-sync-batch`;
-            const resp = await fetch(url, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-              credentials: 'omit',
-              body: JSON.stringify({ deviceId, commands }),
-            }).catch((e) => ({ ok: false, status: 0, statusText: String(e?.message ?? e) } as any));
+            let token: string | undefined;
+            if (phpMode) {
+              const { useAuthStore } = await import('./auth-store');
+              token = await useAuthStore.getState().actions.refreshAccessToken({ deviceId });
+              if (!token) throw new Error('An authenticated POS session is required for sync.');
+            }
+            const url = `${API_BASE}${phpMode ? '/sync/batch' : '/public/pos-sync-batch'}`;
+            const body = JSON.stringify({ deviceId, commands });
+            const doPost = async (overrideToken?: string) =>
+              fetch(url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Accept: 'application/json',
+                  'X-Device-Id': deviceId,
+                  ...(overrideToken ? { Authorization: `Bearer ${overrideToken}` } : {}),
+                },
+                credentials: 'omit',
+                body,
+              }).catch((e) => ({ ok: false, status: 0, statusText: String(e?.message ?? e) } as any));
+
+            let resp = await doPost(token);
+            if (!resp.ok && phpMode && (resp as any).status === 403) {
+              const { useAuthStore } = await import('./auth-store');
+              const forced = await useAuthStore.getState().actions.refreshAccessToken({ deviceId, force: true });
+              resp = await doPost(forced);
+            }
 
             if (!resp.ok) {
+              let errorCode = '';
+              let errorMessage = '';
+              if (typeof (resp as any)?.json === 'function' && typeof (resp as any)?.clone === 'function') {
+                try {
+                  const parsed = await (resp as any).clone().json();
+                  const err = parsed?.error ?? parsed?.data?.error ?? null;
+                  if (err) {
+                    errorCode = typeof err.code === 'string' ? err.code : '';
+                    errorMessage = typeof err.message === 'string' ? err.message : '';
+                  }
+                } catch {
+                  /* noop */
+                }
+              }
+              if (!errorMessage && typeof (resp as any)?.text === 'function') {
+                try { errorMessage = String(await (resp as any).text()).slice(0, 1200); } catch { /* noop */ }
+              }
+              (window as any).__prolificWebPhpLastSyncBatchError = {
+                status: Number((resp as any).status || 0) || 0,
+                code: errorCode || undefined,
+                message: errorMessage || String((resp as any).statusText || ''),
+                at: Date.now(),
+                url,
+              };
               // Backend down, offline, or 401/403 — rollback to PENDING so
               // next cycle retries. Offline POS cashiers keep working locally
               // forever; sync resumes once backend reachable.
               pending.forEach((q) => { q.status = 'PENDING'; });
-              console.debug(`[mock sync] push skipped (HTTP ${(resp as any).status || 'net-err'}) — ${pending.length} command(s) stay pending`);
+              persistPhpSyncQueue();
+              const status = (resp as any).status || 'net-err';
+              const tail = (errorCode || errorMessage) ? ` — ${[errorCode, errorMessage].filter(Boolean).join(': ')}` : '';
+              console.debug(`[mock sync] push skipped (HTTP ${status}) — ${pending.length} command(s) stay pending${tail}`);
               return;
             }
 
@@ -4682,7 +5215,8 @@ export function installMockElectronAPI() {
             const results: any[] =
               Array.isArray(envelope?.results) ? envelope.results :
               Array.isArray(envelope?.data?.results) ? envelope.data.results :
-              commands.map((c, i) => ({ idempotencyKey: c.idempotencyKey, success: true, index: i }));
+              Array.isArray(envelope?.data) ? envelope.data :
+              phpMode ? [] : commands.map((c, i) => ({ idempotencyKey: c.idempotencyKey, success: true, index: i }));
 
             // Correlate results via idempotencyKey → mark row DONE or FAILED
             const resByKey = new Map<string, any>();
@@ -4690,9 +5224,33 @@ export function installMockElectronAPI() {
             pending.forEach((q) => {
               const key = String(q.idempotency_key ?? q.op_id ?? '');
               const r = resByKey.get(key);
-              if (r && r.success === false) { q.status = 'FAILED'; q.error = String(r.error || r.message || 'server rejected'); }
+              if (phpMode) {
+                if (r?.status === 'SUCCESS' && r?.clientAction === 'MARK_COMPLETE') {
+                  let expectedTotal: number | null = null;
+                  try { expectedTotal = JSON.parse(String(q.payload))?.totalCents ?? null; } catch { /* no client total */ }
+                  if (q.entity_type === 'ORDER' && q.operation === 'CREATE' && expectedTotal !== null && r.serverSnapshot?.totalCents !== expectedTotal) {
+                    q.status = 'FAILED'; q.error = 'Server price/tax/discount total differs from the local checkout. Payment sync stopped for manual resolution.';
+                  } else { q.status = 'DONE'; q.ackedAt = Date.now(); q.serverEntityId = r.entityId; }
+                }
+                else if (r?.status === 'RETRYING' || r?.clientAction === 'RETRY_LATER' || !r) { q.status = 'PENDING'; q.nextRetryAt = Date.now() + Math.max(1000, Number(r?.retryAfterMs) || 3000); }
+                else { q.status = 'FAILED'; q.error = String(r?.errorMessage || r?.resultCode || 'PHP sync rejected command'); }
+                if (q.status === 'FAILED') {
+                  const orderId = phpSyncOrderIdentity(q);
+                  if (orderId) {
+                    for (const other of mockSyncQueue) {
+                      if (other === q) continue;
+                      if (phpSyncOrderIdentity(other) !== orderId) continue;
+                      if (other.status === 'DONE' || other.status === 'FAILED') continue;
+                      other.status = 'FAILED';
+                      other.error = `Blocked by failed ${String(q.entity_type || '').toUpperCase()} ${String(q.operation || '').toUpperCase()}: ${String(q.error || 'FAILED')}`;
+                      delete other.nextRetryAt;
+                    }
+                  }
+                }
+              } else if (r && r.success === false) { q.status = 'FAILED'; q.error = String(r.error || r.message || 'server rejected'); }
               else { q.status = 'DONE'; q.ackedAt = Date.now(); }
             });
+            persistPhpSyncQueue();
             const done = pending.filter((q) => q.status === 'DONE').length;
             const fail = pending.filter((q) => q.status === 'FAILED').length;
             if (done || fail) {
@@ -4701,6 +5259,7 @@ export function installMockElectronAPI() {
           } catch (e: any) {
             // Any transport error: rollback to PENDING for retry
             pending.forEach((q) => { if (q.status === 'PROCESSING') q.status = 'PENDING'; });
+            try { persistPhpSyncQueue(); } catch { /* next page load recovers PROCESSING rows */ }
             console.debug('[mock sync] push error (will retry):', e?.message ?? e);
           } finally {
             claimCursor = 0;
@@ -4745,4 +5304,25 @@ export function installMockElectronAPI() {
   } catch (_) {
     /* startup race / non-browser context */
   }
+}
+
+// The browser shim is installed once on window. A Vite hot update otherwise
+// leaves that old object in place because installMockElectronAPI() returns
+// early when electronAPI already exists. Reload only when no unresolved
+// outbox command exists; never trigger a replay just to expose new methods.
+if (import.meta.hot) {
+  import.meta.hot.accept(() => {
+    if (typeof window === 'undefined' || !isWebPhpMode()) return;
+    try {
+      const stored = JSON.parse(localStorage.getItem(PHP_SYNC_QUEUE_KEY) || '[]');
+      if (Array.isArray(stored) && stored.some((row: any) => row?.status !== 'DONE')) {
+        console.warn('[POS] Browser shim update deferred: outbox has unresolved commands. Reload only after safe inspection.');
+        return;
+      }
+    } catch {
+      console.warn('[POS] Browser shim update deferred: outbox could not be inspected safely.');
+      return;
+    }
+    window.location.reload();
+  });
 }

@@ -14,6 +14,7 @@ import {
 import { fetchPosBootstrap } from '../../lib/remote-pos';
 import { ApiWakeState, subscribeApiWake } from '../../lib/api-wake';
 import { applyRemoteMenuSnapshot } from '../../lib/mock-electron-shim';
+import { isWebPhpMode } from '../../lib/web-php-config';
 
 const PIN_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', '⌫'];
 
@@ -328,7 +329,7 @@ export default function LoginScreen() {
         // employee on this terminal regardless of which branch they belong
         // to (many single-branch installations anyway, Admin UI has 1 default
         // branch for all staff today).
-        foundFastPath = await window.electronAPI?.db?.employees?.findByPin?.(pin);
+        if (!isWebPhpMode()) foundFastPath = await window.electronAPI?.db?.employees?.findByPin?.(pin);
       } catch {
         foundFastPath = null;
       }
@@ -462,7 +463,7 @@ export default function LoginScreen() {
           restaurantId: employee.restaurantId,
         };
 
-        await window.electronAPI?.db?.employees?.upsertWithPin?.(employeeRecord, pin);
+        if (!isWebPhpMode()) await window.electronAPI?.db?.employees?.upsertWithPin?.(employeeRecord, pin);
 
         authActions.setOnlineLogin({
           employee: employeeRecord,
@@ -500,6 +501,7 @@ export default function LoginScreen() {
         navigate('/pos', { replace: true });
         return;
       } catch (err: any) {
+        if (isWebPhpMode()) throw err;
         const msg = String(err?.message || String(err));
         if (hasUnreachableMarker(msg)) {
           throw err;

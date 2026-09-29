@@ -16,6 +16,7 @@ async function invokeDb(channel: string, ...args: unknown[]): Promise<unknown> {
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  isNativeDesktop: true,
   getVersions: () => ipcRenderer.invoke('app:get-versions'),
 
   getDeviceId: () => ipcRenderer.invoke('device:get-device-id'),
@@ -42,6 +43,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // classified it as SERVER_UNREACHABLE. This IPC sends the POST through
   // Node's native http stack (no CORS, no preflight) as an automatic
   // belt-and-suspenders fallback.
+  authRefresh: () => ipcRenderer.invoke('auth:refresh'),
   authPinLogin: (payload: {
     pin: string;
     branchId?: string;
@@ -128,6 +130,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
 
     orders: {
+      saveSale: (input: unknown) => invokeDb('db:orders:saveSale', input),
       create: (draft: unknown) => invokeDb('db:orders:create', draft),
       updateStatus: (id: string, status: unknown) =>
         invokeDb('db:orders:updateStatus', { id, status }),

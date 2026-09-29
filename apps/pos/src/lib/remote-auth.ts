@@ -1,5 +1,6 @@
 import { isApiWakingResponse, waitForApiWake } from '@prolific/utils';
 import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
+import { isNativeDesktop, isWebPhpMode, webPhpApiBase, webPhpPinLoginPayload } from './web-php-config';
 
 /**
  * resolveApiBase — professional grade fallback chain for API host.
@@ -20,6 +21,21 @@ import { beginWake, endWake, publishApiWake, WakeSource } from './api-wake';
  *      localhost / 127.0.0.1 / 0.0.0.0, i.e. `npm run dev` mode).
  */
 export function resolveApiBase(): string {
+  if (isNativeDesktop()) {
+    const base = (window.electronAPI as any)?.getApiBaseUrlSync?.();
+    if (!base) throw new Error('Desktop PHP API configuration is unavailable.');
+    return String(base).replace(/\/+$/, '');
+  }
+  if (isWebPhpMode()) return webPhpApiBase();
+  // The opt-in local trial must fail closed if the Electron preload is absent.
+  // A renderer started for PHP staging must never fall through to Node/Render.
+  if ((import.meta as any).env?.VITE_PHP_STAGING_TEST === '1') {
+    const base = (window as any)?.electronAPI?.getApiBaseUrlSync?.();
+    if (typeof base !== 'string' || !/^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1\/?$/.test(base)) {
+      throw new Error('PHP staging mode requires the isolated Electron loopback API');
+    }
+    return base.replace(/\/+$/, '');
+  }
   const REAL_PRODUCTION_API_BASE = 'https://prolific-api.onrender.com/api/v1';
 
   // Helper: appends /api/v1 to a raw base URL if the user forgot it
@@ -190,8 +206,9 @@ if (typeof window !== 'undefined') {
     },
     loginDryRun: async (pin, deviceId) => {
       const url = `${debug.resolvedApiBase}/auth/pin/login`;
-      const payload: Record<string, unknown> = { pin };
-      if (deviceId) payload.deviceId = deviceId;
+      const payload: Record<string, unknown> = isWebPhpMode()
+        ? webPhpPinLoginPayload(pin)
+        : { pin, ...(deviceId ? { deviceId } : {}) };
       try {
         const r = await fetch(url, {
           method: 'POST',
@@ -243,8 +260,11 @@ declare global {
 //     (only wake-retries had one), so Render cold-start latency >15s OS-timeout
 //     on Windows TCP SYN retries threw unreachableErr even when the API was
 //     waking. 8s single-attempt cap = 5 wake retries possible in 45s.
-const PIN_FLOW_SHORT_WAKE_MS = 45_000;
-const PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS = 8_000;
+const phpStagingPinTest = (import.meta as any).env?.VITE_PHP_STAGING_TEST === '1';
+// Cold staging Mongo connections can exceed the production PIN budget. Keep
+// the longer allowance strictly within the opt-in local PHP trial.
+const PIN_FLOW_SHORT_WAKE_MS = phpStagingPinTest ? 120_000 : 45_000;
+const PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS = phpStagingPinTest ? 120_000 : 8_000;
 
 /**
  * Error message marker string. Prefix thrown errors with this token when the
@@ -386,9 +406,10 @@ export async function pinLogin(opts: {
   deviceId?: string;
   signal?: AbortSignal;
 }): Promise<any> {
-  const payload: Record<string, unknown> = { pin: opts.pin };
-  if (opts.branchId) payload.branchId = opts.branchId;
-  if (opts.deviceId !== undefined) payload.deviceId = opts.deviceId;
+  const payload: Record<string, unknown> = isWebPhpMode()
+    ? webPhpPinLoginPayload(opts.pin)
+    : { pin: opts.pin, ...(opts.branchId ? { branchId: opts.branchId } : {}),
+        ...(opts.deviceId !== undefined ? { deviceId: opts.deviceId } : {}) };
 
   // Belt-and-suspenders fallback for Electron packaged renderers.
   // Chromium's fetch() from file:/// (packaged Electron POS) sends an
@@ -412,6 +433,11 @@ export async function pinLogin(opts: {
   //       stack (no CORS, no preflight, never fails on Origin check).
   let res: Response;
   try {
+    if (isNativeDesktop()) {
+      const result = await (window.electronAPI as any).authPinLogin(payload);
+      if (!Number.isInteger(result?.status) || result.status < 200 || result.status > 599) throw unreachableErr('Desktop API request failed');
+      res = new Response(JSON.stringify(result.body), { status: result.status, headers: { 'Content-Type': 'application/json' } });
+    } else {
     res = await guardedFetch(
       () =>
         fetch(`${API_BASE}/auth/pin/login`, {
@@ -423,10 +449,12 @@ export async function pinLogin(opts: {
       'reactive',
       { timeoutMs: PIN_FLOW_SHORT_WAKE_MS, perAttemptMs: PIN_FLOW_PER_ATTEMPT_TIMEOUT_MS }
     );
+    }
   } catch (fetchErr) {
     const marked = String((fetchErr as any)?.message || '').includes(SERVER_UNREACHABLE_MARKER) ||
       String((fetchErr as any)?.name || '') === 'TypeError';
     const canUseIpc: boolean =
+      !isWebPhpMode() && !isNativeDesktop() && typeof window !== 'undefined' &&
       typeof (window as any).electronAPI?.authPinLogin === 'function';
     if (!marked || !canUseIpc) {
       throw fetchErr;
@@ -437,7 +465,12 @@ export async function pinLogin(opts: {
       deviceId: opts.deviceId,
     });
     if (!result || typeof result !== 'object' || !('status' in result)) {
-      throw new Error(`auth:pin-login IPC malformed response: ${String(result)}`);
+      throw fetchErr;
+    }
+    // IPC transport failures have no HTTP status (-1/0). Response only accepts
+    // 200–599; preserve the network error instead of masking it with RangeError.
+    if (!Number.isInteger(result.status) || result.status < 200 || result.status > 599) {
+      throw fetchErr;
     }
     // Fabricate a Response-shaped object so the downstream logic below can
     // be shared between the fetch and IPC paths.
@@ -448,7 +481,7 @@ export async function pinLogin(opts: {
           ? result.body
           : '',
       {
-        status: typeof result.status === 'number' && result.status > 0 ? result.status : 0,
+        status: result.status,
         statusText: String(result.statusText ?? ''),
         headers: { 'Content-Type': 'application/json' },
       }

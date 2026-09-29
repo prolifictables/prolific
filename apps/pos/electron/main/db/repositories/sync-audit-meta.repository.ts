@@ -81,11 +81,20 @@ export class SyncQueueRepository {
     );
   }
 
-  claimBatch(batchSize: number, deviceId: string): SyncQueueRow[] {
+  claimBatch(batchSize: number, deviceId: string, phpStagingSync = false): SyncQueueRow[] {
     const now = Date.now();
+    const stagingFilter = phpStagingSync
+      ? `AND json_valid(payload) AND (
+          (entity_type = 'ORDER' AND operation = 'CREATE' AND (json_extract(payload, '$.source') = 'POS' OR json_extract(payload, '$.status') = 'COMPLETED'))
+          OR (entity_type = 'PAYMENT' AND operation = 'CREATE' AND json_extract(payload, '$.provider') IS NULL)
+          OR (entity_type = 'ORDER' AND operation = 'UPDATE' AND op_id LIKE 'phpstg_%')
+          OR (entity_type = 'SHIFT' AND operation IN ('CREATE', 'UPDATE')))`
+      : '';
+    const dueStatus = phpStagingSync ? "status IN ('QUEUED', 'RETRYING')" : "status = 'QUEUED'";
     const rows = this.db.all<{ id: number }>(
       `SELECT id FROM sync_queue
-       WHERE status = 'QUEUED' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       WHERE ${dueStatus} AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       ${stagingFilter}
        ORDER BY COALESCE(next_attempt_at, created_at) ASC
        LIMIT ?`,
       now,

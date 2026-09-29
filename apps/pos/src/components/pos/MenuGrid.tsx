@@ -10,6 +10,7 @@ import {
   listPublicBranches,
 } from '@/lib/remote-menu';
 import { applyRemoteMenuSnapshot, readOfflineMenuSnapshotMirror } from '@/lib/mock-electron-shim';
+import { isWebPhpMode } from '@/lib/web-php-config';
 
 interface MenuGridProps {
   /**
@@ -304,9 +305,9 @@ export default function MenuGrid({ branchId, onItemAdded }: MenuGridProps) {
               }
               title={
                 sourceLabel.startsWith('📡')
-                  ? 'Menu source: Admin-controlled Nest server (live)'
+                  ? (isWebPhpMode() ? 'Menu source: PHP API (live)' : 'Menu source: Admin-controlled Nest server (live)')
                   : sourceLabel.startsWith('💾')
-                    ? 'Menu source: Local demo seed (server not reachable)'
+                    ? (isWebPhpMode() ? 'Menu source: cached PHP staging menu' : 'Menu source: Local demo seed (server not reachable)')
                     : 'Menu source: unknown'
               }
             >

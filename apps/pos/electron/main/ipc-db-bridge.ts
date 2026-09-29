@@ -1,6 +1,7 @@
 import type { IpcMain } from 'electron';
 import type { ReposBundle } from './db';
 import bcrypt from 'bcryptjs';
+import { savePosSale } from './db/save-pos-sale';
 
 type HandlerFn = (...args: unknown[]) => unknown;
 
@@ -80,6 +81,7 @@ function wrap(channel: string, fn: HandlerFn) {
 }
 
 export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
+  ipcMain.handle('db:orders:saveSale', wrap('db:orders:saveSale', input => savePosSale(repos, input as Parameters<typeof savePosSale>[1])));
   ipcMain.handle(
     'db:employees:findAll',
     wrap('db:employees:findAll', (branchId: unknown) => {
@@ -1089,7 +1091,23 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
   ipcMain.handle(
     'db:shifts:open',
     wrap('db:shifts:open', (data: unknown) => {
-      return repos.shifts.open(data as { id: string } & Record<string, unknown>);
+      return repos.db.transaction(() => {
+        const draft = data as any;
+        const auth = repos.meta.getLastAuth();
+        if (!draft.device_id || draft.branch_id !== auth?.branchId || draft.restaurant_id !== auth?.restaurantId || draft.employee_id !== auth?.employeeId) throw new Error('Shift must match the current employee, branch and device.');
+        const prior = repos.shifts.getOpen(String(draft.device_id));
+        if (prior && (prior.branch_id !== auth?.branchId || prior.restaurant_id !== auth?.restaurantId || prior.employee_id !== auth?.employeeId)) throw new Error('Another employee or branch already has this terminal shift open.');
+        const id = repos.shifts.open({ status: 'OPEN', expected_cash_cents: 0, closing_cash_cents: 0, variance_cents: 0,
+          cash_sales_cents: 0, card_sales_cents: 0, other_sales_cents: 0, refunds_cents: 0, payout_cents: 0,
+          note: null, opened_at: Date.now(), server_version: 0, local_version: 1, synced: 0,
+          created_at: Date.now(), updated_at: Date.now(), ...(prior || draft) });
+        const row = repos.db.get<any>('SELECT * FROM shifts WHERE id = ?', id);
+        const key = `shift_create_${id}_${row.idempotency_key}`;
+        if (!repos.syncQueue.push({ op_id: `shift_open_${id}`, entity_type: 'SHIFT', operation: 'CREATE', entity_id: id,
+          idempotency_key: key, payload: JSON.stringify({ deviceId: row.device_id, branchId: row.branch_id, restaurantId: row.restaurant_id,
+            employeeId: row.employee_id, openingCash: row.opening_cash_cents }), local_entity_version: 1 })) throw new Error('Could not save shift outbox.');
+        return id;
+      })();
     })
   );
 
@@ -1103,13 +1121,25 @@ export function registerAllDbIpc(ipcMain: IpcMain, repos: ReposBundle): void {
         note?: unknown;
         closed_at?: unknown;
       };
+      return repos.db.transaction(() => {
+        const shift = repos.db.get<any>('SELECT * FROM shifts WHERE id = ?', String(p.id ?? ''));
+        const auth = repos.meta.getLastAuth();
+        if (!shift || shift.branch_id !== auth?.branchId || shift.restaurant_id !== auth?.restaurantId || shift.employee_id !== auth?.employeeId) throw new Error('Shift must match the current employee and branch.');
+        const key = `shift_update_${shift.id}_closed`;
+        const command = { deviceId: shift.device_id, branchId: shift.branch_id, restaurantId: shift.restaurant_id,
+          employeeId: shift.employee_id, closingCash: Number(p.closing_cash_cents ?? 0) };
+        const prior = repos.db.get<any>('SELECT payload FROM sync_queue WHERE op_id = ?', `shift_close_${shift.id}`);
+        if (prior && prior.payload !== JSON.stringify(command)) throw new Error('Shift close is already queued with another amount.');
       repos.shifts.close(String(p.id ?? ''), {
         closing_cash_cents: Number(p.closing_cash_cents ?? 0),
         variance_cents: Number(p.variance_cents ?? 0),
         note: p.note ? String(p.note) : null,
         closed_at: p.closed_at ? Number(p.closed_at) : null,
       });
-      return true;
+        if (!repos.syncQueue.push({ op_id: `shift_close_${shift.id}`, entity_type: 'SHIFT', operation: 'UPDATE', entity_id: shift.id,
+          idempotency_key: key, payload: JSON.stringify(command), local_entity_version: 2 })) throw new Error('Could not save shift outbox.');
+        return true;
+      })();
     })
   );
 

@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { LoginMode } from './types';
 import { pinLogin } from './remote-auth';
+import { resolveApiBase } from './remote-auth';
+import { isWebPhpMode, isPhpPosMode, isNativeDesktop } from './web-php-config';
 
 interface AuthState {
   employee: any | null;
@@ -43,6 +45,10 @@ interface AuthState {
     clear: () => void;
   };
 }
+
+// PHP rotates refresh tokens on use. Concurrent bootstrap/menu/shift requests
+// must share one rotation or later requests will replay a revoked token.
+let phpRefreshInFlight: Promise<string> | null = null;
 
 export const useAuthStore = create<AuthState>()(
   persist(
@@ -170,9 +176,9 @@ export const useAuthStore = create<AuthState>()(
             window.electronAPI.db.meta
               .setLastAuth({
                 mode: 'ONLINE',
-                employeeId: (onlineEmployee || {}).id,
-                branchId: (onlineBranch || {}).id,
-                restaurantId: (onlineRestaurant || {}).id,
+                employeeId: useAuthStore.getState().employee?.id,
+                branchId: useAuthStore.getState().branch?.id,
+                restaurantId: useAuthStore.getState().restaurant?.id,
                 accessToken: accessToken || undefined,
                 refreshToken: refreshToken || undefined,
                 expiresAt: typeof expiresAt === 'number' ? expiresAt : undefined,
@@ -204,7 +210,14 @@ export const useAuthStore = create<AuthState>()(
             return cur.accessToken;
           }
 
-          const deviceId = opts?.deviceId;
+          if (isPhpPosMode() && phpRefreshInFlight) return phpRefreshInFlight;
+          const refresh = async (): Promise<string> => {
+          const deviceId = opts?.deviceId || (isNativeDesktop() ? (await window.electronAPI?.getDeviceId())?.deviceId : undefined);
+          if (isNativeDesktop() && cur.refreshToken) {
+            const data = await (window.electronAPI as any).authRefresh();
+            cur.actions.promoteOnlineLogin({ ...data, deviceId });
+            return data.accessToken;
+          }
           // ----------------------------------------------------------------
           // Option A — refresh token flow: if we have a refresh token + server
           // supports a /auth/refresh endpoint, use it (shorter payload, keeps
@@ -213,16 +226,15 @@ export const useAuthStore = create<AuthState>()(
           // ----------------------------------------------------------------
           if (cur.refreshToken) {
             try {
-              const API_BASE =
-                (typeof window !== 'undefined' &&
-                  (window as any).__PROLIFIC_API_BASE__ &&
-                  String((window as any).__PROLIFIC_API_BASE__)) ||
-                'https://prolific-api.onrender.com/api/v1';
+              const API_BASE = resolveApiBase();
               // Try refreshing via POST /auth/refresh (not all builds deploy
               // this route — if it 404s, catch and fall through to the PIN
               // flow below so we never fail Manager page just because this
               // endpoint is missing).
-              const body = JSON.stringify({ refreshToken: cur.refreshToken });
+              const body = JSON.stringify({
+                refreshToken: cur.refreshToken,
+                ...(isWebPhpMode() && typeof deviceId === 'string' ? { deviceId } : {}),
+              });
               const refreshResp = await fetch(`${API_BASE}/auth/refresh`, {
                 method: 'POST',
                 headers: {
@@ -276,8 +288,22 @@ export const useAuthStore = create<AuthState>()(
           // upcoming calls to Manager APIs) all use the fresh credentials.
           cur.actions.promoteOnlineLogin({ ...(data || {}), deviceId });
           return freshToken as string;
+          };
+          if (!isPhpPosMode()) return refresh();
+          const pending = refresh();
+          phpRefreshInFlight = pending;
+          try { return await pending; }
+          finally { if (phpRefreshInFlight === pending) phpRefreshInFlight = null; }
         },
         logout: () => {
+          const refreshToken = useAuthStore.getState().refreshToken;
+          if (isWebPhpMode() && refreshToken) {
+            void fetch(`${resolveApiBase()}/auth/logout`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ refreshToken }),
+            }).catch(() => { /* local logout still proceeds when offline */ });
+          }
           set({
             employee: null,
             branch: null,
@@ -305,13 +331,14 @@ export const useAuthStore = create<AuthState>()(
             lastLoginAt: null,
             offlinePin: undefined,
           });
+          window.electronAPI?.db?.meta?.setLastAuth(null).catch(() => {});
         },
       },
       };
       return state;
     },
     {
-      name: 'pos_auth_v1',
+      name: isWebPhpMode() ? 'pos_auth_php_v1' : 'pos_auth_v1',
       storage: createJSONStorage(() => localStorage),
       partialize: (s) => ({
         employee: s.employee,

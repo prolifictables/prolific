@@ -6,6 +6,7 @@ import { beginWake, endWake, publishApiWake } from './api-wake';
 // production hostnames. This resolver is also used by the authenticated
 // remote-auth / remote-menu-admin clients for identical behaviour.
 import { resolveApiBase } from './remote-auth';
+import { useAuthStore } from './auth-store';
 
 // Remote public API client so the POS cashier terminal (both Electron desktop
 // and the browser preview mode) reads menu data from the Nest server so any
@@ -192,19 +193,10 @@ export async function listPublicBranches(
 export async function resolveDefaultBranchId(
   signal?: AbortSignal
 ): Promise<string | null> {
-  // 1) explicit env override
+  const auth = useAuthStore.getState();
+  const branchId = auth.employee?.branchId || auth.branch?.id;
+  if (auth.employee) return typeof branchId === 'string' && branchId ? branchId : null;
   if (DEFAULT_BRANCH_OVERRIDE) return DEFAULT_BRANCH_OVERRIDE;
-  // 2) authenticated context: auth-store branch id (fastest, no network).
-  try {
-    if (typeof window !== 'undefined') {
-      const raw = (window as any).localStorage?.getItem?.('prolific-pos-auth');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        const bid = parsed?.state?.branch?.id || parsed?.branch?.id;
-        if (typeof bid === 'string' && bid.length > 0) return bid;
-      }
-    }
-  } catch { /* fall through */ }
   // 3) list from server → pick isDefault or first active
   try {
     const branches = await listPublicBranches(signal);
@@ -268,7 +260,7 @@ export async function fetchPublicMenu(
         branches[0];
       fallbackId = fb?.id || null;
     } catch { fallbackId = null; }
-    if (!fallbackId || fallbackId === branchId) throw initialErr;
+    if (useAuthStore.getState().employee || !fallbackId || fallbackId === branchId) throw initialErr;
     const qs2 = `?branchId=${encodeURIComponent(fallbackId)}`;
     const path2 = `/public/menu${qs2}`;
     res = await guardedFetch(
