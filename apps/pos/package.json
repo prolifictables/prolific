@@ -16,6 +16,7 @@
   "dependencies": {
     "7zip-bin": "^5.2.0",
     "app-builder-bin": "4.0.0",
+    "app-builder-lib": "24.13.3",
     "better-sqlite3": "^9.2.2",
     "clsx": "^2.0.0",
     "electron-store": "^8.1.0",
